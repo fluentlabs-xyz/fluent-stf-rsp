@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "bin/host",
-    "bin/eth-proofs",
+#    "bin/host",
+#    "bin/eth-proofs",
     "crates/executor/client",
     "crates/executor/host",
     "crates/mpt",
@@ -48,46 +48,47 @@ rsp-mpt = { path = "./crates/mpt" }
 rsp-primitives = { path = "./crates/primitives" }
 
 # reth
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false, features = [
+reth-primitives = { path = "../fluent/crates/primitives", default-features = false, features = [
     "alloy-compat",
     "std",
 ] }
-reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-codecs = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-optimism-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-optimism-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-optimism-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-execution-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
-reth-optimism-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false, features = [
-    "optimism",
-] }
-reth-optimism-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.2.0", default-features = false }
+reth-primitives-traits = { path = "../fluent/crates/primitives-traits", default-features = false }
+reth-consensus = { path = "../fluent/crates/consensus/consensus", default-features = false }
+reth-evm = { path = "../fluent/crates/evm", default-features = false }
+reth-evm-ethereum = { path = "../fluent/crates/ethereum/evm", default-features = false }
+reth-optimism-evm = { path = "../fluent/crates/optimism/evm", default-features = false }
+reth-optimism-primitives = { path = "../fluent/crates/optimism/primitives", default-features = false }
+reth-storage-errors = { path = "../fluent/crates/storage/errors", default-features = false }
+reth-trie = { path = "../fluent/crates/trie/trie", default-features = false }
+reth-chainspec = { path = "../fluent/crates/chainspec", default-features = false }
+reth-optimism-chainspec = { path = "../fluent/crates/optimism/chainspec", default-features = false }
+reth-execution-types = { path = "../fluent/crates/evm/execution-types", default-features = false }
+reth-errors = { path = "../fluent/crates/errors", default-features = false }
+reth-ethereum-primitives = { path = "../fluent/crates/ethereum/primitives", default-features = false }
+reth-optimism-forks = { path = "../fluent/crates/optimism/hardforks", default-features = false }
 
-# revm
-revm = { version = "19.5.0", features = [
-    "optimism",
+revm = { path = "../fluentbase/revm/crates/revm", features = [
+#    "optimism",
     "serde",
     "kzg-rs",
 ], default-features = false }
-revm-primitives = { version = "15.2.0", features = [
+revm-primitives = { path = "../fluentbase/revm/crates/primitives", features = [
     "serde",
+    "kzg-rs",
 ], default-features = false }
-revm-inspectors = "0.15.0"
-revm-interpreter = { version = "15.2.0", default-features = false }
-revm-precompile = { version = "16.0.0", default-features = false }
+
+reth-node-ethereum = { path = "../fluent/crates/ethereum/node", default-features = false }
+reth-codecs = { path = "../fluent/crates/storage/codecs", default-features = false }
+reth-trie-common = { path = "../fluent/crates/trie/common", default-features = false }
+reth-execution-errors = { path = "../fluent/crates/evm/execution-errors", default-features = false }
+reth-db = { path = "../fluent/crates/storage/db", default-features = false }
+reth-ethereum-consensus = { path = "../fluent/crates/ethereum/consensus", default-features = false }
+reth-optimism-consensus = { path = "../fluent/crates/optimism/consensus", default-features = false, features = [
+    "optimism",
+] }
+revm-interpreter = { path = "../fluentbase/revm/crates/interpreter", default-features = false }
+revm-precompile = { path = "../fluentbase/revm/crates/precompile", default-features = false }
+revm-inspectors = { path = "../revm-inspectors", default-features = false }
 
 # alloy
 alloy-chains = { version = "0.1.59", default-features = false }
