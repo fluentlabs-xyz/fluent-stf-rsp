@@ -1,7 +1,7 @@
 [workspace]
-members = ["build-wasm32",
-#    "bin/host",
-#    "bin/eth-proofs",
+members = [
+    "bin/host",
+    "bin/eth-proofs",
     "crates/executor/client",
     "crates/executor/host",
     "crates/mpt",
