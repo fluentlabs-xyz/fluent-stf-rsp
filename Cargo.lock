@@ -1058,6 +1058,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-wasm32"
+version = "0.1.0"
+
+[[package]]
 name = "bumpalo"
 version = "3.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1149,6 +1153,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cargo_metadata"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8769706aad5d996120af43197bf46ef6ad0fda35216b4505f926a365a232d924"
+dependencies = [
+ "camino",
+ "cargo-platform",
+ "semver 1.0.25",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.11",
 ]
 
 [[package]]
@@ -1995,6 +2013,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluentbase-build"
+version = "0.1.0"
+dependencies = [
+ "cargo_metadata 0.19.1",
+]
+
+[[package]]
 name = "fluentbase-codec"
 version = "0.1.0"
 dependencies = [
@@ -2021,10 +2046,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluentbase-contracts-fairblock"
+version = "0.1.0"
+dependencies = [
+ "fluentbase-build",
+]
+
+[[package]]
+name = "fluentbase-contracts-multicall"
+version = "0.1.0"
+dependencies = [
+ "fluentbase-build",
+ "fluentbase-sdk",
+]
+
+[[package]]
+name = "fluentbase-examples-greeting"
+version = "0.1.0"
+dependencies = [
+ "fluentbase-build",
+ "fluentbase-sdk",
+]
+
+[[package]]
 name = "fluentbase-genesis"
 version = "0.1.0"
 dependencies = [
  "alloy-genesis",
+ "fluentbase-contracts-fairblock",
+ "fluentbase-contracts-multicall",
+ "fluentbase-examples-greeting",
  "fluentbase-types",
  "serde",
  "serde_json",
@@ -5810,7 +5861,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb3ab2b8e8bad6d5ab1235ac31f777a0d4487a3d79b275af61008e58cec40391"
 dependencies = [
  "anyhow",
- "cargo_metadata",
+ "cargo_metadata 0.18.1",
  "chrono",
  "clap",
  "dirs",
