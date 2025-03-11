@@ -58,23 +58,23 @@ sp1-prover = "5.1.0"
 sp1-sdk = "5.1.0"
 
 # reth
-#reth-primitives = { path = "../fluent/crates/primitives", default-features = false, features = ["alloy-compat", "std"] }
-#reth-primitives-traits = { path = "../fluent/crates/primitives-traits", default-features = false }
-#reth-consensus = { path = "../fluent/crates/consensus/consensus", default-features = false }
-#reth-evm = { path = "../fluent/crates/evm", default-features = false }
-#reth-evm-ethereum = { path = "../fluent/crates/ethereum/evm", default-features = false }
-#reth-optimism-evm = { path = "../fluent/crates/optimism/evm", default-features = false }
-#reth-optimism-primitives = { path = "../fluent/crates/optimism/primitives", default-features = false }
-#reth-storage-errors = { path = "../fluent/crates/storage/errors", default-features = false }
-#reth-trie = { path = "../fluent/crates/trie/trie", default-features = false }
-#reth-chainspec = { path = "../fluent/crates/chainspec", default-features = false }
-#reth-optimism-chainspec = { path = "../fluent/crates/optimism/chainspec", default-features = false }
-#reth-execution-types = { path = "../fluent/crates/evm/execution-types", default-features = false }
-#reth-errors = { path = "../fluent/crates/errors", default-features = false }
-#reth-ethereum-primitives = { path = "../fluent/crates/ethereum/primitives", default-features = false }
-#reth-optimism-forks = { path = "../fluent/crates/optimism/hardforks", default-features = false }
-#revm = { path = "../fluentbase/revm/crates/revm", features = ["serde", "kzg-rs"], default-features = false }
-#revm-primitives = { path = "../fluentbase/revm/crates/primitives", features = ["serde", "kzg-rs"], default-features = false }
+# reth-primitives = { path = "../fluent/crates/primitives", default-features = false, features = ["alloy-compat", "std"] }
+# reth-primitives-traits = { path = "../fluent/crates/primitives-traits", default-features = false }
+# reth-consensus = { path = "../fluent/crates/consensus/consensus", default-features = false }
+# reth-evm = { path = "../fluent/crates/evm", default-features = false }
+# reth-evm-ethereum = { path = "../fluent/crates/ethereum/evm", default-features = false }
+# reth-optimism-evm = { path = "../fluent/crates/optimism/evm", default-features = false }
+# reth-optimism-primitives = { path = "../fluent/crates/optimism/primitives", default-features = false }
+# reth-storage-errors = { path = "../fluent/crates/storage/errors", default-features = false }
+# reth-trie = { path = "../fluent/crates/trie/trie", default-features = false }
+# reth-chainspec = { path = "../fluent/crates/chainspec", default-features = false }
+# reth-optimism-chainspec = { path = "../fluent/crates/optimism/chainspec", default-features = false }
+# reth-execution-types = { path = "../fluent/crates/evm/execution-types", default-features = false }
+# reth-errors = { path = "../fluent/crates/errors", default-features = false }
+# reth-ethereum-primitives = { path = "../fluent/crates/ethereum/primitives", default-features = false }
+# reth-optimism-forks = { path = "../fluent/crates/optimism/hardforks", default-features = false }
+# revm = { path = "../fluentbase/revm/crates/revm", features = ["serde", "kzg-rs"], default-features = false }
+# revm-primitives = { path = "../fluentbase/revm/crates/primitives", features = ["serde", "kzg-rs"], default-features = false }
 
 reth-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false, features = ["alloy-compat", "std"] }
 reth-primitives-traits = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
@@ -91,9 +91,10 @@ reth-execution-types = { git = "https://github.com/fluentlabs-xyz/fluent", branc
 reth-errors = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-ethereum-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-optimism-forks = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
-revm = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "devel", features = ["serde", "kzg-rs"], default-features = false }
-revm-primitives = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "devel", features = ["serde", "kzg-rs"], default-features = false }
+revm = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "devel", features = ["optimism", "serde", "kzg-rs"], default-features = false }
+revm-primitives = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "devel", features = ["optimism", "serde", "kzg-rs"], default-features = false }
 
+derive_more = {version = "2.0.1", features = ["full"]}
 # alloy
 alloy-chains = { version = "0.2.5", default-features = false }
 alloy-evm = { version = "0.15", default-features = false }
