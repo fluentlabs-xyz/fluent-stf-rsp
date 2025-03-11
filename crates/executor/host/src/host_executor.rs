@@ -228,7 +228,7 @@ impl<F: BlockExecutionStrategyFactory> HostExecutor<F> {
             blob_gas_used: current_block.header().blob_gas_used(),
             excess_blob_gas: current_block.header().excess_blob_gas(),
             parent_beacon_block_root: current_block.header().parent_beacon_block_root(),
-            requests_hash: None,
+            requests_hash: current_block.header().requests_hash(),
         };
 
         // Assert the derived header is correct.
