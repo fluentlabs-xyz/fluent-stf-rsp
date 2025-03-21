@@ -15,8 +15,8 @@ A minimal implementation of generating zero-knowledge proofs of EVM block execut
    make fluent_run
    ```
 
-2. **Create a Test Transaction**
-   Using [cast](https://book.getfoundry.sh/cast/):
+2. **Create a Test Transaction to Generate a Block**
+   Using [cast](https://book.getfoundry.sh/cast/) to create a transaction that will be included in a block for proving:
    ```bash
    cast send --value 0.1ether 0x5626f6940E2eb28930eFb4CeF49B2d1F2C9C1199 \
      --private-key df57089febbacf7ba0bc227dafbffa9fc08a93fdc68e1e42411a14efcf23656e \
