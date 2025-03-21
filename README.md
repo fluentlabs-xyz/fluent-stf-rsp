@@ -6,6 +6,37 @@ A minimal implementation of generating zero-knowledge proofs of EVM block execut
 >
 > This repository is still an active work-in-progress and is not audited or meant for production usage.
 
+## Getting Started with Fluent
+
+1. **Clone and Start Fluent Blockchain**
+   ```bash
+   git clone https://github.com/fluentlabs-xyz/fluent
+   cd fluent
+   make fluent_run
+   ```
+
+2. **Create a Test Transaction**
+   Using [cast](https://book.getfoundry.sh/cast/):
+   ```bash
+   cast send --value 0.1ether 0x5626f6940E2eb28930eFb4CeF49B2d1F2C9C1199 \
+     --private-key df57089febbacf7ba0bc227dafbffa9fc08a93fdc68e1e42411a14efcf23656e \
+     --rpc-url http://localhost:8545
+   ```
+   *Note: This private key is for development use only*
+
+3. **Install the RSP Command**
+   ```bash
+   cargo install --path bin/host
+   ```
+
+4. **Run State Transition Function**
+   ```bash
+   rsp --block-number 1 --rpc-url http://localhost:8545 \
+     --genesis-path bin/host/genesis/fluent-devnet.json
+   ```
+
+To generate a proof, add the `--prove` flag. Note that proof generation is resource-intensive — a simple transfer can take ~4.5 hours on a standard laptop.
+
 ## Getting Started
 
 To use RSP, you must first have [Rust](https://www.rust-lang.org/tools/install) installed and [SP1](https://docs.succinct.xyz/docs/getting-started/install) installed to build the client programs. Then follow the instructions below.
@@ -46,7 +77,7 @@ rsp --block-number 18884864 --rpc-url <RPC> --genesis-path <GENESIS_PATH>
 
 > [!TIP]
 >
-> The genesis json file only need to contains the chain id and hardforks block/timestamps. You can have a look at the folder 
+> The genesis json file only need to contains the chain id and hardforks block/timestamps. You can have a look at the folder
 > `bin/host/genesis` for examples.
 
 When running RSP, you should see logs similar to:
