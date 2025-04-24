@@ -17,8 +17,10 @@ pub fn main() {
 
     // Execute the block.
     let executor = OpClientExecutor::optimism(Arc::new((&input.genesis).try_into().unwrap()));
-    let header = executor.execute(input).expect("failed to execute client");
+    let (header, withdrawal_events_hash) = executor.execute(input).expect("failed to execute client");
+    let block_hash = header.hash_slow();
 
     // Commit the block hash.
-    sp1_zkvm::io::commit::<CommittedHeader>(&header.into());
+    sp1_zkvm::io::commit(&block_hash);
+    sp1_zkvm::io::commit(&withdrawal_events_hash);
 }

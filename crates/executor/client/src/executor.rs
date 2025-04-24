@@ -21,7 +21,7 @@ use crate::{
     into_primitives::FromInput,
     io::{ClientExecutorInput, TrieDB, WitnessInput},
     tracking::OpCodesTrackingBlockExecutor,
-    BlockValidator,
+    BlockValidator,  withdrawal_event_hash::CalculateWithdrawalEventHash,
 };
 
 pub const DESERIALZE_INPUTS: &str = "deserialize inputs";
@@ -53,7 +53,7 @@ where
     pub fn execute(
         &self,
         mut input: ClientExecutorInput<C::Primitives>,
-    ) -> Result<Header, ClientError> {
+    ) -> Result<(Header, B256), ClientError> {
         let sealed_headers = input.sealed_headers().collect::<Vec<_>>();
 
         // Initialize the witnessed database with verified storage proofs.
@@ -144,7 +144,15 @@ where
             requests_hash: input.current_block.header().requests_hash(),
         };
 
-        Ok(header)
+        let bridge_address: Address = Address::ZERO;
+        let send_topic: B256 = B256::ZERO;
+
+        Ok((
+            header,
+            executor_outcome
+                .calculate_withdrawal_event_hash(bridge_address, send_topic)
+                .map_err(|err| ClientError::FailedToSerializeWithdrawalEvents(err))?,
+        ))
     }
 }
 

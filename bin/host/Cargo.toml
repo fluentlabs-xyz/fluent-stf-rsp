@@ -29,7 +29,7 @@ alloy-consensus.workspace = true
 alloy-provider.workspace = true
 
 
-# reth 
+# reth
 reth-primitives-traits.workspace = true
 
 # revm

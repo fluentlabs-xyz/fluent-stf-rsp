@@ -20,8 +20,10 @@ pub fn main() {
         Arc::new((&input.genesis).try_into().unwrap()),
         input.custom_beneficiary,
     );
-    let header = executor.execute(input).expect("failed to execute client");
+    let (header, withdrawal_events_hash) = executor.execute(input).expect("failed to execute client");
+    let block_hash = header.hash_slow();
 
-    // Commit the block header.
-    sp1_zkvm::io::commit::<CommittedHeader>(&header.into());
+    // Commit the block hash.
+    sp1_zkvm::io::commit(&block_hash);
+    sp1_zkvm::io::commit(&withdrawal_events_hash);
 }
