@@ -7,4 +7,6 @@ pub mod error;
 pub mod executor;
 
 mod into_primitives;
+mod withdrawal_event_hash;
+
 pub use into_primitives::{FromInput, IntoInput, IntoPrimitives};

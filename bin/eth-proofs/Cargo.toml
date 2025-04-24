@@ -13,7 +13,7 @@ tracing-subscriber = "0.3.18"
 dotenv = "0.15.0"
 clap = { version = "4.5.7", features = ["derive", "env"] }
 eyre = "0.6.12"
-reqwest = { version =  "0.12.9", features = ["json"] }
+reqwest = { version = "0.12.9", features = ["json"] }
 pagerduty-rs = "0.1.6"
 base64 = "0.22.1"
 time = "0.3.37"
@@ -25,7 +25,8 @@ rsp-client-executor.workspace = true
 rsp-primitives.workspace = true
 
 # sp1
-sp1-sdk = "4.1.0"
+sp1-sdk = { path = "../../../sp1/crates/sdk" }
+#sp1-sdk = "4.1.0"
 
 # alloy
 alloy-chains.workspace = true

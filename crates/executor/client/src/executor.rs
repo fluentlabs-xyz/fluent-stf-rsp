@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use alloy_consensus::{BlockHeader, Header, TxReceipt};
-use alloy_primitives::Bloom;
+use alloy_primitives::{Bloom, Keccak256, B256};
 use reth_chainspec::ChainSpec;
 use reth_evm::execute::{BlockExecutionStrategy, BlockExecutionStrategyFactory};
 use reth_evm_ethereum::execute::EthExecutionStrategyFactory;
@@ -13,7 +13,7 @@ use revm_primitives::Address;
 
 use crate::{
     custom::CustomEthEvmConfig, error::ClientError, into_primitives::FromInput,
-    io::ClientExecutorInput,
+    io::ClientExecutorInput, withdrawal_event_hash::CalculateWithdrawalEventHash,
 };
 
 pub type EthClientExecutor = ClientExecutor<EthExecutionStrategyFactory<CustomEthEvmConfig>>;
@@ -41,7 +41,7 @@ where
     pub fn execute(
         &self,
         mut input: ClientExecutorInput<F::Primitives>,
-    ) -> Result<Header, ClientError> {
+    ) -> Result<(Header, B256), ClientError> {
         // Initialize the witnessed database with verified storage proofs.
         let db = profile!("initialize witness db", {
             let trie_db = input.witness_db().unwrap();
@@ -119,10 +119,18 @@ where
             blob_gas_used: input.current_block.header().blob_gas_used(),
             excess_blob_gas: input.current_block.header().excess_blob_gas(),
             parent_beacon_block_root: input.current_block.header().parent_beacon_block_root(),
-            requests_hash: None,
+            requests_hash: input.current_block.requests_hash(),
         };
 
-        Ok(header)
+        let bridge_address: Address = Address::ZERO;
+        let send_topic: B256 = B256::ZERO;
+
+        Ok((
+            header,
+            executor_outcome
+                .calculate_withdrawal_event_hash(bridge_address, send_topic)
+                .map_err(|err| ClientError::FailedToSerializeWithdrawalEvents(err))?,
+        ))
     }
 }
 

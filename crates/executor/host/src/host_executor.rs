@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use alloy_consensus::{BlockHeader, Header, TxReceipt};
 use alloy_primitives::{Bloom, Sealable};
 use alloy_provider::{Network, Provider};
+use alloy_rlp::Encodable;
 use alloy_rpc_types::BlockTransactionsKind;
 use reth_chainspec::ChainSpec;
 use reth_evm::execute::{BlockExecutionStrategy, BlockExecutionStrategyFactory};

@@ -49,7 +49,8 @@ alloy-network.workspace = true
 alloy-rpc-types.workspace = true
 op-alloy-network = { workspace = true, optional = true }
 op-alloy-rpc-types = { workspace = true, optional = true }
-
+bincode = "1.3.3"
+alloy-sol-types.workspace = true
 
 [features]
 optimism = [
