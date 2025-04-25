@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use alloy_consensus::{BlockHeader, Header, TxReceipt};
+use alloy_primitives::{address, b256, Bloom, Keccak256, B256};
 use alloy_consensus::{BlockHeader, Header};
 use itertools::Itertools;
 use reth_chainspec::ChainSpec;
@@ -15,7 +17,10 @@ use reth_trie::KeccakKeyHasher;
 use revm::database::WrapDatabaseRef;
 use revm_primitives::Address;
 
+use crate::events_hash::{BridgeHashes, BridgeInfo};
 use crate::{
+    custom::CustomEthEvmConfig, error::ClientError, events_hash::CalculateEventsHash,
+    into_primitives::FromInput, io::ClientExecutorInput,
     custom::CustomEvmFactory,
     error::ClientError,
     into_primitives::FromInput,
@@ -45,6 +50,12 @@ pub struct ClientExecutor<C: ConfigureEvm, CS> {
     chain_spec: Arc<CS>,
 }
 
+static BRIDGE_INFO: BridgeInfo = BridgeInfo {
+    address: address!("0x00961Ef480Eb55e80D19ad83579A64c007002123"),
+    withdrawal_topic: b256!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+    deposit_topic: b256!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+};
+
 impl<C, CS> ClientExecutor<C, CS>
 where
     C: ConfigureEvm,
@@ -53,7 +64,7 @@ where
     pub fn execute(
         &self,
         mut input: ClientExecutorInput<C::Primitives>,
-    ) -> Result<(Header, B256), ClientError> {
+    ) -> Result<(Header, BridgeHashes), ClientError> {
         let sealed_headers = input.sealed_headers().collect::<Vec<_>>();
 
         // Initialize the witnessed database with verified storage proofs.
@@ -145,14 +156,12 @@ where
         };
 
         let bridge_address: Address = Address::ZERO;
-        let send_topic: B256 = B256::ZERO;
+        let deposit_topic: B256 = B256::ZERO;
+        let withdrawal_topic: B256 = B256::ZERO;
+        let bridgeInfo =
+            BridgeInfo { address: Default::default(), withdrawal_topic, deposit_topic };
 
-        Ok((
-            header,
-            executor_outcome
-                .calculate_withdrawal_event_hash(bridge_address, send_topic)
-                .map_err(|err| ClientError::FailedToSerializeWithdrawalEvents(err))?,
-        ))
+        Ok((header, bridgeInfo.calculate_bridge_hashes(&executor_outcome)?))
     }
 }
 
