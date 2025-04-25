@@ -13,6 +13,31 @@ sol! {
     }
 }
 
+pub struct BridgeHashes {
+    pub withdrawal_hash: B256,
+    pub deposit_hash: B256,
+}
+
+pub struct BridgeInfo {
+    pub address: Address,
+    pub withdrawal_topic: B256,
+    pub deposit_topic: B256,
+}
+
+impl BridgeInfo {
+    pub fn calculate_bridge_hashes<T: TxReceipt<Log = alloy_primitives::Log>>(
+        &self,
+        execution_outcome: &ExecutionOutcome<T>,
+    ) -> Result<BridgeHashes, Error> {
+        Ok(BridgeHashes {
+            withdrawal_hash: execution_outcome
+                .calculate_events_hash(&self.address, &self.withdrawal_topic)?,
+            deposit_hash: execution_outcome
+                .calculate_events_hash(&self.address, &self.deposit_topic)?,
+        })
+    }
+}
+
 impl From<&alloy_primitives::Log> for Log {
     fn from(value: &alloy_primitives::Log) -> Self {
         Log {
@@ -28,29 +53,27 @@ impl From<&alloy_primitives::Log> for Log {
     }
 }
 
-pub trait CalculateWithdrawalEventHash {
-    fn calculate_withdrawal_event_hash(
+pub trait CalculateEventsHash {
+    fn calculate_events_hash(
         &self,
-        bridge_address: Address,
-        send_topic: B256,
+        bridge_address: &Address,
+        send_topic: &B256,
     ) -> Result<B256, Error>;
 }
 
-impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateWithdrawalEventHash
-    for ExecutionOutcome<T>
-{
-    fn calculate_withdrawal_event_hash(
+impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for ExecutionOutcome<T> {
+    fn calculate_events_hash(
         &self,
-        bridge_address: Address,
-        send_topic: B256,
+        bridge_address: &Address,
+        send_topic: &B256,
     ) -> Result<B256, Error> {
         let withdrawal_logs = self
             .receipts
             .iter()
             .flat_map(|receipt| receipt.iter().filter(TxReceipt::status).flat_map(TxReceipt::logs))
             .filter(|log| {
-                log.address == bridge_address
-                    && log.data.topics().get(0).map(|topic| *topic == send_topic).unwrap_or(false)
+                &log.address == bridge_address
+                    && log.data.topics().get(0).map(|topic| topic == send_topic).unwrap_or(false)
             })
             .map(|log| Log::from(log).abi_encode_packed())
             .collect::<Vec<_>>()
@@ -58,8 +81,9 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateWithdrawalEventHash
             .flatten()
             .collect::<Vec<_>>();
 
-        println!("Log: {:?}", withdrawal_logs);
         let mut hasher = Keccak256::new();
+
+        //TODO: Rework to merkle root
         hasher.update(&withdrawal_logs);
 
         Ok(hasher.finalize())
@@ -74,7 +98,7 @@ mod tests {
     use alloy_sol_types::SolValue;
     use reth_execution_types::ExecutionOutcome;
 
-    use crate::withdrawal_event_hash::{CalculateWithdrawalEventHash, Log as EncodeLog};
+    use crate::events_hash::{CalculateEventsHash, Log as EncodeLog};
 
     #[test]
     fn abi_encode() {
@@ -203,9 +227,8 @@ mod tests {
 
         let expected_hash = hasher.finalize();
 
-        let actual_hash = execution_outcome
-            .calculate_withdrawal_event_hash(bridge_address, send_event_topic)
-            .unwrap();
+        let actual_hash =
+            execution_outcome.calculate_events_hash(&bridge_address, &send_event_topic).unwrap();
 
         assert_eq!(actual_hash, expected_hash);
     }
@@ -300,9 +323,8 @@ mod tests {
 
         let expected_hash = hasher.finalize();
 
-        let actual_hash = execution_outcome
-            .calculate_withdrawal_event_hash(bridge_address, send_event_topic)
-            .unwrap();
+        let actual_hash =
+            execution_outcome.calculate_events_hash(&bridge_address, &send_event_topic).unwrap();
 
         assert_eq!(actual_hash, expected_hash);
     }

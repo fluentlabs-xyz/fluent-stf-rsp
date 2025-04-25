@@ -4,9 +4,8 @@ pub mod io;
 mod utils;
 pub mod custom;
 pub mod error;
+mod events_hash;
 pub mod executor;
-
 mod into_primitives;
-mod withdrawal_event_hash;
 
 pub use into_primitives::{FromInput, IntoInput, IntoPrimitives};
