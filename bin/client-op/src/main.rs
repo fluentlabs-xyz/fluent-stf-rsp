@@ -19,10 +19,10 @@ pub fn main() {
     let executor = OpClientExecutor::optimism(Arc::new((&input.genesis).try_into().unwrap()));
     let (header, events_hash) = executor.execute(input).expect("failed to execute client");
     let block_hash = header.hash_slow();
-    let block_number = header.number;
+    let parent_hash = header.parent_hash;
 
     // Commit the block hash.
-    sp1_zkvm::io::commit(&block_number);
+    sp1_zkvm::io::commit(&parent_hash);
     sp1_zkvm::io::commit(&block_hash);
     sp1_zkvm::io::commit(&events_hash.withdrawal_hash);
     sp1_zkvm::io::commit(&events_hash.deposit_hash);
