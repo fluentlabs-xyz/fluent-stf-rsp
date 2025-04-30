@@ -129,13 +129,7 @@ where
             requests_hash: input.current_block.requests_hash(),
         };
 
-        let bridge_address: Address = Address::ZERO;
-        let deposit_topic: B256 = B256::ZERO;
-        let withdrawal_topic: B256 = B256::ZERO;
-        let bridgeInfo =
-            BridgeInfo { address: Default::default(), withdrawal_topic, deposit_topic };
-
-        Ok((header, bridgeInfo.calculate_bridge_hashes(&executor_outcome)?))
+        Ok((header, BRIDGE_INFO.calculate_bridge_hashes(&executor_outcome)?))
     }
 }
 
