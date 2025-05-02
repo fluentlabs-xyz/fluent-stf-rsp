@@ -171,12 +171,12 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
 #[cfg(test)]
 mod tests {
     use alloy_consensus::TxType;
-    use alloy_primitives::U256;
+    use alloy_primitives::{b256, hex, U256};
     use alloy_primitives::{Address, Bytes, Keccak256, Log, LogData, B256};
     use alloy_sol_types::SolValue;
     use reth_execution_types::ExecutionOutcome;
 
-    use crate::events_hash::{CalculateEventsHash, Log as EncodeLog, ZERO_BYTES_HASH};
+    use crate::events_hash::{CalculateEventsHash, Log as EncodeLog, SentMessage, ZERO_BYTES_HASH};
 
     #[test]
     fn abi_encode() {
@@ -396,5 +396,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_hash, ZERO_BYTES_HASH);
+    }
+
+    #[test]
+    fn test_deposit_hash() {
+        let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
+
+        let bridge_address = Address::from([0xa; 20]);
+        let send_event_topic = B256::from([0xb; 32]);
+
+        let event_data = hex!("0x00000000000000000000000000000000000000000000000000000000000007d00000000000000000000000000000000000000000000000000000000000000000b054bbc29d2e7acbd3e724ebee9a9b350202ede8800adf450cd7cc66d011bc7a000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000050102030405000000000000000000000000000000000000000000000000000000");
+
+        execution_outcome.receipts = vec![
+            vec![
+                reth_primitives::Receipt {
+                    tx_type: Default::default(),
+                    success: true,
+                    cumulative_gas_used: 0,
+                    logs: vec![Log {
+                        address: bridge_address,
+                        data: LogData::new(vec![send_event_topic], Bytes::from(event_data))
+                            .unwrap(),
+                    }],
+                },
+                reth_primitives::Receipt::default(),
+            ],
+            vec![reth_primitives::Receipt::default(), reth_primitives::Receipt::default()],
+        ];
+
+        let actual_hash =
+            execution_outcome.calculate_deposit_hash(&bridge_address, &send_event_topic).unwrap();
+
+        let expected_deposit_hash: B256 =
+            b256!("0x027916995b58e921b14738f7dae4eeab4cfb30e2022d6c9a608c62a9d18d934e");
+
+        assert_eq!(actual_hash, expected_deposit_hash);
     }
 }
