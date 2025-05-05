@@ -1,10 +1,9 @@
 use alloy_consensus::TxReceipt;
+use alloy_primitives::FixedBytes;
 use alloy_primitives::{b256, Address, Keccak256, LogData, B256};
-use alloy_primitives::{FixedBytes, U256};
 use alloy_sol_types::{sol, SolType, SolValue};
 use bincode::Error;
 use reth_execution_types::ExecutionOutcome;
-use std::io::Bytes;
 
 sol! {
     struct Log{
@@ -76,12 +75,13 @@ fn merkle_root(mut leaves: Vec<B256>) -> B256 {
             leaves.push(leaves.last().unwrap().clone());
         }
 
-        for i in (0..leaves.len()) {
+        for i in (0..leaves.len() / 2) {
             let mut hasher = Keccak256::new();
             hasher.update(&leaves[i * 2]);
             hasher.update(&leaves[i * 2 + 1]);
             leaves[i] = hasher.finalize();
         }
+        leaves.truncate(leaves.len() / 2);
     }
 
     leaves[0]
@@ -128,6 +128,7 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
         let mut hasher = Keccak256::new();
 
         for message_hash in message_hashes {
+            println!("Hash: {}", message_hash);
             hasher.update(&message_hash);
         }
 
@@ -217,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn test_withdrawal_event_hash() {
+    fn test_deposit_event_hash() {
         let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
 
         let bridge_address = Address::from([0xa; 20]);
@@ -243,16 +244,8 @@ mod tests {
             ],
         }]];
 
-        let expected_data = vec![
-            10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11,
-            11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
-            11, 11, 11, 11, 11, 11, 11, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 153, 153, 153, 153, 153, 153, 153, 153, 153,
-            153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153,
-            153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153,
-            153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153,
-            153, 153, 153, 153,
-        ];
+        let expected_data =
+            hex!("0x9999999999999999999999999999999999999999999999999999999999999999");
 
         let mut hasher = Keccak256::new();
         hasher.update(&expected_data);
@@ -266,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn test_any_withdrawal_events_hash() {
+    fn test_any_deposit_events_hash() {
         let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
 
         let bridge_address = Address::from([0xa; 20]);
@@ -328,27 +321,7 @@ mod tests {
             }],
         ];
 
-        let expected_data = vec![
-            10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11,
-            11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
-            11, 11, 11, 11, 11, 11, 11, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98,
-            98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98,
-            98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98,
-            98, 98, 98, 98, 98, 98, 98, 98, 98, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
-            10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
-            11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 99, 99,
-            99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
-            99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
-            99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 10, 10, 10, 10,
-            10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11,
-            11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
-            11, 11, 11, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
-            100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
-            100, 100, 100,
-        ];
+        let expected_data = hex!("0x626262626262626262626262626262626262626262626262626262626262626263636363636363636363636363636363636363636363636363636363636363636464646464646464646464646464646464646464646464646464646464646464");
 
         let mut hasher = Keccak256::new();
         hasher.update(&expected_data);
@@ -405,7 +378,7 @@ mod tests {
         let bridge_address = Address::from([0xa; 20]);
         let send_event_topic = B256::from([0xb; 32]);
 
-        let event_data = hex!("0x00000000000000000000000000000000000000000000000000000000000007d00000000000000000000000000000000000000000000000000000000000000000b054bbc29d2e7acbd3e724ebee9a9b350202ede8800adf450cd7cc66d011bc7a000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000050102030405000000000000000000000000000000000000000000000000000000");
+        let event_data = hex!("0xb054bbc29d2e7acbd3e724ebee9a9b350202ede8800adf450cd7cc66d011bc7a0000000000000000000000000000000000000000000000000000000000000001");
 
         execution_outcome.receipts = vec![
             vec![
@@ -431,5 +404,53 @@ mod tests {
             b256!("0x027916995b58e921b14738f7dae4eeab4cfb30e2022d6c9a608c62a9d18d934e");
 
         assert_eq!(actual_hash, expected_deposit_hash);
+    }
+
+    #[test]
+    fn test_withdrawal_root() {
+        let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
+
+        let bridge_address = Address::from([0xa; 20]);
+        let send_event_topic = B256::from([0xb; 32]);
+
+        let event_data =  hex!("0x00000000000000000000000000000000000000000000000000000000000007d00000000000000000000000000000000000000000000000000000000000000000835612469dd5d58ef5be0da80c826de8354bbdd63eec7aea2dcca10ab8c0ff73000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000050102030405000000000000000000000000000000000000000000000000000000");
+        let event_data2 = hex!("0x00000000000000000000000000000000000000000000000000000000000009d000000000000000000000000000000000000000000000000000000000000000007e3a41a1eaf8f064503f94e4090673e401318e9c6f22ee1002084d58465b4a11000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000051122334455000000000000000000000000000000000000000000000000000000");
+
+        execution_outcome.receipts = vec![
+            vec![
+                reth_primitives::Receipt {
+                    tx_type: Default::default(),
+                    success: true,
+                    cumulative_gas_used: 0,
+                    logs: vec![Log {
+                        address: bridge_address,
+                        data: LogData::new(vec![send_event_topic], Bytes::from(event_data))
+                            .unwrap(),
+                    }],
+                },
+                reth_primitives::Receipt::default(),
+            ],
+            vec![
+                reth_primitives::Receipt {
+                    tx_type: Default::default(),
+                    success: true,
+                    cumulative_gas_used: 0,
+                    logs: vec![Log {
+                        address: bridge_address,
+                        data: LogData::new(vec![send_event_topic], Bytes::from(event_data2))
+                            .unwrap(),
+                    }],
+                },
+                reth_primitives::Receipt::default(),
+            ],
+        ];
+
+        let actual_hash = execution_outcome
+            .calculate_withdrawal_root(&bridge_address, &send_event_topic)
+            .unwrap();
+        let expected_withdrawal_hash: B256 =
+            b256!("0x102d9a87b06e98ffe86c937e6831235147652eaf025cdce60d44b79c93d2926a");
+
+        assert_eq!(actual_hash, expected_withdrawal_hash);
     }
 }
