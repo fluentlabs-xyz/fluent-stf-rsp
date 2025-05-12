@@ -28,9 +28,8 @@ pub struct BridgeHashes {
     pub deposit_hash: B256,
 }
 
-#[derive(Debug)]
 pub(crate) struct BridgeInfo {
-    pub bridge_address: Address,
+    pub address: Address,
     pub withdrawal_topic: B256,
     pub deposit_topic: B256,
 }
@@ -56,7 +55,7 @@ impl From<&alloy_primitives::Log> for Log {
             topics: value
                 .data
                 .topics()
-                .into_iter()
+                .iter()
                 .map(|topic| FixedBytes::new(topic.0).into())
                 .collect(),
             data: value.data.data.to_vec().into(),
@@ -71,13 +70,13 @@ fn merkle_root(mut leaves: Vec<B256>) -> B256 {
 
     while leaves.len() > 1 {
         if leaves.len() % 2 != 0 {
-            leaves.push(leaves.last().unwrap().clone());
+            leaves.push(*leaves.last().unwrap());
         }
 
         for i in 0..leaves.len() / 2 {
             let mut hasher = Keccak256::new();
-            hasher.update(&leaves[i * 2]);
-            hasher.update(&leaves[i * 2 + 1]);
+            hasher.update(leaves[i * 2]);
+            hasher.update(leaves[i * 2 + 1]);
             leaves[i] = hasher.finalize();
         }
         leaves.truncate(leaves.len() / 2);
@@ -128,7 +127,7 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
 
         for message_hash in message_hashes {
             println!("Hash: {}", message_hash);
-            hasher.update(&message_hash);
+            hasher.update(message_hash);
         }
 
         Ok(hasher.finalize())
@@ -161,7 +160,7 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
             .flat_map(|receipt| receipt.iter().filter(TxReceipt::status).flat_map(TxReceipt::logs))
             .filter(|log| {
                 &log.address == bridge_address
-                    && log.data.topics().get(0).map(|topic| topic == send_topic).unwrap_or(false)
+                    && log.data.topics().first().map(|topic| topic == send_topic).unwrap_or(false)
             })
             .map(|log| &log.data)
             .collect::<Vec<_>>()
@@ -183,7 +182,7 @@ mod tests {
         let send_event_topic = U256::from(0xcccc);
         let log = EncodeLog {
             address: [0x0a; 20].into(),
-            topics: vec![send_event_topic.into()],
+            topics: vec![send_event_topic],
             data: [0xbb; 32].into(),
         };
 
@@ -247,7 +246,7 @@ mod tests {
             hex!("0x9999999999999999999999999999999999999999999999999999999999999999");
 
         let mut hasher = Keccak256::new();
-        hasher.update(&expected_data);
+        hasher.update(expected_data);
 
         let expected_hash = hasher.finalize();
 
@@ -323,7 +322,7 @@ mod tests {
         let expected_data = hex!("0x626262626262626262626262626262626262626262626262626262626262626263636363636363636363636363636363636363636363636363636363636363636464646464646464646464646464646464646464646464646464646464646464");
 
         let mut hasher = Keccak256::new();
-        hasher.update(&expected_data);
+        hasher.update(expected_data);
 
         let expected_hash = hasher.finalize();
 
