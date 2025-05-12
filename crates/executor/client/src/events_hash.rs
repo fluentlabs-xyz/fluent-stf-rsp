@@ -1,7 +1,7 @@
 use alloy_consensus::TxReceipt;
 use alloy_primitives::FixedBytes;
 use alloy_primitives::{b256, Address, Keccak256, LogData, B256};
-use alloy_sol_types::{sol, SolType, SolValue};
+use alloy_sol_types::{sol};
 use bincode::Error;
 use reth_execution_types::ExecutionOutcome;
 
@@ -11,9 +11,7 @@ sol! {
         uint256[] topics;
         bytes data;
     }
-}
 
-sol! {
     struct SentMessage {
         uint256 value;
         uint256 nonce;
@@ -22,30 +20,31 @@ sol! {
     }
 }
 
-static ZERO_BYTES_HASH: B256 =
-    b256!("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+const ZERO_BYTES_HASH: B256 = b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
 
+#[derive(Debug)]
 pub struct BridgeHashes {
     pub withdrawal_hash: B256,
     pub deposit_hash: B256,
 }
 
-pub struct BridgeInfo {
-    pub address: Address,
+#[derive(Debug)]
+pub(crate) struct BridgeInfo {
+    pub bridge_address: Address,
     pub withdrawal_topic: B256,
     pub deposit_topic: B256,
 }
 
 impl BridgeInfo {
-    pub fn calculate_bridge_hashes<T: TxReceipt<Log = alloy_primitives::Log>>(
+    pub(crate) fn calculate_bridge_hashes<T: TxReceipt<Log = alloy_primitives::Log>>(
         &self,
         execution_outcome: &ExecutionOutcome<T>,
     ) -> Result<BridgeHashes, Error> {
         Ok(BridgeHashes {
             withdrawal_hash: execution_outcome
-                .calculate_withdrawal_root(&self.address, &self.withdrawal_topic)?,
+                .calculate_deposit_hash(&self.bridge_address, &self.withdrawal_topic)?,
             deposit_hash: execution_outcome
-                .calculate_deposit_hash(&self.address, &self.deposit_topic)?,
+                .calculate_deposit_hash(&self.bridge_address, &self.deposit_topic)?,
         })
     }
 }
@@ -75,7 +74,7 @@ fn merkle_root(mut leaves: Vec<B256>) -> B256 {
             leaves.push(leaves.last().unwrap().clone());
         }
 
-        for i in (0..leaves.len() / 2) {
+        for i in 0..leaves.len() / 2 {
             let mut hasher = Keccak256::new();
             hasher.update(&leaves[i * 2]);
             hasher.update(&leaves[i * 2 + 1]);
@@ -87,7 +86,7 @@ fn merkle_root(mut leaves: Vec<B256>) -> B256 {
     leaves[0]
 }
 
-pub trait CalculateEventsHash {
+pub(crate) trait CalculateEventsHash {
     fn calculate_deposit_hash(
         &self,
         bridge_address: &Address,
@@ -177,7 +176,7 @@ mod tests {
     use alloy_sol_types::SolValue;
     use reth_execution_types::ExecutionOutcome;
 
-    use crate::events_hash::{CalculateEventsHash, Log as EncodeLog, SentMessage, ZERO_BYTES_HASH};
+    use crate::events_hash::{CalculateEventsHash, Log as EncodeLog, ZERO_BYTES_HASH};
 
     #[test]
     fn abi_encode() {

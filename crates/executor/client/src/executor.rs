@@ -19,7 +19,7 @@ use revm_primitives::Address;
 
 use crate::events_hash::{BridgeHashes, BridgeInfo};
 use crate::{
-    custom::CustomEthEvmConfig, error::ClientError, events_hash::CalculateEventsHash,
+    custom::CustomEthEvmConfig, error::ClientError,
     into_primitives::FromInput, io::ClientExecutorInput,
     custom::CustomEvmFactory,
     error::ClientError,
@@ -51,7 +51,7 @@ pub struct ClientExecutor<C: ConfigureEvm, CS> {
 }
 
 static BRIDGE_INFO: BridgeInfo = BridgeInfo {
-    address: address!("0x00961Ef480Eb55e80D19ad83579A64c007002123"),
+    bridge_address: address!("0x00961Ef480Eb55e80D19ad83579A64c007002123"),
     withdrawal_topic: b256!("0x0000000000000000000000000000000000000000000000000000000000000000"),
     deposit_topic: b256!("0x0000000000000000000000000000000000000000000000000000000000000000"),
 };
