@@ -43,7 +43,7 @@ impl BridgeInfo {
     ) -> Result<BridgeHashes, Error> {
         Ok(BridgeHashes {
             withdrawal_hash: execution_outcome
-                .calculate_deposit_hash(&self.address, &self.withdrawal_topic)?,
+                .calculate_withdrawal_root(&self.address, &self.withdrawal_topic)?,
             deposit_hash: execution_outcome
                 .calculate_deposit_hash(&self.address, &self.deposit_topic)?,
         })
