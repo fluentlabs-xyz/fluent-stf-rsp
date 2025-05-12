@@ -5,7 +5,7 @@ use reth_primitives_traits::BlockBody;
 use rsp_client_executor::io::ClientExecutorInput;
 use rsp_host_executor::ExecutionHooks;
 use serde::{Deserialize, Serialize};
-use sp1_sdk::{ExecutionReport};
+use sp1_sdk::ExecutionReport;
 use std::{fs::OpenOptions, path::PathBuf};
 
 #[derive(Serialize, Deserialize)]

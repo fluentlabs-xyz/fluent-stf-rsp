@@ -106,7 +106,7 @@ impl<'a> TrieDB<'a> {
     }
 }
 
-impl<'a> DatabaseRef for TrieDB<'a> {
+impl DatabaseRef for TrieDB<'_> {
     /// The database error type.
     type Error = ProviderError;
 
