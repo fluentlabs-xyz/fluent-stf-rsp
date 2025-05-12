@@ -1,14 +1,12 @@
 use alloy_consensus::BlockHeader;
-use base64::{engine::general_purpose::STANDARD, Engine};
 use csv::WriterBuilder;
 use reth_primitives::NodePrimitives;
 use reth_primitives_traits::BlockBody;
 use rsp_client_executor::io::ClientExecutorInput;
 use rsp_host_executor::ExecutionHooks;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sp1_sdk::{ExecutionReport, HashableKey, SP1VerifyingKey};
-use std::{fs, fs::OpenOptions, path::PathBuf};
+use sp1_sdk::{ExecutionReport};
+use std::{fs::OpenOptions, path::PathBuf};
 
 #[derive(Serialize, Deserialize)]
 struct ExecutionReportData {

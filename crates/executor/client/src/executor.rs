@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use alloy_consensus::{BlockHeader, Header, TxReceipt};
-use alloy_primitives::{address, b256, Bloom, Keccak256, B256};
+use alloy_primitives::{address, b256, Bloom};
 use reth_chainspec::ChainSpec;
 use reth_evm::execute::{BlockExecutionStrategy, BlockExecutionStrategyFactory};
 use reth_evm_ethereum::execute::EthExecutionStrategyFactory;
@@ -13,7 +13,7 @@ use revm_primitives::Address;
 
 use crate::events_hash::{BridgeHashes, BridgeInfo};
 use crate::{
-    custom::CustomEthEvmConfig, error::ClientError, events_hash::CalculateEventsHash,
+    custom::CustomEthEvmConfig, error::ClientError,
     into_primitives::FromInput, io::ClientExecutorInput,
 };
 
@@ -35,7 +35,7 @@ pub struct ClientExecutor<F: BlockExecutionStrategyFactory> {
 }
 
 static BRIDGE_INFO: BridgeInfo = BridgeInfo {
-    address: address!("0x00961Ef480Eb55e80D19ad83579A64c007002123"),
+    bridge_address: address!("0x00961Ef480Eb55e80D19ad83579A64c007002123"),
     withdrawal_topic: b256!("0x0000000000000000000000000000000000000000000000000000000000000000"),
     deposit_topic: b256!("0x0000000000000000000000000000000000000000000000000000000000000000"),
 };
