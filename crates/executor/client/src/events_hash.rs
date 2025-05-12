@@ -1,7 +1,7 @@
 use alloy_consensus::TxReceipt;
 use alloy_primitives::FixedBytes;
 use alloy_primitives::{b256, Address, Keccak256, LogData, B256};
-use alloy_sol_types::{sol};
+use alloy_sol_types::sol;
 use bincode::Error;
 use reth_execution_types::ExecutionOutcome;
 
@@ -20,7 +20,8 @@ sol! {
     }
 }
 
-const ZERO_BYTES_HASH: B256 = b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+const ZERO_BYTES_HASH: B256 =
+    b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
 
 #[derive(Debug)]
 pub struct BridgeHashes {
@@ -29,7 +30,7 @@ pub struct BridgeHashes {
 }
 
 pub(crate) struct BridgeInfo {
-    pub address: Address,
+    pub bridge_address: Address,
     pub withdrawal_topic: B256,
     pub deposit_topic: B256,
 }

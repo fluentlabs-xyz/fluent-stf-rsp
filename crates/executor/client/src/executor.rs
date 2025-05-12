@@ -13,8 +13,8 @@ use revm_primitives::Address;
 
 use crate::events_hash::{BridgeHashes, BridgeInfo};
 use crate::{
-    custom::CustomEthEvmConfig, error::ClientError,
-    into_primitives::FromInput, io::ClientExecutorInput,
+    custom::CustomEthEvmConfig, error::ClientError, into_primitives::FromInput,
+    io::ClientExecutorInput,
 };
 
 pub type EthClientExecutor = ClientExecutor<EthExecutionStrategyFactory<CustomEthEvmConfig>>;
