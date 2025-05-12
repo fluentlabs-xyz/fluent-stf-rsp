@@ -26,8 +26,7 @@ rsp-mpt = { workspace = true, features = ["preimage_context"] }
 rsp-primitives.workspace = true
 
 # sp1
-sp1-sdk = { path = "../../../../sp1/crates/sdk" }
-#sp1-sdk = "4.0.0"
+sp1-sdk = "4.0.0"
 
 # reth
 reth-evm.workspace = true
