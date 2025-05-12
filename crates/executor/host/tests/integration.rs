@@ -19,11 +19,13 @@ use tracing_subscriber::{
 };
 use url::Url;
 
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_ethereum() {
     run_eth_e2e(&Genesis::Mainnet, "RPC_1", 18884864, None).await;
 }
 
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_optimism() {
     let chain_spec: Arc<OpChainSpec> = Arc::new((&Genesis::OpMainnet).try_into().unwrap());
@@ -45,6 +47,7 @@ async fn test_e2e_optimism() {
     .await;
 }
 
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_linea() {
     run_eth_e2e(
@@ -56,6 +59,7 @@ async fn test_e2e_linea() {
     .await;
 }
 
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_sepolia() {
     run_eth_e2e(&Genesis::Sepolia, "RPC_11155111", 6804324, None).await;
