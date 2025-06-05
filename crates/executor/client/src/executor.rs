@@ -77,14 +77,6 @@ where
         let mut state = strategy.into_state();
         state.merge_transitions(BundleRetention::Reverts);
 
-        // Accumulate the logs bloom.
-        let mut logs_bloom = Bloom::default();
-        profile!("accrue logs bloom", {
-            executor_output.receipts.iter().for_each(|r| {
-                logs_bloom.accrue_bloom(&r.bloom());
-            })
-        });
-
         // Convert the output to an execution outcome.
         let executor_outcome = ExecutionOutcome::new(
             state.take_bundle(),
@@ -112,7 +104,7 @@ where
             state_root,
             transactions_root: input.current_block.header().transactions_root(),
             receipts_root: input.current_block.header().receipts_root(),
-            logs_bloom,
+            logs_bloom: input.current_block.header().logs_bloom,
             difficulty: input.current_block.header().difficulty(),
             number: input.current_block.header().number(),
             gas_limit: input.current_block.header().gas_limit(),
