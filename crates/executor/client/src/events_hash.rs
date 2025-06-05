@@ -103,7 +103,7 @@ pub(crate) trait CalculateEventsHash {
 }
 
 const RECEIVE_EVENT_MESSAGE_HASH_OFFSET: usize = 0;
-const SEND_EVENT_MESSAGE_HASH_OFFSET: usize = 64;
+const SEND_EVENT_MESSAGE_HASH_OFFSET: usize = 128;
 
 impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for ExecutionOutcome<T> {
     fn calculate_deposit_hash(
