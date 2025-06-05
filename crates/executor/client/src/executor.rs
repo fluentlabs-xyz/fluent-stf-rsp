@@ -1,12 +1,16 @@
+use std::hash::Hash;
 use std::sync::Arc;
 
-use alloy_consensus::{BlockHeader, Header, TxReceipt};
-use alloy_primitives::{address, b256, Bloom};
+use alloy_consensus::{BlockHeader, Header};
+use alloy_primitives::{address, b256};
 use reth_chainspec::ChainSpec;
+use reth_consensus::{ConsensusError, HeaderValidator};
+use reth_consensus_common::validation::validate_body_against_header;
+use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_evm::execute::{BlockExecutionStrategy, BlockExecutionStrategyFactory};
 use reth_evm_ethereum::execute::EthExecutionStrategyFactory;
 use reth_execution_types::ExecutionOutcome;
-use reth_primitives_traits::Block;
+use reth_primitives_traits::{Block, SealedHeader};
 use reth_trie::KeccakKeyHasher;
 use revm::db::{states::bundle_state::BundleRetention, WrapDatabaseRef};
 use revm_primitives::Address;
@@ -17,7 +21,8 @@ use crate::{
     io::ClientExecutorInput,
 };
 
-pub type EthClientExecutor = ClientExecutor<EthExecutionStrategyFactory<CustomEthEvmConfig>>;
+pub type EthClientExecutor =
+    ClientExecutor<EthExecutionStrategyFactory<CustomEthEvmConfig>, EthBeaconConsensus<ChainSpec>>;
 
 #[cfg(feature = "optimism")]
 pub type OpClientExecutor = ClientExecutor<
@@ -26,12 +31,14 @@ pub type OpClientExecutor = ClientExecutor<
         reth_optimism_chainspec::OpChainSpec,
         crate::custom::CustomOpEvmConfig,
     >,
+    EthBeaconConsensus<ChainSpec>,
 >;
 
 /// An executor that executes a block inside a zkVM.
 #[derive(Debug, Clone)]
-pub struct ClientExecutor<F: BlockExecutionStrategyFactory> {
+pub struct ClientExecutor<F: BlockExecutionStrategyFactory, V: HeaderValidator> {
     block_execution_strategy_factory: F,
+    header_validator: Option<V>,
 }
 
 static BRIDGE_INFO: BridgeInfo = BridgeInfo {
@@ -40,10 +47,11 @@ static BRIDGE_INFO: BridgeInfo = BridgeInfo {
     deposit_topic: b256!("0xc5797c3a3c0e6c245576d05b8c3929881b44e1a21fdb4f1b118ede3c009683c5"),
 };
 
-impl<F> ClientExecutor<F>
+impl<F, V> ClientExecutor<F, V>
 where
     F: BlockExecutionStrategyFactory,
     F::Primitives: FromInput,
+    V: HeaderValidator,
 {
     pub fn execute(
         &self,
@@ -56,6 +64,22 @@ where
         });
 
         let mut strategy = self.block_execution_strategy_factory.create_strategy(db);
+
+        profile!("validate header", {
+            self.header_validator
+                .as_ref()
+                .map(|validator| {
+                    validator.validate_header(&SealedHeader::new_unhashed(
+                        input.current_block.header().clone(),
+                    ))?;
+                    validate_body_against_header(
+                        &input.current_block.body,
+                        input.current_block.header(),
+                    )?;
+                    Ok::<(), ConsensusError>(())
+                })
+                .unwrap_or(Ok(()))
+        })?;
 
         let block = profile!("recover senders", {
             F::Primitives::from_input_block(input.current_block.clone())
@@ -130,8 +154,9 @@ impl EthClientExecutor {
         Self {
             block_execution_strategy_factory: EthExecutionStrategyFactory::new(
                 chain_spec.clone(),
-                CustomEthEvmConfig::eth(chain_spec, custom_beneficiary),
+                CustomEthEvmConfig::eth(chain_spec.clone(), custom_beneficiary),
             ),
+            header_validator: Some(EthBeaconConsensus::new(chain_spec)),
         }
     }
 }
@@ -145,6 +170,7 @@ impl OpClientExecutor {
                 crate::custom::CustomOpEvmConfig::optimism(chain_spec),
                 reth_optimism_evm::BasicOpReceiptBuilder::default(),
             ),
+            header_validator: None,
         }
     }
 }
