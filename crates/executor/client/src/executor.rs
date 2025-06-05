@@ -36,8 +36,8 @@ pub struct ClientExecutor<F: BlockExecutionStrategyFactory> {
 
 static BRIDGE_INFO: BridgeInfo = BridgeInfo {
     bridge_address: address!("0x00961Ef480Eb55e80D19ad83579A64c007002123"),
-    withdrawal_topic: b256!("0x0000000000000000000000000000000000000000000000000000000000000000"),
-    deposit_topic: b256!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+    withdrawal_topic: b256!("0x7b397c6ce16a73396390bf270a2021417ca4d97f44e82cdce3f5eb750fd34134"),
+    deposit_topic: b256!("0xc5797c3a3c0e6c245576d05b8c3929881b44e1a21fdb4f1b118ede3c009683c5"),
 };
 
 impl<F> ClientExecutor<F>
