@@ -1,3 +1,4 @@
+use std::hash::Hash;
 use std::sync::Arc;
 
 use alloy_consensus::{BlockHeader, Header, TxReceipt};
@@ -12,7 +13,7 @@ use reth_evm::{
 };
 use reth_evm_ethereum::EthEvmConfig;
 use reth_execution_types::ExecutionOutcome;
-use reth_primitives_traits::Block;
+use reth_primitives_traits::{Block, SealedHeader};
 use reth_trie::KeccakKeyHasher;
 use revm::database::WrapDatabaseRef;
 use revm_primitives::Address;
