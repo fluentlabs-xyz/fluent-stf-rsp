@@ -79,6 +79,8 @@ sp1-sdk = "5.1.0"
 reth-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false, features = ["alloy-compat", "std"] }
 reth-primitives-traits = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-ethereum-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-consensus-common = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-evm = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-evm-ethereum = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-optimism-evm = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
@@ -94,7 +96,7 @@ reth-optimism-forks = { git = "https://github.com/fluentlabs-xyz/fluent", branch
 revm = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "devel", features = ["optimism", "serde", "kzg-rs"], default-features = false }
 revm-primitives = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "devel", features = ["optimism", "serde", "kzg-rs"], default-features = false }
 
-derive_more = {version = "2.0.1", features = ["full"]}
+derive_more = { version = "2.0.1", features = ["full"] }
 # alloy
 alloy-chains = { version = "0.2.5", default-features = false }
 alloy-evm = { version = "0.15", default-features = false }
