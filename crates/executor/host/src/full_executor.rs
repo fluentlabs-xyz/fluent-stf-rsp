@@ -288,7 +288,7 @@ async fn execute_client<P: NodePrimitives, H: ExecutionHooks>(
 
         hooks.on_proving_start(client_input.current_block.number).await?;
 
-        let proof = client.prove(pk, &stdin).compressed().run().expect("Proving should work.");
+        let proof = client.prove(pk, &stdin).groth16().run().expect("Proving should work.");
         let proof_bytes = bincode::serialize(&proof.proof).unwrap();
 
         hooks
