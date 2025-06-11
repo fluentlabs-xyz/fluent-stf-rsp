@@ -70,6 +70,7 @@ reth-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "
 reth-primitives-traits = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-ethereum-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-optimism-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-consensus-common = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-evm = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
 reth-evm-ethereum = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
@@ -106,7 +107,7 @@ alloy-transport-http = { version = "0.11.1", features = [
     "reqwest-rustls-tls",
 ], default-features = false }
 alloy-transport-ws = { version = "0.11.1" }
-alloy-sol-types = { version = "1.0.0" }
+alloy-sol-types = { version = "1.1.0" }
 alloy-rpc-client = { version = "0.11.1", default-features = false }
 alloy-eips = { version = "0.11.1", default-features = false }
 alloy-rlp = "0.3.10"
