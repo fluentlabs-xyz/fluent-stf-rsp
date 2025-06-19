@@ -83,6 +83,19 @@ where
                         &input.current_block.body,
                         input.current_block.header(),
                     )?;
+
+                    let header_blob_gas_used = input
+                        .current_block
+                        .blob_gas_used()
+                        .ok_or(ConsensusError::BlobGasUsedMissing)?;
+                    let total_blob_gas = input.current_block.body().blob_gas_used();
+                    if total_blob_gas != header_blob_gas_used {
+                        return Err(ConsensusError::BlobGasUsedDiff(GotExpected {
+                            got: header_blob_gas_used,
+                            expected: total_blob_gas,
+                        }));
+                    }
+
                     Ok::<(), ConsensusError>(())
                 })
                 .unwrap_or(Ok(()))
