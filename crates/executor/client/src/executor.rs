@@ -32,7 +32,7 @@ pub type OpClientExecutor = ClientExecutor<
         reth_optimism_chainspec::OpChainSpec,
         crate::custom::CustomOpEvmConfig,
     >,
-    EthBeaconConsensus<ChainSpec>,
+    OpBeaconConsensus<reth_optimism_chainspec::OpChainSpec>,
 >;
 
 /// An executor that executes a block inside a zkVM.
@@ -71,9 +71,14 @@ where
             self.header_validator
                 .as_ref()
                 .map(|validator| {
-                    validator.validate_header(&SealedHeader::new_unhashed(
-                        input.current_block.header().clone(),
-                    ))?;
+                    let current_header =
+                        SealedHeader::new_unhashed(input.current_block.header().clone());
+                    let parent_header = SealedHeader::new_unhashed(input.parent_header().clone());
+                    validator.validate_header(&current_header)?;
+                    validator.validate_header_against_parent(&current_header, &parent_header)?;
+                    //TODO: Calculate correct total difficult
+                    validator.validate_header_with_total_difficulty(&current_header, U256::MAX)?;
+
                     validate_body_against_header(
                         &input.current_block.body,
                         input.current_block.header(),
@@ -169,10 +174,10 @@ impl OpClientExecutor {
         Self {
             block_execution_strategy_factory: reth_optimism_evm::OpExecutionStrategyFactory::new(
                 chain_spec.clone(),
-                crate::custom::CustomOpEvmConfig::optimism(chain_spec),
+                crate::custom::CustomOpEvmConfig::optimism(chain_spec.clone()),
                 reth_optimism_evm::BasicOpReceiptBuilder::default(),
             ),
-            header_validator: None,
+            header_validator: Some(OpBeaconConsensus::new(chain_spec)),
         }
     }
 }
