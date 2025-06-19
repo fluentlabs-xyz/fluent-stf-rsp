@@ -1,8 +1,14 @@
-use std::hash::Hash;
-use std::sync::Arc;
+use std::{hash::Hash, sync::Arc};
 
+use crate::{
+    custom::CustomEthEvmConfig,
+    error::ClientError,
+    events_hash::{BridgeHashes, BridgeInfo},
+    into_primitives::FromInput,
+    io::ClientExecutorInput,
+};
 use alloy_consensus::{BlockHeader, Header};
-use alloy_primitives::{address, b256};
+use alloy_primitives::{address, b256, U256};
 use reth_chainspec::ChainSpec;
 use reth_consensus::{ConsensusError, HeaderValidator};
 use reth_consensus_common::validation::validate_body_against_header;
@@ -10,16 +16,11 @@ use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_evm::execute::{BlockExecutionStrategy, BlockExecutionStrategyFactory};
 use reth_evm_ethereum::execute::EthExecutionStrategyFactory;
 use reth_execution_types::ExecutionOutcome;
-use reth_primitives_traits::{Block, SealedHeader};
+use reth_optimism_consensus::OpBeaconConsensus;
+use reth_primitives_traits::{Block, BlockBody, GotExpected, SealedHeader};
 use reth_trie::KeccakKeyHasher;
 use revm::db::{states::bundle_state::BundleRetention, WrapDatabaseRef};
 use revm_primitives::Address;
-
-use crate::events_hash::{BridgeHashes, BridgeInfo};
-use crate::{
-    custom::CustomEthEvmConfig, error::ClientError, into_primitives::FromInput,
-    io::ClientExecutorInput,
-};
 
 pub type EthClientExecutor =
     ClientExecutor<EthExecutionStrategyFactory<CustomEthEvmConfig>, EthBeaconConsensus<ChainSpec>>;
@@ -44,6 +45,7 @@ pub struct ClientExecutor<F: BlockExecutionStrategyFactory, V: HeaderValidator> 
 static BRIDGE_INFO: BridgeInfo = BridgeInfo {
     bridge_address: address!("0x00961Ef480Eb55e80D19ad83579A64c007002123"),
     withdrawal_topic: b256!("0x7b397c6ce16a73396390bf270a2021417ca4d97f44e82cdce3f5eb750fd34134"),
+    rollback_topic: b256!("0xdf7aa00ff05158efbc91b05d801c14d80f3d08daf5b13c7f066030c864be3d65"),
     deposit_topic: b256!("0xc5797c3a3c0e6c245576d05b8c3929881b44e1a21fdb4f1b118ede3c009683c5"),
 };
 

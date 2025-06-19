@@ -1,6 +1,5 @@
 use alloy_consensus::TxReceipt;
-use alloy_primitives::FixedBytes;
-use alloy_primitives::{b256, Address, Keccak256, LogData, B256};
+use alloy_primitives::{b256, Address, FixedBytes, Keccak256, LogData, B256};
 use alloy_sol_types::sol;
 use bincode::Error;
 use reth_execution_types::ExecutionOutcome;
@@ -32,6 +31,7 @@ pub struct BridgeHashes {
 pub(crate) struct BridgeInfo {
     pub bridge_address: Address,
     pub withdrawal_topic: B256,
+    pub rollback_topic: B256,
     pub deposit_topic: B256,
 }
 
@@ -41,8 +41,11 @@ impl BridgeInfo {
         execution_outcome: &ExecutionOutcome<T>,
     ) -> Result<BridgeHashes, Error> {
         Ok(BridgeHashes {
-            withdrawal_hash: execution_outcome
-                .calculate_withdrawal_root(&self.bridge_address, &self.withdrawal_topic)?,
+            withdrawal_hash: execution_outcome.calculate_withdrawal_root(
+                &self.bridge_address,
+                &self.withdrawal_topic,
+                &self.rollback_topic,
+            )?,
             deposit_hash: execution_outcome
                 .calculate_deposit_hash(&self.bridge_address, &self.deposit_topic)?,
         })
@@ -97,6 +100,7 @@ pub(crate) trait CalculateEventsHash {
         &self,
         bridge_address: &Address,
         send_topic: &B256,
+        rollback_topic: &B256,
     ) -> Result<B256, Error>;
 
     fn find_receipt_log(&self, bridge_address: &Address, send_topic: &B256) -> Vec<&LogData>;
@@ -109,9 +113,9 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
     fn calculate_deposit_hash(
         &self,
         bridge_address: &Address,
-        send_topic: &B256,
+        receive_topic: &B256,
     ) -> Result<B256, Error> {
-        let deposit_logs = self.find_receipt_log(bridge_address, send_topic);
+        let deposit_logs = self.find_receipt_log(bridge_address, receive_topic);
         let message_hashes = deposit_logs
             .into_iter()
             .filter(|log_data| log_data.data.len() >= RECEIVE_EVENT_MESSAGE_HASH_OFFSET + 32)
@@ -127,7 +131,6 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
         let mut hasher = Keccak256::new();
 
         for message_hash in message_hashes {
-            println!("Hash: {}", message_hash);
             hasher.update(message_hash);
         }
 
@@ -138,10 +141,13 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
         &self,
         bridge_address: &Address,
         send_topic: &B256,
+        rollback_topic: &B256,
     ) -> Result<B256, Error> {
         let withdrawal_logs = self.find_receipt_log(bridge_address, send_topic);
+        let rollback_logs = self.find_receipt_log(bridge_address, rollback_topic);
         let message_hashes = withdrawal_logs
             .into_iter()
+            .chain(rollback_logs.into_iter())
             .filter(|log_data| log_data.data.len() >= SEND_EVENT_MESSAGE_HASH_OFFSET + 32)
             .map(|log_data| {
                 let message_hash: [u8; 32] = log_data.data
@@ -160,8 +166,8 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
             .iter()
             .flat_map(|receipt| receipt.iter().filter(TxReceipt::status).flat_map(TxReceipt::logs))
             .filter(|log| {
-                &log.address == bridge_address
-                    && log.data.topics().first().map(|topic| topic == send_topic).unwrap_or(false)
+                &log.address == bridge_address &&
+                    log.data.topics().first().map(|topic| topic == send_topic).unwrap_or(false)
             })
             .map(|log| &log.data)
             .collect::<Vec<_>>()
@@ -171,8 +177,7 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
 #[cfg(test)]
 mod tests {
     use alloy_consensus::TxType;
-    use alloy_primitives::{b256, hex, U256};
-    use alloy_primitives::{Address, Bytes, Keccak256, Log, LogData, B256};
+    use alloy_primitives::{b256, hex, Address, Bytes, Keccak256, Log, LogData, B256, U256};
     use alloy_sol_types::SolValue;
     use reth_execution_types::ExecutionOutcome;
 
@@ -357,6 +362,7 @@ mod tests {
 
         let bridge_address = Address::from([0xa; 20]);
         let send_event_topic = B256::from([0xb; 32]);
+        let rollback_event_topic = B256::from([0x1b; 32]);
 
         execution_outcome.receipts = vec![
             vec![reth_primitives::Receipt::default(), reth_primitives::Receipt::default()],
@@ -364,7 +370,7 @@ mod tests {
         ];
 
         let actual_hash = execution_outcome
-            .calculate_withdrawal_root(&bridge_address, &send_event_topic)
+            .calculate_withdrawal_root(&bridge_address, &send_event_topic, &rollback_event_topic)
             .unwrap();
 
         assert_eq!(actual_hash, ZERO_BYTES_HASH);
@@ -411,7 +417,7 @@ mod tests {
 
         let bridge_address = Address::from([0xa; 20]);
         let send_event_topic = B256::from([0xb; 32]);
-
+        let rollback_event_topic = B256::from([0x1b; 32]);
         let event_data =  hex!("0x00000000000000000000000000000000000000000000000000000000000007d00000000000000000000000000000000000000000000000000000000000000000835612469dd5d58ef5be0da80c826de8354bbdd63eec7aea2dcca10ab8c0ff73000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000050102030405000000000000000000000000000000000000000000000000000000");
         let event_data2 = hex!("0x00000000000000000000000000000000000000000000000000000000000009d000000000000000000000000000000000000000000000000000000000000000007e3a41a1eaf8f064503f94e4090673e401318e9c6f22ee1002084d58465b4a11000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000051122334455000000000000000000000000000000000000000000000000000000");
 
@@ -445,7 +451,7 @@ mod tests {
         ];
 
         let actual_hash = execution_outcome
-            .calculate_withdrawal_root(&bridge_address, &send_event_topic)
+            .calculate_withdrawal_root(&bridge_address, &send_event_topic, &rollback_event_topic)
             .unwrap();
         let expected_withdrawal_hash: B256 =
             b256!("0x102d9a87b06e98ffe86c937e6831235147652eaf025cdce60d44b79c93d2926a");
