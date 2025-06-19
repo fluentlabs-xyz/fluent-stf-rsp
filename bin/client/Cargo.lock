@@ -2649,6 +2649,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "op-alloy-network"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c45f90eaee907df6f1c75d9295c303cfc018fdb3ef91b13b9f46e9922bfb1625"
+dependencies = [
+ "alloy-consensus",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rpc-types-eth",
+ "alloy-signer",
+ "op-alloy-consensus",
+ "op-alloy-rpc-types",
+]
+
+[[package]]
 name = "op-alloy-rpc-types"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3646,6 +3661,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-optimism-evm"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluent?branch=stf#fc41e90414826e35d5779c0d4b48907172dc5468"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "derive_more",
+ "op-alloy-consensus",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-consensus-common",
+ "reth-ethereum-forks",
+ "reth-evm",
+ "reth-execution-errors",
+ "reth-execution-types",
+ "reth-optimism-chainspec",
+ "reth-optimism-consensus",
+ "reth-optimism-forks",
+ "reth-optimism-primitives",
+ "reth-primitives-traits",
+ "revm",
+ "revm-primitives",
+ "thiserror 2.0.12",
+ "tracing",
+]
+
+[[package]]
 name = "reth-optimism-forks"
 version = "1.2.0"
 source = "git+https://github.com/fluentlabs-xyz/fluent?branch=stf#fc41e90414826e35d5779c0d4b48907172dc5468"
@@ -3973,6 +4016,8 @@ dependencies = [
  "bincode",
  "bytes",
  "itertools 0.13.0",
+ "op-alloy-network",
+ "op-alloy-rpc-types",
  "reth-chainspec",
  "reth-consensus",
  "reth-consensus-common",
@@ -3982,7 +4027,10 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-execution-types",
+ "reth-optimism-chainspec",
  "reth-optimism-consensus",
+ "reth-optimism-evm",
+ "reth-optimism-primitives",
  "reth-primitives",
  "reth-primitives-traits",
  "reth-trie",

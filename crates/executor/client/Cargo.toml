@@ -29,22 +29,22 @@ reth-consensus-common.workspace = true
 reth-ethereum-primitives = { workspace = true, features = ["serde-bincode-compat"] }
 reth-execution-types.workspace = true
 reth-primitives.workspace = true
-reth-primitives-traits.workspace = true
+reth-primitives-traits = { workspace = true, features = ["serde-bincode-compat"] }
 reth-trie.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 reth-optimism-evm = { workspace = true, optional = true }
 reth-optimism-chainspec = { workspace = true, optional = true }
-reth-optimism-primitives = { workspace = true, optional = true, features = ["serde", "serde-bincode-compat"] }
+reth-optimism-primitives = { workspace = true, optional = true, features = ["optimism", "serde", "serde-bincode-compat"] }
 reth-errors.workspace = true
 reth-chainspec.workspace = true
 
 # revm
 revm = { workspace = true, features = ["kzg-rs"] }
-revm-primitives.workspace = true
+revm-primitives = { workspace = true, features = ["optimism"] }
 
 # alloy
-alloy-eips = { workspace = true, features = ["sha2"] }
+alloy-eips = { workspace = true, features = ["sha2", "serde-bincode-compat"] }
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true

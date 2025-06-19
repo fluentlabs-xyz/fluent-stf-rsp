@@ -32,7 +32,7 @@ sp1-sdk = "4.0.0"
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 reth-optimism-evm = { workspace = true }
-reth-optimism-primitives = { workspace = true }
+reth-optimism-primitives = { workspace = true, features = ["optimism", "serde", "serde-bincode-compat"] }
 reth-optimism-chainspec = { workspace = true }
 reth-primitives = { workspace = true, features = ["secp256k1"] }
 reth-primitives-traits.workspace = true
