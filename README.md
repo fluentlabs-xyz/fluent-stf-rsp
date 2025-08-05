@@ -2,10 +2,6 @@
 
 A minimal implementation of generating zero-knowledge proofs of EVM block execution using [Reth](https://github.com/paradigmxyz/reth). Supports both Ethereum and OP Stack.
 
-> [!CAUTION]
->
-> This repository is still an active work-in-progress and is not audited or meant for production usage.
-
 ## Getting Started with Fluent
 
 1. **Clone and Start Fluent Blockchain**
