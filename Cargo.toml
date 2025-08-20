@@ -76,29 +76,29 @@ sp1-sdk = "5.1.0"
 #reth-errors = { path = "../fluent/crates/errors", default-features = false }
 #reth-ethereum-primitives = { path = "../fluent/crates/ethereum/primitives", default-features = false }
 #reth-optimism-forks = { path = "../fluent/crates/optimism/hardforks", default-features = false }
-#revm = { path = "../fluentbase/revm/crates/revm", features = ["std", "optimism"], default-features = false }
-#revm-primitives = { path = "../fluentbase/revm/crates/primitives", features = ["optimism", "serde", "kzg-rs"], default-features = false }
+revm = { path = "../revm-rwasm/crates/revm", features = ["std"], default-features = false }
+revm-primitives = { path = "../revm-rwasm/crates/primitives", features = ["serde"], default-features = false }
 
-reth-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false, features = ["alloy-compat", "std"] }
-reth-primitives-traits = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", features = ["serde", "serde-bincode-compat"], default-features = false }
-reth-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-ethereum-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-optimism-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", features = ["optimism"], default-features = false }
-reth-consensus-common = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-evm = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-evm-ethereum = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-optimism-evm = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-optimism-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", features = ["serde", "optimism", "serde-bincode-compat"], default-features = false }
-reth-storage-errors = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-trie = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-chainspec = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-optimism-chainspec = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-execution-types = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-errors = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-ethereum-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-reth-optimism-forks = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "stf", default-features = false }
-revm = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "stf", features = ["std", "optimism"], default-features = false }
-revm-primitives = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "stf", features = ["optimism", "serde", "kzg-rs"], default-features = false }
+reth-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false, features = ["alloy-compat", "std"] }
+reth-primitives-traits = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", features = ["serde", "serde-bincode-compat"], default-features = false }
+reth-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-ethereum-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-optimism-consensus = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-consensus-common = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-evm = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-evm-ethereum = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-optimism-evm = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-optimism-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", features = ["serde", "serde-bincode-compat"], default-features = false }
+reth-storage-errors = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-trie = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-chainspec = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", features = ["std"], default-features = false }
+reth-optimism-chainspec = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-execution-types = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-errors = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-ethereum-primitives = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+reth-optimism-forks = { git = "https://github.com/fluentlabs-xyz/fluent", branch = "devel", default-features = false }
+#revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm", branch = "devel", features = ["std"], default-features = false }
+#revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm", branch = "devel", features = ["serde"], default-features = false }
 
 derive_more = { version = "2.0.1", features = ["full"] }
 # alloy
