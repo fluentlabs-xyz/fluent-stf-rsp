@@ -1,8 +1,8 @@
 use std::{hash::Hash, sync::Arc};
 
-use alloy_consensus::{BlockHeader, Header, TxReceipt};
-use alloy_primitives::{address, b256, Bloom, Keccak256, B256};
+use crate::io::ClientExecutorInput;
 use alloy_consensus::{BlockHeader, Header};
+use alloy_primitives::{address, b256, Bloom, Keccak256, B256};
 use itertools::Itertools;
 use reth_chainspec::ChainSpec;
 use reth_errors::BlockExecutionError;
@@ -18,16 +18,14 @@ use reth_trie::KeccakKeyHasher;
 use revm::database::WrapDatabaseRef;
 use revm_primitives::Address;
 
-use crate::events_hash::{BridgeHashes, BridgeInfo};
 use crate::{
-    custom::CustomEthEvmConfig, error::ClientError,
-    into_primitives::FromInput, io::ClientExecutorInput,
     custom::CustomEvmFactory,
     error::ClientError,
+    events_hash::{BridgeHashes, BridgeInfo},
     into_primitives::FromInput,
-    io::{ClientExecutorInput, TrieDB, WitnessInput},
+    io::{TrieDB, WitnessInput},
     tracking::OpCodesTrackingBlockExecutor,
-    BlockValidator,  withdrawal_event_hash::CalculateWithdrawalEventHash,
+    BlockValidator,
 };
 
 pub const DESERIALZE_INPUTS: &str = "deserialize inputs";

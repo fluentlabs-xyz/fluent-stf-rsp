@@ -223,12 +223,13 @@ mod tests {
 
     #[test]
     fn test_deposit_event_hash() {
-        let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
+        let mut execution_outcome =
+            ExecutionOutcome::<reth_ethereum_primitives::Receipt>::default();
 
         let bridge_address = Address::from([0xa; 20]);
         let send_event_topic = B256::from([0xb; 32]);
 
-        execution_outcome.receipts = vec![vec![reth_primitives::Receipt {
+        execution_outcome.receipts = vec![vec![reth_ethereum_primitives::Receipt {
             tx_type: TxType::Eip1559,
             success: true,
             cumulative_gas_used: 0,
@@ -264,14 +265,15 @@ mod tests {
 
     #[test]
     fn test_any_deposit_events_hash() {
-        let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
+        let mut execution_outcome =
+            ExecutionOutcome::<reth_ethereum_primitives::Receipt>::default();
 
         let bridge_address = Address::from([0xa; 20]);
         let send_event_topic = B256::from([0xb; 32]);
 
         execution_outcome.receipts = vec![
             vec![
-                reth_primitives::Receipt {
+                reth_ethereum_primitives::Receipt {
                     tx_type: TxType::Eip1559,
                     success: true,
                     cumulative_gas_used: 0,
@@ -290,7 +292,7 @@ mod tests {
                         },
                     ],
                 },
-                reth_primitives::Receipt {
+                reth_ethereum_primitives::Receipt {
                     tx_type: TxType::Eip1559,
                     success: true,
                     cumulative_gas_used: 0,
@@ -310,7 +312,7 @@ mod tests {
                     ],
                 },
             ],
-            vec![reth_primitives::Receipt {
+            vec![reth_ethereum_primitives::Receipt {
                 tx_type: TxType::Eip1559,
                 success: true,
                 cumulative_gas_used: 0,
@@ -340,14 +342,21 @@ mod tests {
 
     #[test]
     fn test_empty_deposit_hash() {
-        let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
+        let mut execution_outcome =
+            ExecutionOutcome::<reth_ethereum_primitives::Receipt>::default();
 
         let bridge_address = Address::from([0xa; 20]);
         let send_event_topic = B256::from([0xb; 32]);
 
         execution_outcome.receipts = vec![
-            vec![reth_primitives::Receipt::default(), reth_primitives::Receipt::default()],
-            vec![reth_primitives::Receipt::default(), reth_primitives::Receipt::default()],
+            vec![
+                reth_ethereum_primitives::Receipt::default(),
+                reth_ethereum_primitives::Receipt::default(),
+            ],
+            vec![
+                reth_ethereum_primitives::Receipt::default(),
+                reth_ethereum_primitives::Receipt::default(),
+            ],
         ];
 
         let actual_hash =
@@ -358,15 +367,22 @@ mod tests {
 
     #[test]
     fn test_empty_withdrawal_root() {
-        let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
+        let mut execution_outcome =
+            ExecutionOutcome::<reth_ethereum_primitives::Receipt>::default();
 
         let bridge_address = Address::from([0xa; 20]);
         let send_event_topic = B256::from([0xb; 32]);
         let rollback_event_topic = B256::from([0x1b; 32]);
 
         execution_outcome.receipts = vec![
-            vec![reth_primitives::Receipt::default(), reth_primitives::Receipt::default()],
-            vec![reth_primitives::Receipt::default(), reth_primitives::Receipt::default()],
+            vec![
+                reth_ethereum_primitives::Receipt::default(),
+                reth_ethereum_primitives::Receipt::default(),
+            ],
+            vec![
+                reth_ethereum_primitives::Receipt::default(),
+                reth_ethereum_primitives::Receipt::default(),
+            ],
         ];
 
         let actual_hash = execution_outcome
@@ -378,7 +394,8 @@ mod tests {
 
     #[test]
     fn test_deposit_hash() {
-        let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
+        let mut execution_outcome =
+            ExecutionOutcome::<reth_ethereum_primitives::Receipt>::default();
 
         let bridge_address = Address::from([0xa; 20]);
         let send_event_topic = B256::from([0xb; 32]);
@@ -387,7 +404,7 @@ mod tests {
 
         execution_outcome.receipts = vec![
             vec![
-                reth_primitives::Receipt {
+                reth_ethereum_primitives::Receipt {
                     tx_type: Default::default(),
                     success: true,
                     cumulative_gas_used: 0,
@@ -397,9 +414,12 @@ mod tests {
                             .unwrap(),
                     }],
                 },
-                reth_primitives::Receipt::default(),
+                reth_ethereum_primitives::Receipt::default(),
             ],
-            vec![reth_primitives::Receipt::default(), reth_primitives::Receipt::default()],
+            vec![
+                reth_ethereum_primitives::Receipt::default(),
+                reth_ethereum_primitives::Receipt::default(),
+            ],
         ];
 
         let actual_hash =
@@ -413,7 +433,8 @@ mod tests {
 
     #[test]
     fn test_withdrawal_root() {
-        let mut execution_outcome = ExecutionOutcome::<reth_primitives::Receipt>::default();
+        let mut execution_outcome =
+            ExecutionOutcome::<reth_ethereum_primitives::Receipt>::default();
 
         let bridge_address = Address::from([0xa; 20]);
         let send_event_topic = B256::from([0xb; 32]);
@@ -423,7 +444,7 @@ mod tests {
 
         execution_outcome.receipts = vec![
             vec![
-                reth_primitives::Receipt {
+                reth_ethereum_primitives::Receipt {
                     tx_type: Default::default(),
                     success: true,
                     cumulative_gas_used: 0,
@@ -433,10 +454,10 @@ mod tests {
                             .unwrap(),
                     }],
                 },
-                reth_primitives::Receipt::default(),
+                reth_ethereum_primitives::Receipt::default(),
             ],
             vec![
-                reth_primitives::Receipt {
+                reth_ethereum_primitives::Receipt {
                     tx_type: Default::default(),
                     success: true,
                     cumulative_gas_used: 0,
@@ -446,7 +467,7 @@ mod tests {
                             .unwrap(),
                     }],
                 },
-                reth_primitives::Receipt::default(),
+                reth_ethereum_primitives::Receipt::default(),
             ],
         ];
 

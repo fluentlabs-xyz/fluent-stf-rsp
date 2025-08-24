@@ -4,9 +4,11 @@
 //!
 //! The [CustomEvmConfig] type implements the [ConfigureEvm] and [ConfigureEvmEnv] traits,
 //! configuring the custom CustomEvmConfig precompiles and instructions.
-
-use alloy_evm::EthEvm;
-use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv, EvmFactory};
+use alloy_evm::{precompiles::PrecompilesMap, EthEvm};
+use reth_evm::{
+    fluentbase_revm::{RwasmBuilder, RwasmPrecompiles},
+    Database, EvmEnv, EvmFactory,
+};
 use revm::{
     bytecode::opcode::OpCode,
     context::{
@@ -103,7 +105,8 @@ impl EvmFactory for CustomEvmFactory {
             .with_cfg(input.cfg_env)
             .with_block(input.block_env)
             .build_mainnet_with_inspector(NoOpInspector {})
-            .with_precompiles(precompiles);
+            .with_precompiles(precompiles)
+            .build_rwasm_with_inspector(NoOpInspector {});
 
         EthEvm::new(evm, false)
     }

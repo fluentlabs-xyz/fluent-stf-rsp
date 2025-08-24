@@ -115,20 +115,6 @@ impl BlockValidator<ChainSpec> for EthPrimitives {
 }
 
 #[cfg(feature = "optimism")]
-impl IntoPrimitives<op_alloy_network::Optimism> for reth_optimism_primitives::OpPrimitives {
-    fn into_primitive_block(
-        block: alloy_rpc_types::Block<op_alloy_rpc_types::Transaction>,
-    ) -> Self::Block {
-        let block = block.map_transactions(|tx| tx.inner.inner.into_inner());
-        block.into_consensus()
-    }
-
-    fn into_consensus_header(header: alloy_rpc_types::Header) -> Header {
-        header.into()
-    }
-}
-
-#[cfg(feature = "optimism")]
 impl FromInput for reth_optimism_primitives::OpPrimitives {
     fn from_input_block(block: Block<Self::SignedTx>) -> Self::Block {
         block

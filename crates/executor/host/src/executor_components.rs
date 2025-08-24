@@ -106,30 +106,30 @@ where
     }
 }
 
-#[derive(Debug, Default)]
-pub struct OpExecutorComponents<H, P = EnvProver> {
-    phantom: PhantomData<(H, P)>,
-}
+// #[derive(Debug, Default)]
+// pub struct OpExecutorComponents<H, P = EnvProver> {
+//     phantom: PhantomData<(H, P)>,
+// }
 
-impl<H, P> ExecutorComponents for OpExecutorComponents<H, P>
-where
-    H: ExecutionHooks,
-    P: Prover<CpuProverComponents> + MaybeProveWithCycles + 'static,
-{
-    type Prover = P;
-
-    type Network = Optimism;
-
-    type Primitives = OpPrimitives;
-
-    type EvmConfig = OpEvmConfig;
-
-    type ChainSpec = OpChainSpec;
-
-    type Hooks = H;
-
-    fn try_into_chain_spec(genesis: &Genesis) -> eyre::Result<OpChainSpec> {
-        let spec = genesis.try_into()?;
-        Ok(spec)
-    }
-}
+// impl<H, P> ExecutorComponents for OpExecutorComponents<H, P>
+// where
+//     H: ExecutionHooks,
+//     P: Prover<CpuProverComponents> + MaybeProveWithCycles + 'static,
+// {
+//     type Prover = P;
+//
+//     type Network = Optimism;
+//
+//     type Primitives = OpPrimitives;
+//
+//     type EvmConfig = OpEvmConfig;
+//
+//     type ChainSpec = OpChainSpec;
+//
+//     type Hooks = H;
+//
+//     fn try_into_chain_spec(genesis: &Genesis) -> eyre::Result<OpChainSpec> {
+//         let spec = genesis.try_into()?;
+//         Ok(spec)
+//     }
+// }
