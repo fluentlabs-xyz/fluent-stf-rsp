@@ -12,7 +12,6 @@ use reth_evm::{
 };
 use reth_evm_ethereum::EthEvmConfig;
 use reth_execution_types::ExecutionOutcome;
-use reth_optimism_consensus::OpBeaconConsensus;
 use reth_primitives_traits::{Block, BlockBody, GotExpected, SealedHeader};
 use reth_trie::KeccakKeyHasher;
 use revm::database::WrapDatabaseRef;
