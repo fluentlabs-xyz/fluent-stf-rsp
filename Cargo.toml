@@ -125,7 +125,7 @@ revm-state = { version = "7.0.1", default-features = false }
 derive_more = { version = "2.0.1", features = ["full"] }
 # alloy
 alloy-chains = { version = "0.2.5", default-features = false }
-alloy-evm = { version = "0.15", default-features = false }
+alloy-evm = { version = "0.15", default-features = false, features = ["std"] }
 alloy-primitives = { version = "1.3.0", default-features = false, features = ["sha3-keccak", "map-foldhash"] }
 alloy-provider = { version = "1.0.23", default-features = false, features = [
     "reqwest",
@@ -158,7 +158,6 @@ op-alloy-consensus = "0.18.12"
 op-alloy-network = "0.18.12"
 op-alloy-rpc-types = "0.18.12"
 
-
 [workspace.lints]
 rust.missing_debug_implementations = "warn"
 rust.unreachable_pub = "warn"
@@ -174,14 +173,6 @@ sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-
 k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-5.0.0" }
 p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p256-13.2-sp1-5.0.0" }
 
-#revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm", branch = "devel", features = ["std"], default-features = false }
-#revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm", branch = "devel", features = ["serde"], default-features = false }
-#revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm", branch = "devel", default-features = false }
-#revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm", branch = "devel", default-features = false }
-#revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm", branch = "devel", default-features = false }
-#revm-state = { git = "https://github.com/fluentlabs-xyz/revm-rwasm", branch = "devel", default-features = false }
-#alloy-evm = { git = "https://github.com/fluentlabs-xyz/alloy-rwasm.git", branch = "devel" }
-
 
 revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
 revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
@@ -194,4 +185,8 @@ revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branc
 revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
 revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
 op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-alloy-evm = { git = "https://github.com/fluentlabs-xyz/alloy-rwasm.git", branch = "devel" }
+#alloy-evm = { git = "https://github.com/fluentlabs-xyz/alloy-rwasm.git", branch = "devel", features = ["std"] }
+alloy-evm = { path = "../alloy-rwasm/crates/evm" }
+
+#[patch."https://github.com/fluentlabs-xyz/fluent"]
+#reth-evm = { path = "../fluent/crates/evm/evm", default-features = false }
