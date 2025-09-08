@@ -53,7 +53,7 @@ impl Args {
             rpc_url: Some(self.http_rpc_url.clone()),
             cache_dir: None,
             custom_beneficiary: None,
-            prove_mode: (!self.execute_only).then_some(SP1ProofMode::Compressed),
+            prove_mode: (!self.execute_only).then_some(SP1ProofMode::Groth16),
             skip_client_execution: true,
             opcode_tracking: false,
         };
