@@ -1,10 +1,4 @@
-use std::{
-    fmt::{Debug, Formatter},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
+use alloy_primitives::B256;
 use alloy_provider::Provider;
 use either::Either;
 use eyre::bail;
@@ -12,7 +6,16 @@ use reth_primitives_traits::NodePrimitives;
 use rsp_client_executor::io::{ClientExecutorInput, CommittedHeader};
 use serde::de::DeserializeOwned;
 use sp1_prover::components::CpuProverComponents;
-use sp1_sdk::{ExecutionReport, Prover, SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey};
+use sp1_sdk::{
+    ExecutionReport, Prover, SP1Proof, SP1ProofWithPublicValues, SP1ProvingKey, SP1PublicValues,
+    SP1Stdin, SP1VerifyingKey,
+};
+use std::{
+    fmt::{Debug, Formatter},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{task, time::sleep};
 use tracing::{info, info_span, warn};
 
@@ -76,7 +79,6 @@ pub trait BlockExecutor<C: ExecutorComponents> {
         stdin.write_vec(buffer);
 
         let stdin = Arc::new(stdin);
-
         if self.config().skip_client_execution {
             info!("Client execution skipped");
         } else {
@@ -91,15 +93,20 @@ pub trait BlockExecutor<C: ExecutorComponents> {
             let (mut public_values, execution_report) = execute_result?;
 
             // Read the block header.
-            let header = public_values.read::<CommittedHeader>().header;
-            let executed_block_hash = header.hash_slow();
+            let parent_hash = public_values.read::<B256>();
+            let block_hash = public_values.read::<B256>();
+
             let input_block_hash = client_input.current_block.header.hash_slow();
 
-            if input_block_hash != executed_block_hash {
-                return Err(HostError::HeaderMismatch(executed_block_hash, input_block_hash))?
+            if input_block_hash != block_hash {
+                return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?
             }
 
-            info!(?executed_block_hash, "Execution successful");
+            if client_input.current_block.header.parent_hash != parent_hash {
+                return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?
+            }
+
+            info!(?block_hash, "Execution successful");
 
             hooks
                 .on_execution_end::<C::Primitives>(&client_input.current_block, &execution_report)
