@@ -21,8 +21,8 @@ use crate::error::ClientError;
 
 pub type EthClientExecutorInput = ClientExecutorInput<EthPrimitives>;
 
-#[cfg(feature = "optimism")]
-pub type OpClientExecutorInput = ClientExecutorInput<reth_optimism_primitives::OpPrimitives>;
+// #[cfg(feature = "optimism")]
+// pub type OpClientExecutorInput = ClientExecutorInput<reth_optimism_primitives::OpPrimitives>;
 
 /// The input for the client to execute a block and fully verify the STF (state transition
 /// function).

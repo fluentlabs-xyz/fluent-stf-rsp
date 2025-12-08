@@ -11,8 +11,8 @@ use reth_evm::{
     ConfigureEvm,
 };
 use reth_evm_ethereum::EthEvmConfig;
-use reth_optimism_chainspec::OpChainSpec;
-use reth_optimism_evm::OpEvmConfig;
+// use reth_optimism_chainspec::OpChainSpec;
+// use reth_optimism_evm::OpEvmConfig;
 use reth_primitives_traits::{Block, BlockBody, SealedHeader};
 use reth_trie::{HashedPostState, KeccakKeyHasher};
 use revm::database::CacheDB;
@@ -27,7 +27,7 @@ use crate::HostError;
 
 pub type EthHostExecutor = HostExecutor<EthEvmConfig<ChainSpec, CustomEvmFactory>, ChainSpec>;
 
-pub type OpHostExecutor = HostExecutor<OpEvmConfig, OpChainSpec>;
+// pub type OpHostExecutor = HostExecutor<OpEvmConfig, OpChainSpec>;
 
 /// An executor that fetches data from a [Provider] to execute blocks in the [ClientExecutor].
 #[derive(Debug, Clone)]
@@ -48,11 +48,11 @@ impl EthHostExecutor {
     }
 }
 
-impl OpHostExecutor {
-    pub fn optimism(chain_spec: Arc<OpChainSpec>) -> Self {
-        Self { evm_config: OpEvmConfig::optimism(chain_spec.clone()), chain_spec }
-    }
-}
+// impl OpHostExecutor {
+//     pub fn optimism(chain_spec: Arc<OpChainSpec>) -> Self {
+//         Self { evm_config: OpEvmConfig::optimism(chain_spec.clone()), chain_spec }
+//     }
+// }
 
 impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
     /// Creates a new [HostExecutor].
