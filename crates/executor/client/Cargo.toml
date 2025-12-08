@@ -24,7 +24,7 @@ rsp-primitives.workspace = true
 # reth
 reth-consensus.workspace = true
 reth-ethereum-consensus.workspace = true
-reth-optimism-consensus = { workspace = true, optional = true }
+#reth-optimism-consensus = { workspace = true, optional = true }
 reth-consensus-common.workspace = true
 reth-ethereum-primitives = { workspace = true, features = ["serde-bincode-compat"] }
 reth-execution-types.workspace = true
@@ -32,15 +32,15 @@ reth-primitives-traits.workspace = true
 reth-trie.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
-reth-optimism-evm = { workspace = true, optional = true }
-reth-optimism-chainspec = { workspace = true, optional = true, features = ["serde"] }
-reth-optimism-primitives = { workspace = true, optional = true, features = ["serde", "serde-bincode-compat"] }
+#reth-optimism-evm = { workspace = true, optional = true }
+#reth-optimism-chainspec = { workspace = true, optional = true, features = ["serde"] }
+#reth-optimism-primitives = { workspace = true, optional = true, features = ["serde", "serde-bincode-compat"] }
 reth-errors.workspace = true
 reth-chainspec.workspace = true
 
 # revm
 revm = { workspace = true, features = ["kzg-rs"] }
-revm-primitives = { workspace = true }
+revm-primitives = { workspace = true, features = ["serde"] }
 
 # alloy
 alloy-evm = { workspace = true, features = ["std"] }
@@ -61,9 +61,9 @@ bytes = "1.10.1"
 optimism = [
     "dep:op-alloy-network",
     "dep:op-alloy-rpc-types",
-    "dep:reth-optimism-evm",
-    "dep:reth-optimism-consensus",
-    "dep:reth-optimism-chainspec",
-    "dep:reth-optimism-primitives",
-    "rsp-primitives/optimism",
+    #    "dep:reth-optimism-evm",
+    #    "dep:reth-optimism-consensus",
+    #    "dep:reth-optimism-chainspec",
+    #    "dep:reth-optimism-primitives",
+    #    "rsp-primitives/optimism",
 ]

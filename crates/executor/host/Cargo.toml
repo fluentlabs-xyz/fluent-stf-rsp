@@ -34,11 +34,11 @@ sp1-prover.workspace = true
 # reth
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
-reth-optimism-evm = { workspace = true }
-reth-optimism-chainspec = { workspace = true }
-reth-optimism-primitives.workspace = true
+#reth-optimism-evm = { workspace = true }
+#reth-optimism-chainspec = { workspace = true }
+#reth-optimism-primitives.workspace = true
 reth-ethereum-primitives.workspace = true
-reth-primitives-traits  = { workspace = true, features = ["secp256k1"] }
+reth-primitives-traits = { workspace = true, features = ["secp256k1"] }
 reth-trie.workspace = true
 reth-errors.workspace = true
 reth-chainspec.workspace = true
