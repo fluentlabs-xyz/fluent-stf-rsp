@@ -3,15 +3,9 @@
 #[cfg(feature = "sp1")]
 sp1_zkvm::entrypoint!(main);
 
-use rsp_client_executor::{
-    executor::EthClientExecutor,
-    io::EthClientExecutorInput,
-};
+use rsp_client_executor::{executor::EthClientExecutor, io::EthClientExecutorInput};
 #[cfg(feature = "sp1")]
-use rsp_client_executor::{
-    executor::DESERIALZE_INPUTS,
-    utils::profile_report,
-};
+use rsp_client_executor::{executor::DESERIALZE_INPUTS, utils::profile_report};
 use std::sync::Arc;
 
 #[cfg(feature = "sp1")]
@@ -40,46 +34,45 @@ pub fn main() {
 
 #[cfg(feature = "nitro")]
 fn main() -> anyhow::Result<()> {
-    use std::io::{Read, Write};
-    use vsock::{SockAddr, VsockListener};
-    use sha2::{Sha256, Digest};
-    use aws_nitro_enclaves_nsm_api::{driver, api::{Request, Response}};
+    use aws_nitro_enclaves_nsm_api::{
+        api::{Request, Response},
+        driver,
+    };
     use nix::libc;
     use serde_bytes::ByteBuf;
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use vsock::{SockAddr, VsockListener};
 
     println!("Enclave started, listening on vsock port 5005");
 
     let addr = SockAddr::new_vsock(libc::VMADDR_CID_ANY, 5005);
 
-    // Bind listener
     let listener = VsockListener::bind(&addr)?;
 
     loop {
         let (mut stream, _addr) = listener.accept()?;
         println!("Accepted connection");
 
-        // Read incoming bytes (expect serialized EthClientExecutorInput)
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf)?;
 
         println!("Received input, size: {} bytes", buf.len());
 
-        // Deserialize input
         let input: EthClientExecutorInput = bincode::deserialize(&buf)
             .map_err(|e| anyhow::anyhow!("Failed to deserialize input: {}", e))?;
 
-        // Execute the block.
         let executor = EthClientExecutor::eth(
             Arc::new((&input.genesis).try_into().unwrap()),
             input.custom_beneficiary,
         );
-        let (header, events_hash) = executor.execute(input)
+        let (header, events_hash) = executor
+            .execute(input)
             .map_err(|e| anyhow::anyhow!("Failed to execute client: {:?}", e))?;
-        
+
         let block_hash = header.hash_slow();
         let parent_hash = header.parent_hash;
 
-        // Compute result hash (combining all committed values)
         let mut hasher = Sha256::new();
         hasher.update(AsRef::<[u8]>::as_ref(&parent_hash));
         hasher.update(AsRef::<[u8]>::as_ref(&block_hash));
@@ -87,7 +80,6 @@ fn main() -> anyhow::Result<()> {
         hasher.update(AsRef::<[u8]>::as_ref(&events_hash.deposit_hash));
         let result_hash = hasher.finalize();
 
-        // Generate attestation
         let nsm_fd = driver::nsm_init();
         let request = Request::Attestation {
             public_key: None,
@@ -101,7 +93,6 @@ fn main() -> anyhow::Result<()> {
         };
         driver::nsm_exit(nsm_fd);
 
-        // Send back result hash and attestation (in JSON)
         let output = serde_json::json!({
             "parent_hash": hex::encode(AsRef::<[u8]>::as_ref(&parent_hash)),
             "block_hash": hex::encode(AsRef::<[u8]>::as_ref(&block_hash)),
