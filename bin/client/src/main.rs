@@ -1,13 +1,20 @@
-#![no_main]
+#![cfg_attr(feature = "sp1", no_main)]
+
+#[cfg(feature = "sp1")]
 sp1_zkvm::entrypoint!(main);
 
 use rsp_client_executor::{
-    executor::{EthClientExecutor, DESERIALZE_INPUTS},
-    io::{CommittedHeader, EthClientExecutorInput},
+    executor::EthClientExecutor,
+    io::EthClientExecutorInput,
+};
+#[cfg(feature = "sp1")]
+use rsp_client_executor::{
+    executor::DESERIALZE_INPUTS,
     utils::profile_report,
 };
 use std::sync::Arc;
 
+#[cfg(feature = "sp1")]
 pub fn main() {
     // Read the input.
     let input = profile_report!(DESERIALZE_INPUTS, {
@@ -29,4 +36,83 @@ pub fn main() {
     sp1_zkvm::io::commit(&block_hash);
     sp1_zkvm::io::commit(&events_hash.withdrawal_hash);
     sp1_zkvm::io::commit(&events_hash.deposit_hash);
+}
+
+#[cfg(feature = "nitro")]
+fn main() -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    use vsock::{SockAddr, VsockListener};
+    use sha2::{Sha256, Digest};
+    use aws_nitro_enclaves_nsm_api::{driver, api::{Request, Response}};
+    use nix::libc;
+    use serde_bytes::ByteBuf;
+
+    println!("Enclave started, listening on vsock port 5005");
+
+    let addr = SockAddr::new_vsock(libc::VMADDR_CID_ANY, 5005);
+
+    // Bind listener
+    let listener = VsockListener::bind(&addr)?;
+
+    loop {
+        let (mut stream, _addr) = listener.accept()?;
+        println!("Accepted connection");
+
+        // Read incoming bytes (expect serialized EthClientExecutorInput)
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf)?;
+
+        println!("Received input, size: {} bytes", buf.len());
+
+        // Deserialize input
+        let input: EthClientExecutorInput = bincode::deserialize(&buf)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize input: {}", e))?;
+
+        // Execute the block.
+        let executor = EthClientExecutor::eth(
+            Arc::new((&input.genesis).try_into().unwrap()),
+            input.custom_beneficiary,
+        );
+        let (header, events_hash) = executor.execute(input)
+            .map_err(|e| anyhow::anyhow!("Failed to execute client: {:?}", e))?;
+        
+        let block_hash = header.hash_slow();
+        let parent_hash = header.parent_hash;
+
+        // Compute result hash (combining all committed values)
+        let mut hasher = Sha256::new();
+        hasher.update(AsRef::<[u8]>::as_ref(&parent_hash));
+        hasher.update(AsRef::<[u8]>::as_ref(&block_hash));
+        hasher.update(AsRef::<[u8]>::as_ref(&events_hash.withdrawal_hash));
+        hasher.update(AsRef::<[u8]>::as_ref(&events_hash.deposit_hash));
+        let result_hash = hasher.finalize();
+
+        // Generate attestation
+        let nsm_fd = driver::nsm_init();
+        let request = Request::Attestation {
+            public_key: None,
+            user_data: Some(ByteBuf::from(result_hash.to_vec())),
+            nonce: None,
+        };
+        let response = driver::nsm_process_request(nsm_fd, request);
+        let attestation_doc = match response {
+            Response::Attestation { document } => document,
+            _ => return Err(anyhow::anyhow!("Failed to get attestation document")),
+        };
+        driver::nsm_exit(nsm_fd);
+
+        // Send back result hash and attestation (in JSON)
+        let output = serde_json::json!({
+            "parent_hash": hex::encode(AsRef::<[u8]>::as_ref(&parent_hash)),
+            "block_hash": hex::encode(AsRef::<[u8]>::as_ref(&block_hash)),
+            "withdrawal_hash": hex::encode(AsRef::<[u8]>::as_ref(&events_hash.withdrawal_hash)),
+            "deposit_hash": hex::encode(AsRef::<[u8]>::as_ref(&events_hash.deposit_hash)),
+            "result_hash": hex::encode(result_hash),
+            "attestation": attestation_doc,
+        });
+
+        let serialized = serde_json::to_vec(&output)?;
+        stream.write_all(&serialized)?;
+        println!("Sent response, size: {} bytes", serialized.len());
+    }
 }
