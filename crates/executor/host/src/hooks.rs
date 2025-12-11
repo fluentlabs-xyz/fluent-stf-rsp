@@ -34,6 +34,16 @@ pub trait ExecutionHooks: Send {
     ) -> impl Future<Output = eyre::Result<()>> {
         async { Ok(()) }
     }
+
+    #[cfg(feature = "nitro")]
+    fn on_nitro_attestation_end(
+        &self,
+        _block_number: u64,
+        _attestation: &[u8],
+        _proving_duration: Duration,
+    ) -> impl Future<Output = eyre::Result<()>> {
+        async { Ok(()) }
+    }
 }
 
 impl ExecutionHooks for () {}

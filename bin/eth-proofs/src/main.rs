@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use alloy_provider::{Provider, ProviderBuilder, WsConnect};
+use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use clap::Parser;
 use cli::Args;
 use eth_proofs::EthProofsClient;
@@ -55,7 +55,7 @@ async fn main() -> eyre::Result<()> {
 
     let ws = WsConnect::new(args.ws_rpc_url);
     let ws_provider = ProviderBuilder::new().connect_ws(ws).await?;
-    let http_provider = create_provider(args.http_rpc_url);
+    let http_provider: RootProvider = create_provider(args.http_rpc_url);
 
     // Subscribe to block headers.
     let subscription = ws_provider.subscribe_blocks().await?;
@@ -71,28 +71,31 @@ async fn main() -> eyre::Result<()> {
 
     let client = Arc::new(client);
 
-    let executor = FullExecutor::<EthExecutorComponents<_, _>, _>::try_new(
-        http_provider.clone(),
-        elf,
-        block_execution_strategy_factory,
-        client,
-        eth_proofs_client,
-        config,
-    )
-    .await?;
+    #[cfg(feature = "sp1")]
+    {
+        let executor = FullExecutor::<EthExecutorComponents<_, _>, _>::try_new(
+            http_provider.clone(),
+            elf,
+            block_execution_strategy_factory,
+            client,
+            eth_proofs_client,
+            config,
+        )
+        .await?;
 
-    info!("Latest block number: {}", http_provider.get_block_number().await?);
+        info!("Latest block number: {}", http_provider.get_block_number().await?);
 
-    while let Some(header) = stream.next().await {
-        // Wait for the block to be avaliable in the HTTP provider
-        executor.wait_for_block(header.number).await?;
+        while let Some(header) = stream.next().await {
+            // Wait for the block to be avaliable in the HTTP provider
+            executor.wait_for_block(header.number).await?;
 
-        if let Err(err) = executor.execute(header.number).await {
-            let error_message = format!("Error handling block {}: {err}", header.number);
-            error!(error_message);
+            if let Err(err) = executor.execute(header.number).await {
+                let error_message = format!("Error handling block {}: {err}", header.number);
+                error!(error_message);
 
-            if let Some(alerting_client) = &alerting_client {
-                alerting_client.send_alert(error_message).await;
+                if let Some(alerting_client) = &alerting_client {
+                    alerting_client.send_alert(error_message).await;
+                }
             }
         }
     }

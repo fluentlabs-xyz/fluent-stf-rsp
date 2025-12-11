@@ -4,9 +4,9 @@ name = "rsp"
 edition = "2021"
 
 [features]
-default = ["sp1"]
-sp1 = []
-nitro = []
+default = []
+sp1 = ["rsp-host-executor/sp1"]
+nitro = ["rsp-host-executor/nitro"]
 
 [dependencies]
 tokio.workspace = true
@@ -22,7 +22,7 @@ csv = "1.1"
 
 # workspace
 rsp-client-executor.workspace = true
-rsp-host-executor.workspace = true
+rsp-host-executor = { workspace = true, default-features = false }
 rsp-primitives.workspace = true
 rsp-provider.workspace = true
 

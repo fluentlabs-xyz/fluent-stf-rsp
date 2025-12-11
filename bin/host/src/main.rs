@@ -1,15 +1,18 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-use std::sync::Arc;
-
+use alloy_provider::RootProvider;
 use clap::Parser;
 use execute::PersistExecutionReport;
+#[cfg(feature = "sp1")]
+use rsp_host_executor::build_executor;
+#[cfg(feature = "nitro")]
+use rsp_host_executor::build_executor_with_nitro;
 use rsp_host_executor::{
-    build_executor, create_eth_block_execution_strategy_factory, BlockExecutor,
-    EthExecutorComponents,
+    create_eth_block_execution_strategy_factory, BlockExecutor, EthExecutorComponents,
 };
 use rsp_provider::create_provider;
 use sp1_sdk::{include_elf, EnvProver};
+use std::{path::PathBuf, sync::Arc};
 use tracing_subscriber::{
     filter::EnvFilter, fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
 };
@@ -53,41 +56,40 @@ async fn main() -> eyre::Result<()> {
 
     let prover_client = Arc::new(EnvProver::new());
 
-    // if config.chain.is_optimism() {
-    //     let elf = include_elf!("rsp-client-op").to_vec();
-    //     let block_execution_strategy_factory =
-    //         create_op_block_execution_strategy_factory(&config.genesis);
-    //     let provider = config.rpc_url.as_ref().map(|url| create_provider(url.clone()));
-    //
-    // let executor = build_executor::<EthExecutorComponents<_>, _>(
-    //     elf,
-    //     provider,
-    //     block_execution_strategy_factory,
-    //     prover_client,
-    //     persist_execution_report,
-    //     config,
-    // )
-    // .await?;
-    //
-    //     executor.execute(block_number).await?;
-    // } else {
-    let elf = include_elf!("rsp-client").to_vec();
     let block_execution_strategy_factory =
         create_eth_block_execution_strategy_factory(&config.genesis, config.custom_beneficiary);
-    let provider = config.rpc_url.as_ref().map(|url| create_provider(url.clone()));
+    let provider: Option<RootProvider> =
+        config.rpc_url.as_ref().map(|url| create_provider(url.clone()));
 
-    let executor = build_executor::<EthExecutorComponents<_>, _>(
-        elf,
-        provider,
-        block_execution_strategy_factory,
-        prover_client,
-        persist_execution_report,
-        config,
-    )
-    .await?;
-
-    executor.execute(block_number).await?;
-    // }
+    if cfg!(feature = "sp1") {
+        #[cfg(feature = "sp1")]
+        let executor = build_executor::<EthExecutorComponents<_>, _>(
+            include_elf!("rsp-client").to_vec(),
+            provider,
+            block_execution_strategy_factory,
+            prover_client,
+            persist_execution_report,
+            config,
+        )
+        .await?;
+        #[cfg(feature = "sp1")]
+        executor.execute(block_number).await?;
+    } else if cfg!(feature = "nitro") {
+        #[cfg(feature = "nitro")]
+        let executor = build_executor_with_nitro::<EthExecutorComponents<_>, _>(
+            PathBuf::from("rsp-client"),
+            provider,
+            block_execution_strategy_factory,
+            prover_client,
+            persist_execution_report,
+            config,
+        )
+        .await?;
+        #[cfg(feature = "nitro")]
+        executor.execute(block_number).await?;
+    } else {
+        return Err(eyre::eyre!("No features of proving engine enable"));
+    };
 
     Ok(())
 }

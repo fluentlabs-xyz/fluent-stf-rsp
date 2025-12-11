@@ -6,7 +6,10 @@ edition = "2021"
 
 [features]
 default = ["sp1"]
-sp1 = ["dep:sp1-zkvm"]
+sp1 = [
+    "dep:sp1-zkvm",
+    "rsp-client-executor/sp1",
+]
 nitro = [
     "dep:vsock",
     "dep:sha2",
@@ -16,6 +19,7 @@ nitro = [
     "dep:aws-nitro-enclaves-nsm-api",
     "dep:anyhow",
     "dep:nix",
+    "rsp-client-executor/nitro",
 ]
 
 [dependencies]

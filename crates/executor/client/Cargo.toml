@@ -58,6 +58,8 @@ alloy-sol-types.workspace = true
 bytes = "1.10.1"
 
 [features]
+sp1 = []
+nitro = []
 optimism = [
     "dep:op-alloy-network",
     "dep:op-alloy-rpc-types",

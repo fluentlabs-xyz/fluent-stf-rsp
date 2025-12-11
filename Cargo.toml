@@ -13,6 +13,11 @@ members = [
 exclude = []
 resolver = "2"
 
+[workspace.features]
+default = []
+sp1 = ["rsp-host-executor/sp1"]
+nitro = ["rsp-host-executor/nitro"]
+
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -45,7 +50,7 @@ rlp = "0.5.2"
 rsp-rpc-db = { path = "./crates/storage/rpc-db" }
 rsp-witness-db = { path = "./crates/storage/witness-db" }
 rsp-client-executor = { path = "./crates/executor/client" }
-rsp-host-executor = { path = "./crates/executor/host" }
+rsp-host-executor = { path = "./crates/executor/host", default-features = false }
 rsp-mpt = { path = "./crates/mpt" }
 rsp-primitives = { path = "./crates/primitives" }
 rsp-provider = { path = "./crates/provider" }
@@ -200,8 +205,6 @@ revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.
 op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
 alloy-evm = { git = "https://github.com/fluentlabs-xyz/alloy-rwasm.git", branch = "stf", features = ["std", "svm"] }
 #alloy-evm = { path = "../alloy-rwasm/crates/evm" }
-
-
 
 revm-rwasm-precompile = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", package = "revm-precompile", features = ["svm"] }
 

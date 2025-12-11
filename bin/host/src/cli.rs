@@ -100,6 +100,8 @@ impl HostArgs {
             prove_mode: self.prove.then_some(SP1ProofMode::Groth16),
             skip_client_execution: false,
             opcode_tracking: self.opcode_tracking,
+            #[cfg(feature = "nitro")]
+            nitro_config: None,
         };
 
         Ok(config)

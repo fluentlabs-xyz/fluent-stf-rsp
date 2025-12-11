@@ -22,7 +22,11 @@ mod executor_components;
 pub use executor_components::{EthExecutorComponents, ExecutorComponents};
 
 mod full_executor;
-pub use full_executor::{build_executor, BlockExecutor, EitherExecutor, FullExecutor};
+#[cfg(feature = "sp1")]
+pub use full_executor::build_executor;
+#[cfg(feature = "nitro")]
+pub use full_executor::build_executor_with_nitro;
+pub use full_executor::{BlockExecutor, EitherExecutor, FullExecutor};
 
 mod hooks;
 pub use hooks::ExecutionHooks;
@@ -44,6 +48,20 @@ pub fn create_eth_block_execution_strategy_factory(
 //
 //     OpEvmConfig::optimism(chain_spec)
 // }
+#[cfg(feature = "nitro")]
+#[derive(Debug, Clone)]
+pub struct NitroConfig {
+    pub enclave_cid: u32,
+    pub enclave_port: u32,
+}
+
+#[cfg(feature = "nitro")]
+impl Default for NitroConfig {
+    fn default() -> Self {
+        Self { enclave_cid: 10, enclave_port: 5005 }
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub chain: Chain,
@@ -54,6 +72,8 @@ pub struct Config {
     pub prove_mode: Option<SP1ProofMode>,
     pub skip_client_execution: bool,
     pub opcode_tracking: bool,
+    #[cfg(feature = "nitro")]
+    pub nitro_config: Option<NitroConfig>,
 }
 
 impl Config {
@@ -67,6 +87,8 @@ impl Config {
             prove_mode: None,
             skip_client_execution: false,
             opcode_tracking: false,
+            #[cfg(feature = "nitro")]
+            nitro_config: None,
         }
     }
 }

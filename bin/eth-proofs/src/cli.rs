@@ -56,6 +56,8 @@ impl Args {
             prove_mode: (!self.execute_only).then_some(SP1ProofMode::Groth16),
             skip_client_execution: true,
             opcode_tracking: false,
+            #[cfg(feature = "nitro")]
+            nitro_config: None,
         };
 
         Ok(config)

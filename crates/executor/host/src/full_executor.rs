@@ -4,7 +4,7 @@ use either::Either;
 use eyre::bail;
 use reth_primitives_traits::NodePrimitives;
 use rsp_client_executor::io::{ClientExecutorInput, CommittedHeader};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
 use sp1_prover::components::CpuProverComponents;
 use sp1_sdk::{
     ExecutionReport, Prover, SP1Proof, SP1ProofWithPublicValues, SP1ProvingKey, SP1PublicValues,
@@ -19,6 +19,15 @@ use std::{
 use tokio::{task, time::sleep};
 use tracing::{info, info_span, warn};
 
+#[cfg(feature = "nitro")]
+use {
+    std::fs,
+    std::io::{Read, Write},
+    tokio::process::Command as TokioCommand,
+    vsock::SockAddr,
+    vsock::VsockStream,
+};
+
 use crate::{
     executor_components::MaybeProveWithCycles, Config, ExecutionHooks, ExecutorComponents,
     HostError, HostExecutor,
@@ -26,6 +35,7 @@ use crate::{
 
 pub type EitherExecutor<C, P> = Either<FullExecutor<C, P>, CachedExecutor<C>>;
 
+#[cfg(feature = "sp1")]
 pub async fn build_executor<C, P>(
     elf: Vec<u8>,
     provider: Option<P>,
@@ -53,18 +63,153 @@ where
     bail!("Either a RPC URL or a cache dir must be provided")
 }
 
+#[cfg(feature = "nitro")]
+pub async fn build_executor_with_nitro<C, P>(
+    binary_path: PathBuf,
+    provider: Option<P>,
+    evm_config: C::EvmConfig,
+    client: Arc<C::Prover>,
+    hooks: C::Hooks,
+    config: Config,
+) -> eyre::Result<FullExecutor<C, P>>
+where
+    C: ExecutorComponents,
+    P: Provider<C::Network> + Clone + std::fmt::Debug,
+{
+    let client_dir = binary_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| eyre::eyre!("Invalid binary path"))?;
+    let binary_name = binary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| eyre::eyre!("Invalid binary name"))?;
+
+    let temp_dir = client_dir.join("target").join("nitro-enclave-build");
+    fs::create_dir_all(&temp_dir)
+        .map_err(|e| eyre::eyre!("Failed to create temp directory: {}", e))?;
+    info!("Created temp directory at: {:?}", temp_dir);
+
+    let docker_binary_path = temp_dir.join(binary_name);
+    fs::copy(&binary_path, &docker_binary_path)
+        .map_err(|e| eyre::eyre!("Failed to copy binary to temp directory: {}", e))?;
+    info!("Copied binary to: {:?}", docker_binary_path);
+
+    // Create Dockerfile
+    let dockerfile_content = format!(
+        r#"FROM alpine:latest
+            COPY {} .
+            CMD ["./{}"]
+        "#,
+        binary_name, binary_name
+    );
+
+    let dockerfile_path = temp_dir.join("Dockerfile");
+    fs::write(&dockerfile_path, dockerfile_content)
+        .map_err(|e| eyre::eyre!("Failed to write Dockerfile: {}", e))?;
+    info!("Created Dockerfile at: {:?}", dockerfile_path);
+
+    let eif_name = "rsp-client-enclave";
+    info!("Building Docker image...");
+    let docker_build_output = TokioCommand::new("docker")
+        .args(&[
+            "build",
+            "-t",
+            eif_name,
+            "-f",
+            dockerfile_path.to_str().unwrap(),
+            temp_dir.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .map_err(|e| eyre::eyre!("Failed to execute docker build: {}", e))?;
+
+    if !docker_build_output.status.success() {
+        let stderr = String::from_utf8_lossy(&docker_build_output.stderr);
+        return Err(eyre::eyre!("Docker build failed: {}", stderr));
+    }
+
+    let eif_path = client_dir.join(format!("{}.eif", eif_name));
+    info!("Building EIF with nitro-cli...");
+    let nitro_build_output = TokioCommand::new("nitro-cli")
+        .args(&[
+            "build-enclave",
+            "--docker-uri",
+            eif_name,
+            "--output-file",
+            eif_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .map_err(|e| eyre::eyre!("Failed to execute nitro-cli build-enclave: {}", e))?;
+
+    if !nitro_build_output.status.success() {
+        let stderr = String::from_utf8_lossy(&nitro_build_output.stderr);
+        return Err(eyre::eyre!("nitro-cli build-enclave failed: {}", stderr));
+    }
+
+    info!("EIF built successfully at: {:?}", eif_path);
+
+    if let Err(e) = fs::remove_dir_all(&temp_dir) {
+        warn!("Failed to remove temp directory: {}", e);
+    }
+
+    info!("Running enclave...");
+    let run_output = TokioCommand::new("nitro-cli")
+        .args(&[
+            "run-enclave",
+            "--eif-path",
+            eif_path.to_str().unwrap(),
+            "--cpu-count",
+            "2",
+            "--memory",
+            "256",
+            "--enclave-cid",
+            "10",
+            "--debug-mode",
+        ])
+        .output()
+        .await
+        .map_err(|e| eyre::eyre!("Failed to execute nitro-cli run-enclave: {}", e))?;
+
+    if !run_output.status.success() {
+        let stderr = String::from_utf8_lossy(&run_output.stderr);
+        return Err(eyre::eyre!("nitro-cli run-enclave failed: {}", stderr));
+    }
+
+    info!("Enclave running successfully");
+
+    let provider =
+        provider.ok_or_else(|| eyre::eyre!("Provider is required for Nitro executor"))?;
+
+    Ok(FullExecutor {
+        provider,
+        host_executor: HostExecutor::new(
+            evm_config,
+            Arc::new(C::try_into_chain_spec(&config.genesis)?),
+        ),
+        client,
+        hooks,
+        config,
+    })
+}
+
 pub trait BlockExecutor<C: ExecutorComponents> {
     #[allow(async_fn_in_trait)]
     async fn execute(&self, block_number: u64) -> eyre::Result<()>;
 
     fn client(&self) -> Arc<C::Prover>;
 
+    #[cfg(feature = "sp1")]
     fn pk(&self) -> Arc<SP1ProvingKey>;
 
+    #[cfg(feature = "sp1")]
     fn vk(&self) -> Arc<SP1VerifyingKey>;
 
     fn config(&self) -> &Config;
 
+    #[cfg(feature = "sp1")]
     #[allow(async_fn_in_trait)]
     async fn process_client(
         &self,
@@ -147,6 +292,119 @@ pub trait BlockExecutor<C: ExecutorComponents> {
 
         Ok(())
     }
+
+    #[cfg(feature = "nitro")]
+    #[allow(async_fn_in_trait)]
+    async fn process_nitro_client(
+        &self,
+        client_input: ClientExecutorInput<C::Primitives>,
+        hooks: &C::Hooks,
+    ) -> eyre::Result<()> {
+        // Get enclave CID and port from config or use defaults
+        let nitro_config = self.config().nitro_config.as_ref().cloned().unwrap_or_default();
+
+        let enclave_cid = nitro_config.enclave_cid;
+        let enclave_port = nitro_config.enclave_port;
+
+        info!("Connecting to Nitro enclave at CID={} PORT={}", enclave_cid, enclave_port);
+
+        // Serialize the client input to bincode
+        let payload = bincode::serialize(&client_input)?;
+
+        info!("Serialized input: {} bytes", payload.len());
+        let attestation_start = Instant::now();
+        let response = task::spawn_blocking(move || -> eyre::Result<EnclaveResponse> {
+            let addr = SockAddr::new_vsock(enclave_cid, enclave_port);
+            let mut stream = VsockStream::connect(&addr).map_err(|e| {
+                eyre::eyre!("Failed to connect to VSOCK {}:{}: {}", enclave_cid, enclave_port, e)
+            })?;
+
+            stream
+                .write_all(&payload)
+                .map_err(|e| eyre::eyre!("Failed to write payload to enclave: {}", e))?;
+            stream.flush().map_err(|e| eyre::eyre!("Failed to flush stream: {}", e))?;
+
+            info!("Sent {} bytes to enclave", payload.len());
+
+            let mut resp_buf = Vec::new();
+            stream
+                .read_to_end(&mut resp_buf)
+                .map_err(|e| eyre::eyre!("Failed to read response from enclave: {}", e))?;
+
+            let resp_text = String::from_utf8_lossy(&resp_buf);
+            info!("Received response ({} bytes): {}", resp_buf.len(), resp_text);
+
+            let parsed: EnclaveResponse = serde_json::from_slice(&resp_buf)
+                .map_err(|e| eyre::eyre!("Failed to parse JSON response from enclave: {}", e))?;
+
+            Ok(parsed)
+        })
+        .await
+        .map_err(|e| eyre::eyre!("Task join error: {}", e))??;
+
+        let input_block_hash = client_input.current_block.header.hash_slow();
+
+        if input_block_hash != response.block_hash {
+            return Err(eyre::eyre!(
+                "Block hash mismatch: expected {}, got {}",
+                hex::encode(AsRef::<[u8]>::as_ref(&input_block_hash)),
+                hex::encode(AsRef::<[u8]>::as_ref(&response.block_hash))
+            ));
+        }
+
+        if client_input.current_block.header.parent_hash != response.parent_hash {
+            return Err(eyre::eyre!(
+                "Parent hash mismatch: expected {}, got {}",
+                hex::encode(AsRef::<[u8]>::as_ref(&client_input.current_block.header.parent_hash)),
+                hex::encode(AsRef::<[u8]>::as_ref(&response.parent_hash))
+            ));
+        }
+        let attestation_duration = attestation_start.elapsed();
+
+        hooks
+            .on_nitro_attestation_end(
+                client_input.current_block.number,
+                &response.attestation,
+                attestation_duration,
+            )
+            .await?;
+
+        info!("Nitro enclave execution successful");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "nitro")]
+#[derive(Debug, Deserialize)]
+struct EnclaveResponse {
+    #[serde(deserialize_with = "deserialize_b256_from_hex")]
+    parent_hash: B256,
+    #[serde(deserialize_with = "deserialize_b256_from_hex")]
+    block_hash: B256,
+    #[serde(deserialize_with = "deserialize_b256_from_hex")]
+    withdrawal_hash: B256,
+    #[serde(deserialize_with = "deserialize_b256_from_hex")]
+    deposit_hash: B256,
+    #[serde(deserialize_with = "deserialize_b256_from_hex")]
+    result_hash: B256,
+    attestation: Vec<u8>,
+}
+
+#[cfg(feature = "nitro")]
+fn deserialize_b256_from_hex<'de, D>(deserializer: D) -> Result<B256, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let s = String::deserialize(deserializer)?;
+    let bytes = hex::decode(s)
+        .map_err(|e| serde::de::Error::custom(format!("Failed to decode hex: {}", e)))?;
+    if bytes.len() != 32 {
+        return Err(serde::de::Error::custom(format!("Expected 32 bytes, got {}", bytes.len())));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(B256::from(arr))
 }
 
 impl<C, P> BlockExecutor<C> for EitherExecutor<C, P>
@@ -168,6 +426,7 @@ where
         }
     }
 
+    #[cfg(feature = "sp1")]
     fn pk(&self) -> Arc<SP1ProvingKey> {
         match self {
             Either::Left(ref executor) => executor.pk.clone(),
@@ -175,6 +434,7 @@ where
         }
     }
 
+    #[cfg(feature = "sp1")]
     fn vk(&self) -> Arc<SP1VerifyingKey> {
         match self {
             Either::Left(ref executor) => executor.vk.clone(),
@@ -198,7 +458,9 @@ where
     provider: P,
     host_executor: HostExecutor<C::EvmConfig, C::ChainSpec>,
     client: Arc<C::Prover>,
+    #[cfg(feature = "sp1")]
     pk: Arc<SP1ProvingKey>,
+    #[cfg(feature = "sp1")]
     vk: Arc<SP1VerifyingKey>,
     hooks: C::Hooks,
     config: Config,
@@ -209,6 +471,7 @@ where
     C: ExecutorComponents,
     P: Provider<C::Network> + Clone + std::fmt::Debug,
 {
+    #[cfg(feature = "sp1")]
     pub async fn try_new(
         provider: P,
         elf: Vec<u8>,
@@ -307,7 +570,15 @@ where
             }
         };
 
-        self.process_client(client_input, &self.hooks).await?;
+        if cfg!(feature = "sp1") {
+            #[cfg(feature = "sp1")]
+            self.process_client(client_input, &self.hooks).await?;
+        } else if cfg!(feature = "nitro") {
+            #[cfg(feature = "nitro")]
+            self.process_nitro_client(client_input, &self.hooks).await?;
+        } else {
+            return Err(eyre::eyre!("No features of proving engine enable"));
+        }
 
         Ok(())
     }
@@ -316,10 +587,12 @@ where
         self.client.clone()
     }
 
+    #[cfg(feature = "sp1")]
     fn pk(&self) -> Arc<SP1ProvingKey> {
         self.pk.clone()
     }
 
+    #[cfg(feature = "sp1")]
     fn vk(&self) -> Arc<SP1VerifyingKey> {
         self.vk.clone()
     }
@@ -345,7 +618,9 @@ where
 {
     cache_dir: PathBuf,
     client: Arc<C::Prover>,
+    #[cfg(feature = "sp1")]
     pk: Arc<SP1ProvingKey>,
+    #[cfg(feature = "sp1")]
     vk: Arc<SP1VerifyingKey>,
     hooks: C::Hooks,
     config: Config,
@@ -355,6 +630,7 @@ impl<C> CachedExecutor<C>
 where
     C: ExecutorComponents,
 {
+    #[cfg(feature = "sp1")]
     pub async fn try_new(
         elf: Vec<u8>,
         client: Arc<C::Prover>,
@@ -387,17 +663,29 @@ where
         )?
         .ok_or(eyre::eyre!("No cached input found"))?;
 
-        self.process_client(client_input, &self.hooks).await
+        if cfg!(feature = "sp1") {
+            #[cfg(feature = "sp1")]
+            self.process_client(client_input, &self.hooks).await?;
+        } else if cfg!(feature = "nitro") {
+            #[cfg(feature = "nitro")]
+            self.process_nitro_client(client_input, &self.hooks).await?;
+        } else {
+            return Err(eyre::eyre!("No features of proving engine enable").into());
+        }
+
+        Ok(())
     }
 
     fn client(&self) -> Arc<C::Prover> {
         self.client.clone()
     }
 
+    #[cfg(feature = "sp1")]
     fn pk(&self) -> Arc<SP1ProvingKey> {
         self.pk.clone()
     }
 
+    #[cfg(feature = "sp1")]
     fn vk(&self) -> Arc<SP1VerifyingKey> {
         self.vk.clone()
     }
