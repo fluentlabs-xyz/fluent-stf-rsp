@@ -7108,6 +7108,7 @@ dependencies = [
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
+ "cargo_metadata",
  "clap",
  "csv",
  "dotenv",
