@@ -75,9 +75,15 @@ async fn main() -> eyre::Result<()> {
         #[cfg(feature = "sp1")]
         executor.execute(block_number).await?;
     } else if cfg!(feature = "nitro") {
+        let client_path = if let Ok(client_path) = std::env::var("NITRO_CLIENT") {
+            client_path
+        } else {
+            "./bin/client/target/x86_64-unknown-linux-musl/release/rsp-client".to_string()
+        };
+
         #[cfg(feature = "nitro")]
         let executor = build_executor_with_nitro::<EthExecutorComponents<_>, _>(
-            PathBuf::from("rsp-client"),
+            PathBuf::from(client_path),
             provider,
             block_execution_strategy_factory,
             prover_client,

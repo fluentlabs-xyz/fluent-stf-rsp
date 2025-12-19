@@ -4,7 +4,7 @@ name = "rsp"
 edition = "2021"
 
 [features]
-default = []
+default = ["sp1"]
 sp1 = ["rsp-host-executor/sp1"]
 nitro = ["rsp-host-executor/nitro"]
 
@@ -54,3 +54,4 @@ madato = "0.7.0"
 
 [build-dependencies]
 sp1-build.workspace = true
+cargo_metadata = "0.18.1"

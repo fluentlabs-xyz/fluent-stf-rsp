@@ -1,3 +1,4 @@
+use cargo_metadata::Metadata;
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -41,6 +42,10 @@ fn build_nitro_binary() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("Failed to install target: {}", target).into());
         }
     }
+    let metadata_file = client_dir.join("Cargo.toml");
+    let mut metadata_cmd = cargo_metadata::MetadataCommand::new();
+    let metadata = metadata_cmd.manifest_path(metadata_file).exec().unwrap();
+    cargo_rerun_if_changed(&metadata, &client_dir);
 
     println!("cargo:warning=Building for target: {}", target);
     let build_output = Command::new("cargo")
@@ -70,4 +75,34 @@ fn build_nitro_binary() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:warning=Binary built successfully at: {:?}", binary_path);
     Ok(())
+}
+
+#[cfg(feature = "nitro")]
+pub(crate) fn cargo_rerun_if_changed(metadata: &Metadata, program_dir: &Path) {
+    // Tell cargo to rerun the script only if program/{src, bin, build.rs, Cargo.toml} changes
+    // Ref: https://doc.rust-lang.org/nightly/cargo/reference/build-scripts.html#rerun-if-changed
+    let dirs = vec![
+        program_dir.join("src"),
+        program_dir.join("bin"),
+        program_dir.join("build.rs"),
+        program_dir.join("Cargo.toml"),
+    ];
+    for dir in dirs {
+        if dir.exists() {
+            println!("cargo::rerun-if-changed={}", dir.canonicalize().unwrap().display());
+        }
+    }
+
+    // Re-run the build script if the workspace root's Cargo.lock changes. If the program is its own
+    // workspace, this will be the program's Cargo.lock.
+    println!("cargo:rerun-if-changed={}", metadata.workspace_root.join("Cargo.lock").as_str());
+
+    // Re-run if any local dependency changes.
+    for package in &metadata.packages {
+        for dependency in &package.dependencies {
+            if let Some(path) = &dependency.path {
+                println!("cargo:rerun-if-changed={}", path.as_str());
+            }
+        }
+    }
 }
