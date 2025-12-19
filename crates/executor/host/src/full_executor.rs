@@ -314,11 +314,19 @@ pub trait BlockExecutor<C: ExecutorComponents> {
         info!("Serialized input: {} bytes", payload.len());
         let attestation_start = Instant::now();
         let response = task::spawn_blocking(move || -> eyre::Result<EnclaveResponse> {
+            const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
             let addr = SockAddr::new_vsock(enclave_cid, enclave_port);
             let mut stream = VsockStream::connect(&addr).map_err(|e| {
                 eyre::eyre!("Failed to connect to VSOCK {}:{}: {}", enclave_cid, enclave_port, e)
             })?;
 
+            let req_len: u32 = payload
+                .len()
+                .try_into()
+                .map_err(|_| eyre::eyre!("Payload too large: {} bytes", payload.len()))?;
+            stream
+                .write_all(&req_len.to_be_bytes())
+                .map_err(|e| eyre::eyre!("Failed to write request length to enclave: {}", e))?;
             stream
                 .write_all(&payload)
                 .map_err(|e| eyre::eyre!("Failed to write payload to enclave: {}", e))?;
@@ -326,10 +334,22 @@ pub trait BlockExecutor<C: ExecutorComponents> {
 
             info!("Sent {} bytes to enclave", payload.len());
 
-            let mut resp_buf = Vec::new();
+            let mut resp_len_buf = [0u8; 4];
             stream
-                .read_to_end(&mut resp_buf)
-                .map_err(|e| eyre::eyre!("Failed to read response from enclave: {}", e))?;
+                .read_exact(&mut resp_len_buf)
+                .map_err(|e| eyre::eyre!("Failed to read response length from enclave: {}", e))?;
+            let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+            if resp_len > MAX_FRAME_SIZE {
+                return Err(eyre::eyre!(
+                    "Response frame too large: {} bytes (cap {})",
+                    resp_len,
+                    MAX_FRAME_SIZE
+                ));
+            }
+            let mut resp_buf = vec![0u8; resp_len];
+            stream
+                .read_exact(&mut resp_buf)
+                .map_err(|e| eyre::eyre!("Failed to read response body from enclave: {}", e))?;
 
             let resp_text = String::from_utf8_lossy(&resp_buf);
             info!("Received response ({} bytes): {}", resp_buf.len(), resp_text);

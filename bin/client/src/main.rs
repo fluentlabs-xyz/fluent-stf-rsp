@@ -54,8 +54,21 @@ fn main() -> anyhow::Result<()> {
         let (mut stream, _addr) = listener.accept()?;
         println!("Accepted connection");
 
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf)?;
+        const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+
+        let mut len_buf = [0u8; 4];
+
+        stream.read_exact(&mut len_buf)?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(anyhow::anyhow!(
+                "Request frame too large: {} bytes s (cap {})",
+                len,
+                MAX_FRAME_SIZE
+            ));
+        }
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf)?;
 
         println!("Received input, size: {} bytes", buf.len());
 
@@ -103,7 +116,13 @@ fn main() -> anyhow::Result<()> {
         });
 
         let serialized = serde_json::to_vec(&output)?;
+        let resp_len: u32 = serialized
+            .len()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Response too large: {} bytes", serialized.len()))?;
+        stream.write_all(&resp_len.to_be_bytes())?;
         stream.write_all(&serialized)?;
+        stream.flush()?;
         println!("Sent response, size: {} bytes", serialized.len());
     }
 }
