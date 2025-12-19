@@ -1,17 +1,12 @@
-use std::sync::Arc;
 
 use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use clap::Parser;
 use cli::Args;
 use eth_proofs::EthProofsClient;
 use futures::{future::ready, StreamExt};
-use rsp_host_executor::{
-    alerting::AlertingClient, create_eth_block_execution_strategy_factory, BlockExecutor,
-    EthExecutorComponents, FullExecutor,
-};
+use rsp_host_executor::{alerting::AlertingClient, create_eth_block_execution_strategy_factory};
 use rsp_provider::create_provider;
 use sp1_sdk::{include_elf, ProverClient};
-use tracing::{error, info};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod cli;
@@ -59,8 +54,7 @@ async fn main() -> eyre::Result<()> {
 
     // Subscribe to block headers.
     let subscription = ws_provider.subscribe_blocks().await?;
-    let mut stream =
-        subscription.into_stream().filter(|h| ready(h.number % args.block_interval == 0));
+    let stream = subscription.into_stream().filter(|h| ready(h.number % args.block_interval == 0));
 
     let builder = ProverClient::builder().cuda();
     let client = if let Some(endpoint) = &args.moongate_endpoint {
@@ -69,10 +63,9 @@ async fn main() -> eyre::Result<()> {
         builder.build()
     };
 
-    let client = Arc::new(client);
-
     #[cfg(feature = "sp1")]
     {
+        let client = Arc::new(client);
         let executor = FullExecutor::<EthExecutorComponents<_, _>, _>::try_new(
             http_provider.clone(),
             elf,

@@ -12,7 +12,7 @@ use rsp_host_executor::{
 };
 use rsp_provider::create_provider;
 use sp1_sdk::{include_elf, EnvProver};
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use tracing_subscriber::{
     filter::EnvFilter, fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
 };
@@ -61,8 +61,11 @@ async fn main() -> eyre::Result<()> {
     let provider: Option<RootProvider> =
         config.rpc_url.as_ref().map(|url| create_provider(url.clone()));
 
-    if cfg!(feature = "sp1") {
-        #[cfg(feature = "sp1")]
+    #[cfg(all(feature = "sp1", feature = "nitro"))]
+    compile_error!("Features `sp1` and `nitro` are mutually exclusive");
+
+    #[cfg(feature = "sp1")]
+    {
         let executor = build_executor::<EthExecutorComponents<_>, _>(
             include_elf!("rsp-client").to_vec(),
             provider,
@@ -72,16 +75,18 @@ async fn main() -> eyre::Result<()> {
             config,
         )
         .await?;
-        #[cfg(feature = "sp1")]
         executor.execute(block_number).await?;
-    } else if cfg!(feature = "nitro") {
+    }
+
+    #[cfg(feature = "nitro")]
+    {
+        use std::path::PathBuf;
         let client_path = if let Ok(client_path) = std::env::var("NITRO_CLIENT") {
             client_path
         } else {
             "./bin/client/target/x86_64-unknown-linux-musl/release/rsp-client".to_string()
         };
 
-        #[cfg(feature = "nitro")]
         let executor = build_executor_with_nitro::<EthExecutorComponents<_>, _>(
             PathBuf::from(client_path),
             provider,
@@ -91,11 +96,12 @@ async fn main() -> eyre::Result<()> {
             config,
         )
         .await?;
-        #[cfg(feature = "nitro")]
+
         executor.execute(block_number).await?;
-    } else {
-        return Err(eyre::eyre!("No features of proving engine enable"));
-    };
+    }
+
+    #[cfg(not(any(feature = "sp1", feature = "nitro")))]
+    return Err(eyre::eyre!("No features of proving engine enable"));
 
     Ok(())
 }

@@ -1,8 +1,8 @@
-use std::{hash::Hash, sync::Arc};
+use std::sync::Arc;
 
 use crate::io::ClientExecutorInput;
 use alloy_consensus::{BlockHeader, Header};
-use alloy_primitives::{address, b256, Bloom, Keccak256, B256};
+use alloy_primitives::{address, b256};
 use itertools::Itertools;
 use reth_chainspec::ChainSpec;
 use reth_errors::BlockExecutionError;
@@ -12,7 +12,7 @@ use reth_evm::{
 };
 use reth_evm_ethereum::EthEvmConfig;
 use reth_execution_types::ExecutionOutcome;
-use reth_primitives_traits::{Block, BlockBody, GotExpected, SealedHeader};
+use reth_primitives_traits::Block;
 use reth_trie::KeccakKeyHasher;
 use revm::database::WrapDatabaseRef;
 use revm_primitives::Address;

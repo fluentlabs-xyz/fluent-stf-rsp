@@ -5,19 +5,19 @@
 //! The [CustomEvmConfig] type implements the [ConfigureEvm] and [ConfigureEvmEnv] traits,
 //! configuring the custom CustomEvmConfig precompiles and instructions.
 use alloy_evm::{
-    fluentbase_revm::{builder::DefaultRwasmEvm, DefaultRwasm, RwasmEvm},
+    fluentbase_revm::DefaultRwasm,
     precompiles::PrecompilesMap,
-    EthEvm, Evm,
+    EthEvm,
 };
 use reth_evm::{
-    fluentbase_revm::{RwasmBuilder, RwasmPrecompiles},
+    fluentbase_revm::RwasmBuilder,
     Database, EvmEnv, EvmFactory,
 };
 use revm::{
     bytecode::opcode::OpCode,
     context::{
         result::{EVMError, HaltReason},
-        BlockEnv, CfgEnv, Context as RwasmContext, TxEnv,
+        BlockEnv, CfgEnv, TxEnv,
     },
     handler::EthPrecompiles,
     inspector::NoOpInspector,
@@ -25,7 +25,7 @@ use revm::{
         interpreter_types::{Jumps, LoopControl},
         Interpreter, InterpreterTypes,
     },
-    Context, Inspector, MainBuilder, MainContext,
+    Context, Inspector,
 };
 use revm_primitives::{hardfork::SpecId, Address};
 use std::fmt::Debug;

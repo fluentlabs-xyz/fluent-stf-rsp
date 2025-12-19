@@ -3,13 +3,10 @@ use alloy_provider::Provider;
 use either::Either;
 use eyre::bail;
 use reth_primitives_traits::NodePrimitives;
-use rsp_client_executor::io::{ClientExecutorInput, CommittedHeader};
-use serde::{de::DeserializeOwned, Deserialize};
+use rsp_client_executor::io::ClientExecutorInput;
+use serde::de::DeserializeOwned;
 use sp1_prover::components::CpuProverComponents;
-use sp1_sdk::{
-    ExecutionReport, Prover, SP1Proof, SP1ProofWithPublicValues, SP1ProvingKey, SP1PublicValues,
-    SP1Stdin, SP1VerifyingKey,
-};
+use sp1_sdk::{ExecutionReport, Prover, SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey};
 use std::{
     fmt::{Debug, Formatter},
     path::{Path, PathBuf},
@@ -21,6 +18,7 @@ use tracing::{info, info_span, warn};
 
 #[cfg(feature = "nitro")]
 use {
+    serde::Deserialize,
     std::fs,
     std::io::{Read, Write},
     tokio::process::Command as TokioCommand,
@@ -690,7 +688,7 @@ where
             #[cfg(feature = "nitro")]
             self.process_nitro_client(client_input, &self.hooks).await?;
         } else {
-            return Err(eyre::eyre!("No features of proving engine enable").into());
+            return Err(eyre::eyre!("No features of proving engine enable"));
         }
 
         Ok(())

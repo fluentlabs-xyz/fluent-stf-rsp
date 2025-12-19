@@ -6588,7 +6588,6 @@ dependencies = [
  "alloy-rlp",
  "reth-codecs",
  "reth-primitives-traits",
- "reth-zstd-compressors",
  "serde",
  "serde_with",
 ]
@@ -6672,19 +6671,6 @@ dependencies = [
  "serde_with",
  "thiserror 2.0.16",
  "url",
-]
-
-[[package]]
-name = "reth-primitives"
-version = "0.4.12-dev"
-source = "git+https://github.com/fluentlabs-xyz/fluent?branch=stf#170ab41830f043b92afe75015e1139816369b627"
-dependencies = [
- "alloy-consensus",
- "once_cell",
- "reth-ethereum-forks",
- "reth-ethereum-primitives",
- "reth-primitives-traits",
- "reth-static-file-types",
 ]
 
 [[package]]
@@ -7114,7 +7100,6 @@ dependencies = [
  "dotenv",
  "eyre",
  "madato",
- "reth-primitives",
  "reth-primitives-traits",
  "revm-rwasm-bytecode",
  "rsp-client-executor",

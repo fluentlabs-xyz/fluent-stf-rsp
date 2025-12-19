@@ -3,7 +3,7 @@ use std::{
     str::FromStr,
 };
 
-use crate::{chain_spec, error::ChainSpecError};
+use crate::error::ChainSpecError;
 use alloy_genesis::ChainConfig;
 use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, EthereumHardfork};
 use serde::{Deserialize, Serialize};

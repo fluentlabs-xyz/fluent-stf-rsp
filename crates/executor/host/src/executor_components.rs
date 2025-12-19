@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 use alloy_network::Ethereum;
 use alloy_provider::Network;
 use eyre::{eyre, Ok};
-use op_alloy_network::Optimism;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::ConfigureEvm;

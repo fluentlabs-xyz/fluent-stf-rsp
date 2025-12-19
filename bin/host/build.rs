@@ -1,12 +1,11 @@
-use cargo_metadata::Metadata;
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
-
 #[cfg(feature = "sp1")]
 use sp1_build::build_program;
+#[cfg(feature = "nitro")]
+use {
+    cargo_metadata::Metadata,
+    std::path::{Path, PathBuf},
+    std::process::Command,
+};
 
 fn main() {
     #[cfg(feature = "sp1")]

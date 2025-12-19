@@ -191,7 +191,6 @@ sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-
 k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-5.0.0" }
 p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p256-13.2-sp1-5.0.0" }
 
-
 revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
 revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
 revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
