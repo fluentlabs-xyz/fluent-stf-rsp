@@ -3,7 +3,6 @@ use std::sync::Arc;
 use alloy_provider::{network::Ethereum, Network, RootProvider};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
-use reth_optimism_chainspec::OpChainSpec;
 use revm_primitives::{address, Address};
 use rsp_client_executor::{
     executor::{ClientExecutor, EthClientExecutor},
