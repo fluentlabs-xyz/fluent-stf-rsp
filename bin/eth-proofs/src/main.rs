@@ -1,4 +1,3 @@
-
 use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use clap::Parser;
 use cli::Args;
