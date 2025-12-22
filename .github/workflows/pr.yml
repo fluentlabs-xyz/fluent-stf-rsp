@@ -13,7 +13,7 @@ concurrency:
 jobs:
   lock-files:
     name: "Check lock files"
-    runs-on: ["runs-on", "runner=8cpu-linux-x64", "run-id=${{ github.run_id }}"]
+    runs-on: ubuntu-amd64-8core
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
@@ -25,7 +25,7 @@ jobs:
           cargo tree
           (cd ./bin/client && cargo tree)
           (cd ./bin/client-op && cargo tree)
-          
+
       - name: "Assert no changes"
         run: |
           if [ -n "$(git status --porcelain)" ]; then 
@@ -35,7 +35,7 @@ jobs:
 
   deps-semver:
     name: "Check upstream SemVer violations"
-    runs-on: ["runs-on", "runner=8cpu-linux-x64", "run-id=${{ github.run_id }}"]
+    runs-on: ubuntu-amd64-8core
     steps:
       - name: "Checkout sources"
         uses: "actions/checkout@v4"
@@ -59,7 +59,7 @@ jobs:
 
   fmt:
     name: "Check code format"
-    runs-on: ["runs-on", "runner=8cpu-linux-x64", "run-id=${{ github.run_id }}"]
+    runs-on: ubuntu-amd64-8core
     steps:
       - name: "Checkout sources"
         uses: "actions/checkout@v4"
@@ -78,7 +78,7 @@ jobs:
 
   clippy:
     name: "Run clippy lints"
-    runs-on: ["runs-on", "runner=8cpu-linux-x64", "run-id=${{ github.run_id }}"]
+    runs-on: ubuntu-amd64-8core
     steps:
       - name: "Checkout sources"
         uses: "actions/checkout@v4"
@@ -103,13 +103,12 @@ jobs:
 
   tests:
     name: "Run tests"
-    runs-on:
-      ["runs-on", "runner=64cpu-linux-x64", "run-id=${{ github.run_id }}"]
+    runs-on: ubuntu-amd64-8core
     steps:
       - name: "Checkout sources"
         uses: "actions/checkout@v4"
         with:
-          fetch-depth: 0  
+          fetch-depth: 0
 
       - name: "Install sp1up"
         run: |
