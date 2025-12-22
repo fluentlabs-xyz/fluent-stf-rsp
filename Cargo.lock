@@ -5131,49 +5131,12 @@ checksum = "0c88d2940558fd69f8f07b3cbd7bb3c02fc7d31159c1a7ba9deede50e7881024"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "alloy-network",
  "alloy-primitives",
  "alloy-rlp",
- "alloy-rpc-types-eth",
  "alloy-serde",
  "derive_more 2.0.1",
  "serde",
  "serde_with",
- "thiserror 2.0.16",
-]
-
-[[package]]
-name = "op-alloy-network"
-version = "0.18.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7071d7c3457d02aa0d35799cb8fbd93eabd51a21d100dcf411f4fcab6fdd2ea5"
-dependencies = [
- "alloy-consensus",
- "alloy-network",
- "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-types-eth",
- "alloy-signer",
- "op-alloy-consensus",
- "op-alloy-rpc-types",
-]
-
-[[package]]
-name = "op-alloy-rpc-types"
-version = "0.18.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f22201e53e8cbb67a053e88b534b4e7f02265c5406994bf35978482a9ad0ae26"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-network-primitives",
- "alloy-primitives",
- "alloy-rpc-types-eth",
- "alloy-serde",
- "derive_more 2.0.1",
- "op-alloy-consensus",
- "serde",
- "serde_json",
  "thiserror 2.0.16",
 ]
 
@@ -7164,13 +7127,11 @@ dependencies = [
  "alloy-transport",
  "anyhow",
  "aws-nitro-enclaves-nsm-api",
- "base64 0.22.1",
  "bincode 1.3.3",
  "dotenv",
  "either",
  "eyre",
  "hex",
- "op-alloy-network",
  "reqwest 0.12.23",
  "reth-chainspec",
  "reth-errors",

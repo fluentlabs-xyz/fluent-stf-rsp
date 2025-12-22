@@ -1,11 +1,4 @@
-use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use clap::Parser;
-use cli::Args;
-use eth_proofs::EthProofsClient;
-use futures::{future::ready, StreamExt};
-use rsp_host_executor::{alerting::AlertingClient, create_eth_block_execution_strategy_factory};
-use rsp_provider::create_provider;
-use sp1_sdk::{include_elf, ProverClient};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod cli;
@@ -33,37 +26,52 @@ async fn main() -> eyre::Result<()> {
         .init();
 
     // Parse the command line arguments.
-    let args = Args::parse();
-    let config = args.as_config().await?;
-
-    let elf = include_elf!("rsp-client").to_vec();
-    let block_execution_strategy_factory =
-        create_eth_block_execution_strategy_factory(&config.genesis, None);
-
-    let eth_proofs_client = EthProofsClient::new(
-        args.eth_proofs_cluster_id,
-        args.eth_proofs_endpoint,
-        args.eth_proofs_api_token,
-    );
-    let alerting_client = args.pager_duty_integration_key.map(AlertingClient::new);
-
-    let ws = WsConnect::new(args.ws_rpc_url);
-    let ws_provider = ProviderBuilder::new().connect_ws(ws).await?;
-    let http_provider: RootProvider = create_provider(args.http_rpc_url);
-
-    // Subscribe to block headers.
-    let subscription = ws_provider.subscribe_blocks().await?;
-    let stream = subscription.into_stream().filter(|h| ready(h.number % args.block_interval == 0));
-
-    let builder = ProverClient::builder().cuda();
-    let client = if let Some(endpoint) = &args.moongate_endpoint {
-        builder.server(endpoint).build()
-    } else {
-        builder.build()
-    };
+    #[allow(unused_variables)]
+    let args = cli::Args::parse();
 
     #[cfg(feature = "sp1")]
     {
+        use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
+        use eth_proofs::EthProofsClient;
+        use futures::{future::ready, StreamExt};
+        use rsp_host_executor::{
+            alerting::AlertingClient, create_eth_block_execution_strategy_factory,
+            EthExecutorComponents, FullExecutor,
+        };
+        use rsp_provider::create_provider;
+        use sp1_sdk::{include_elf, ProverClient};
+        use std::sync::Arc;
+        use tracing::{error, info};
+
+        let config = args.as_config().await?;
+
+        let elf = include_elf!("rsp-client").to_vec();
+        let block_execution_strategy_factory =
+            create_eth_block_execution_strategy_factory(&config.genesis, None);
+
+        let eth_proofs_client = EthProofsClient::new(
+            args.eth_proofs_cluster_id,
+            args.eth_proofs_endpoint,
+            args.eth_proofs_api_token,
+        );
+        let alerting_client = args.pager_duty_integration_key.map(AlertingClient::new);
+
+        let ws = WsConnect::new(args.ws_rpc_url);
+        let ws_provider = ProviderBuilder::new().connect_ws(ws).await?;
+        let http_provider: RootProvider = create_provider(args.http_rpc_url);
+
+        // Subscribe to block headers.
+        let subscription = ws_provider.subscribe_blocks().await?;
+        let stream =
+            subscription.into_stream().filter(|h| ready(h.number % args.block_interval == 0));
+
+        let builder = ProverClient::builder().cuda();
+        let client = if let Some(endpoint) = &args.moongate_endpoint {
+            builder.server(endpoint).build()
+        } else {
+            builder.build()
+        };
+
         let client = Arc::new(client);
         let executor = FullExecutor::<EthExecutorComponents<_, _>, _>::try_new(
             http_provider.clone(),

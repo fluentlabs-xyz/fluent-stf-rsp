@@ -10,7 +10,7 @@ use rsp_client_executor::{
     BlockValidator, FromInput, IntoInput, IntoPrimitives,
 };
 use rsp_host_executor::{EthHostExecutor, HostExecutor};
-use rsp_primitives::genesis::{genesis_from_json, Genesis, OP_SEPOLIA_GENESIS_JSON};
+use rsp_primitives::genesis::Genesis;
 use serde::{de::DeserializeOwned, Serialize};
 use tracing_subscriber::{
     fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter,

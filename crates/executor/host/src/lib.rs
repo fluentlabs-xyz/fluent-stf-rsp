@@ -1,5 +1,8 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+use hex as _;
+use serde_json as _;
+
 use alloy_chains::Chain;
 pub use error::Error as HostError;
 use reth_chainspec::ChainSpec;

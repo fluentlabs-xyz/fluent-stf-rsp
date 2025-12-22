@@ -55,7 +55,6 @@ alloy-network.workspace = true
 alloy-provider.workspace = true
 alloy-transport.workspace = true
 alloy-rpc-types.workspace = true
-base64 = "0.22.1"
 serde_json.workspace = true
 hex = "0.4"
 vsock = { version = "0.2", optional = true }
@@ -64,7 +63,7 @@ serde_cbor = { version = "0.11", optional = true }
 anyhow = { version = "1.0", optional = true }
 
 # op
-op-alloy-network.workspace = true
+# op-alloy-network.workspace = true
 
 [dev-dependencies]
 alloy-primitives.workspace = true

@@ -1,14 +1,23 @@
+#[cfg(feature = "sp1")]
 use std::time::Duration;
 
+#[cfg(feature = "sp1")]
 use base64::{engine::general_purpose::STANDARD, Engine};
+#[cfg(feature = "sp1")]
 use eyre::eyre;
+#[cfg(feature = "sp1")]
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+#[cfg(feature = "sp1")]
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
+#[cfg(feature = "sp1")]
 use rsp_host_executor::ExecutionHooks;
+#[cfg(feature = "sp1")]
 use sp1_sdk::{HashableKey, SP1VerifyingKey};
+#[cfg(feature = "sp1")]
 use tracing::error;
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "sp1")]
 pub struct EthProofsClient {
     cluster_id: u64,
     endpoint: String,
@@ -16,6 +25,7 @@ pub struct EthProofsClient {
     client: ClientWithMiddleware,
 }
 
+#[cfg(feature = "sp1")]
 impl EthProofsClient {
     pub fn new(cluster_id: u64, endpoint: String, api_token: String) -> Self {
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
@@ -120,6 +130,7 @@ impl EthProofsClient {
     }
 }
 
+#[cfg(feature = "sp1")]
 impl ExecutionHooks for EthProofsClient {
     async fn on_execution_start(&self, block_number: u64) -> eyre::Result<()> {
         self.queued(block_number).await;

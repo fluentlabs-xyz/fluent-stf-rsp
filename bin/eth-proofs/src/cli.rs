@@ -1,9 +1,14 @@
-use alloy_chains::Chain;
 use clap::Parser;
-use rsp_host_executor::Config;
-use rsp_primitives::genesis::Genesis;
-use sp1_sdk::SP1ProofMode;
 use url::Url;
+
+#[cfg(feature = "sp1")]
+use alloy_chains::Chain;
+#[cfg(feature = "sp1")]
+use rsp_host_executor::Config;
+#[cfg(feature = "sp1")]
+use rsp_primitives::genesis::Genesis;
+#[cfg(feature = "sp1")]
+use sp1_sdk::SP1ProofMode;
 
 /// The arguments for the cli.
 #[derive(Debug, Clone, Parser)]
@@ -46,6 +51,7 @@ pub struct Args {
 }
 
 impl Args {
+    #[cfg(feature = "sp1")]
     pub async fn as_config(&self) -> eyre::Result<Config> {
         let config = Config {
             chain: Chain::mainnet(),
