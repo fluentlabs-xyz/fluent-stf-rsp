@@ -23,7 +23,7 @@ either = "1.13.0"
 
 # workspace
 rsp-rpc-db.workspace = true
-rsp-client-executor = { workspace = true, features = ["optimism"] }
+rsp-client-executor = { workspace = true }
 rsp-mpt = { workspace = true }
 rsp-primitives = { workspace = true, features = ["optimism"] }
 
