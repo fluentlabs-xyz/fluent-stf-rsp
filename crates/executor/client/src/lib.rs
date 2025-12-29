@@ -8,6 +8,7 @@ pub mod custom;
 pub mod error;
 mod events_hash;
 pub mod executor;
+pub mod key;
 pub mod tracking;
 
 mod into_primitives;

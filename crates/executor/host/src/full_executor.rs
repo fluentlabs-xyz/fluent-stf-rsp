@@ -11,11 +11,17 @@ use std::{
     fmt::{Debug, Formatter},
     path::{Path, PathBuf},
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 use tokio::{task, time::sleep};
 use tracing::{info, info_span, warn};
 
+use crate::{
+    executor_components::MaybeProveWithCycles, Config, ExecutionHooks, ExecutorComponents,
+    HostError, HostExecutor,
+};
+use rsp_client_executor::key::EnclaveKeyResponse;
 #[cfg(feature = "nitro")]
 use {
     serde::Deserialize,
@@ -24,11 +30,6 @@ use {
     tokio::process::Command as TokioCommand,
     vsock::SockAddr,
     vsock::VsockStream,
-};
-
-use crate::{
-    executor_components::MaybeProveWithCycles, Config, ExecutionHooks, ExecutorComponents,
-    HostError, HostExecutor,
 };
 
 pub type EitherExecutor<C, P> = Either<FullExecutor<C, P>, CachedExecutor<C>>;
@@ -177,6 +178,14 @@ where
     }
 
     info!("Enclave running successfully");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let nitro_config = config.nitro_config.as_ref().cloned().unwrap_or_default();
+    let enclave_cid = nitro_config.enclave_cid;
+
+    info!("Initializing enclave key management...");
+    initialize_enclave_key(enclave_cid).await?;
 
     let provider =
         provider.ok_or_else(|| eyre::eyre!("Provider is required for Nitro executor"))?;
@@ -406,6 +415,96 @@ struct EnclaveResponse {
     #[serde(deserialize_with = "deserialize_b256_from_hex")]
     result_hash: B256,
     attestation: Vec<u8>,
+}
+
+#[cfg(feature = "nitro")]
+const KEY_MANAGEMENT_PORT: u32 = 5006;
+#[cfg(feature = "nitro")]
+const DATA_KEY_STORAGE: &str = "./data_key.enc";
+
+#[cfg(feature = "nitro")]
+async fn initialize_enclave_key(enclave_cid: u32) -> eyre::Result<()> {
+    use tracing::info;
+
+    if let Ok(encrypted_dek) = fs::read(DATA_KEY_STORAGE) {
+        info!("Found existing encrypted data key, requesting decryption");
+        let resp = handle_key_management_request(
+            enclave_cid,
+            ExecutorKeyRequest::DecryptKey { encrypted_data_key: encrypted_dek },
+        )
+        .await?;
+
+        match resp {
+            EnclaveKeyResponse::KeyDecrypted { .. } => {
+                info!("Successfully decrypted existing key");
+                Ok(())
+            }
+            EnclaveKeyResponse::Error(e) => Err(eyre::eyre!("Key decryption failed: {}", e)),
+            _ => Err(eyre::eyre!("Unexpected response type")),
+        }
+    } else {
+        info!("No existing key found, requesting new key creation");
+        let resp =
+            handle_key_management_request(enclave_cid, ExecutorKeyRequest::CreateNewKey).await?;
+
+        match resp {
+            EnclaveKeyResponse::KeyCreated { sealed_key: _, encrypted_data_key } => {
+                if let Some(parent) = Path::new(DATA_KEY_STORAGE).parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(DATA_KEY_STORAGE, &encrypted_data_key)?;
+                info!("New key created and encrypted data key stored");
+                Ok(())
+            }
+            EnclaveKeyResponse::Error(e) => Err(eyre::eyre!("Key creation failed: {}", e)),
+            _ => Err(eyre::eyre!("Unexpected response type")),
+        }
+    }
+}
+
+#[cfg(feature = "nitro")]
+async fn handle_key_management_request(
+    enclave_cid: u32,
+    req: ExecutorKeyRequest,
+) -> eyre::Result<EnclaveKeyResponse> {
+    use std::io::{Read, Write};
+    use tracing::info;
+
+    info!("Handling key management request: {:?}", req);
+
+    const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+    let addr = SockAddr::new_vsock(enclave_cid, KEY_MANAGEMENT_PORT);
+    let mut stream = VsockStream::connect(&addr)
+        .map_err(|e| eyre::eyre!("Failed to connect to enclave for key management: {}", e))?;
+
+    let req_bytes = bincode::serialize(&req)
+        .map_err(|e| eyre::eyre!("Failed to serialize key request: {}", e))?;
+    let req_len = req_bytes.len() as u32;
+    stream
+        .write_all(&req_len.to_be_bytes())
+        .map_err(|e| eyre::eyre!("Failed to write request length: {}", e))?;
+    stream.write_all(&req_bytes).map_err(|e| eyre::eyre!("Failed to write request: {}", e))?;
+    stream.flush().map_err(|e| eyre::eyre!("Failed to flush: {}", e))?;
+
+    let mut resp_len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut resp_len_buf)
+        .map_err(|e| eyre::eyre!("Failed to read response length: {}", e))?;
+    let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+    if resp_len > MAX_FRAME_SIZE {
+        return Err(eyre::eyre!(
+            "Response frame too large: {} bytes (cap {})",
+            resp_len,
+            MAX_FRAME_SIZE
+        ));
+    }
+    let mut resp_buf = vec![0u8; resp_len];
+    stream.read_exact(&mut resp_buf).map_err(|e| eyre::eyre!("Failed to read response: {}", e))?;
+
+    let response: EnclaveKeyResponse = bincode::deserialize(&resp_buf)
+        .map_err(|e| eyre::eyre!("Failed to deserialize response: {}", e))?;
+
+    Ok(response)
 }
 
 #[cfg(feature = "nitro")]
