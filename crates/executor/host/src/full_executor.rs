@@ -11,7 +11,6 @@ use std::{
     fmt::{Debug, Formatter},
     path::{Path, PathBuf},
     sync::Arc,
-    thread,
     time::{Duration, Instant},
 };
 use tokio::{task, time::sleep};

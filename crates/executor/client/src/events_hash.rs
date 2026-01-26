@@ -147,7 +147,7 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
         let rollback_logs = self.find_receipt_log(bridge_address, rollback_topic);
         let message_hashes = withdrawal_logs
             .into_iter()
-            .chain(rollback_logs.into_iter())
+            .chain(rollback_logs)
             .filter(|log_data| log_data.data.len() >= SEND_EVENT_MESSAGE_HASH_OFFSET + 32)
             .map(|log_data| {
                 let message_hash: [u8; 32] = log_data.data
