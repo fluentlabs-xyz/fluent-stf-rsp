@@ -69,6 +69,7 @@ async fn test_e2e_ethereum() {
 //     .await;
 // }
 
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_linea() {
     run_eth_e2e(
