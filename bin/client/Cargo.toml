@@ -28,6 +28,10 @@ nitro = [
     "dep:aes-gcm",
     "dep:base64",
     "dep:rand",
+    "dep:chrono",
+    "dep:hmac",
+    "dep:rustls",
+    "dep:webpki-roots",
     "rsp-client-executor/nitro",
 ]
 
@@ -62,6 +66,10 @@ serde_cbor = { version = "0.11.2", optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.21", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+hmac = { version = "0.12", optional = true }
+rustls = { version = "0.21.12", default-features = false, features = ["tls12"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 aws-sdk-kms = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }

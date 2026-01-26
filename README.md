@@ -241,3 +241,48 @@ cargo prove build --ignore-rust-version
 ### What are good testing blocks
 
 A good small block to test on for Ethereum mainnet is: `20526624`.
+
+## Nitro Enclave
+
+### KMS credentials
+
+```cmd
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+ROLE=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/iam/security-credentials/)
+curl -H "X-aws-ec2-metadata-token: $TOKEN"   http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE
+
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_SESSION_TOKEN=
+```
+
+### Run rsp with nitro
+
+```cmd
+AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID cargo r --package rsp --release --no-default-features --features nitro -- --block-number <ACTUAL_BLOCK_NUMBER> --rpc-url https://rpc.testnet.fluent.xyz/ --genesis-path bin/host/genesis/fluent-devnet.json
+```
+
+or
+
+```cmd
+AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID  ./target/release/rsp --block-number <ACTUAL_BLOCK_NUMBER> --rpc-url https://rpc.testnet.fluent.xyz/   --genesis-path bin/host/genesis/fluent-devnet.json
+
+```
+
+Check enclaves list
+
+```cmd
+nitro-cli describe-enclaves
+```
+
+Read enclave status
+
+```cmd
+nitro-cli console --enclave-name rsp-client-enclave
+```
+
+Terminate enclave
+
+```cmd
+nitro-cli terminate-enclave --enclave-name rsp-client-enclave
+```

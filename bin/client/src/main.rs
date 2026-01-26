@@ -7,13 +7,15 @@ use aws_nitro_enclaves_nsm_api::{
     driver,
 };
 #[cfg(feature = "nitro")]
+use hmac::Mac;
+#[cfg(feature = "nitro")]
 use nix::libc;
 #[cfg(feature = "nitro")]
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 #[cfg(feature = "nitro")]
 use p256::SecretKey;
 #[cfg(feature = "nitro")]
-use rsp_client_executor::key::{EnclaveKeyResponse, ExecutorKeyRequest};
+use rsp_client_executor::key::{AwsCredentials, EnclaveKeyRequest, EnclaveKeyResponse};
 use rsp_client_executor::{executor::EthClientExecutor, io::EthClientExecutorInput};
 #[cfg(feature = "sp1")]
 use rsp_client_executor::{executor::DESERIALZE_INPUTS, utils::profile_report};
@@ -53,128 +55,267 @@ pub fn main() {
 #[cfg(feature = "nitro")]
 const VSOCK_PORT: u32 = 5005;
 #[cfg(feature = "nitro")]
-const KEY_MANAGEMENT_PORT: u32 = 5006;
-#[cfg(feature = "nitro")]
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 #[cfg(feature = "nitro")]
 const HOST_CID: u32 = 3;
 #[cfg(feature = "nitro")]
 const KMS_PORT: u32 = 8000;
 #[cfg(feature = "nitro")]
-const KEY_ID: &str = "alias/enclave-master-key";
+const KEY_ID: &str = "e3e3147b-f94a-4127-a845-a082e6cc8448";
+#[cfg(feature = "nitro")]
+const REGION: &str = "us-east-1";
+#[cfg(feature = "nitro")]
+const KMS_HOST: &str = "kms.us-east-1.amazonaws.com";
+#[cfg(feature = "nitro")]
+const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
+#[cfg(feature = "nitro")]
+const TARGET_GENERATE_DATA_KEY: &str = "TrentService.GenerateDataKey";
+#[cfg(feature = "nitro")]
+const TARGET_DECRYPT: &str = "TrentService.Decrypt";
 
 #[derive(Serialize, Deserialize)]
 struct AttestationUserData {
     pubkey: Vec<u8>,
     signature: Vec<u8>,
+    parent_hash: Vec<u8>,
+    block_hash: Vec<u8>,
+    withdrawal_hash: Vec<u8>,
+    deposit_hash: Vec<u8>,
     result_hash: Vec<u8>,
 }
 
 #[cfg(feature = "nitro")]
-#[derive(Serialize)]
-#[allow(non_snake_case)]
-struct KmsGenerateRequest<'a> {
-    Action: &'a str,
-    KeyId: &'a str,
-    KeySpec: &'a str,
-}
+fn tls_stream_to_kms() -> anyhow::Result<rustls::StreamOwned<rustls::ClientConnection, VsockStream>>
+{
+    use rustls::{ClientConfig, ClientConnection, RootCertStore};
+    use std::sync::Arc;
 
-#[cfg(feature = "nitro")]
-#[derive(Deserialize)]
-#[allow(non_snake_case)]
-struct KmsGenerateResponse {
-    Plaintext: String,
-    CiphertextBlob: String,
-}
+    let addr = SockAddr::new_vsock(HOST_CID, KMS_PORT);
+    let vsock = VsockStream::connect(&addr)
+        .map_err(|e| anyhow::anyhow!("Failed to connect to VSOCK proxy: {}", e))?;
 
-#[cfg(feature = "nitro")]
-#[derive(Serialize)]
-#[allow(non_snake_case)]
-struct KmsDecryptRequest<'a> {
-    Action: &'a str,
-    CiphertextBlob: &'a str,
-}
+    let mut roots = RootCertStore::empty();
+    roots.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+            ta.subject.as_ref(),
+            ta.subject_public_key_info.as_ref(),
+            ta.name_constraints.as_ref().map(|nc| nc.as_ref()),
+        )
+    }));
 
-#[cfg(feature = "nitro")]
-#[derive(Deserialize)]
-#[allow(non_snake_case)]
-struct KmsDecryptResponse {
-    Plaintext: String,
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = KMS_HOST.try_into().map_err(|e| anyhow::anyhow!("invalid DNS: {}", e))?;
+    let conn = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| anyhow::anyhow!("rustls client connection: {}", e))?;
+
+    Ok(rustls::StreamOwned::new(conn, vsock))
 }
 
 #[cfg(feature = "nitro")]
 fn kms_proxy_call(req: &str) -> anyhow::Result<String> {
-    use std::io::{Read, Write};
-    let addr = SockAddr::new_vsock(HOST_CID, KMS_PORT);
-    let mut stream = VsockStream::connect(&addr)
-        .map_err(|e| anyhow::anyhow!("Failed to connect to KMS proxy: {}", e))?;
-    stream
-        .write_all(req.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Failed to write to KMS proxy: {}", e))?;
-    stream.flush().map_err(|e| anyhow::anyhow!("Failed to flush KMS proxy stream: {}", e))?;
+    let mut tls = tls_stream_to_kms()?;
+    tls.write_all(req.as_bytes()).map_err(|e| anyhow::anyhow!("Failed to write request: {}", e))?;
+    tls.flush().ok();
+
     let mut resp = String::new();
-    stream
-        .read_to_string(&mut resp)
-        .map_err(|e| anyhow::anyhow!("Failed to read from KMS proxy: {}", e))?;
+    tls.read_to_string(&mut resp).map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
     Ok(resp)
 }
 
 #[cfg(feature = "nitro")]
-fn generate_data_key() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+fn split_http(resp: &str) -> (&str, &str) {
+    match resp.find("\r\n\r\n") {
+        Some(i) => (&resp[..i], &resp[i + 4..]),
+        None => (resp, ""),
+    }
+}
+
+#[cfg(feature = "nitro")]
+fn status_line(headers: &str) -> &str {
+    headers.lines().next().unwrap_or("<no status line>")
+}
+
+#[cfg(feature = "nitro")]
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    hex::encode(h.finalize())
+}
+
+#[cfg(feature = "nitro")]
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let mut mac = hmac::Hmac::<Sha256>::new_from_slice(key).expect("HMAC key");
+    mac.update(msg);
+    mac.finalize().into_bytes().to_vec()
+}
+
+#[cfg(feature = "nitro")]
+fn signing_key(secret: &str, date_yyyymmdd: &str, region: &str, service: &str) -> Vec<u8> {
+    let k_secret = format!("AWS4{}", secret);
+    let k_date = hmac_sha256(k_secret.as_bytes(), date_yyyymmdd.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    hmac_sha256(&k_service, b"aws4_request")
+}
+
+#[cfg(feature = "nitro")]
+fn build_signed_http_request(
+    creds: &AwsCredentials,
+    target: &str,
+    body_json: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<String> {
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.format("%Y%m%d").to_string();
+
+    let mut headers: Vec<(String, String)> = vec![
+        ("content-type".into(), CONTENT_TYPE.into()),
+        ("host".into(), KMS_HOST.into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-target".into(), target.into()),
+    ];
+    if let Some(token) = &creds.session_token {
+        if !token.is_empty() {
+            headers.push(("x-amz-security-token".into(), token.clone()));
+        }
+    }
+    headers.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let canonical_headers =
+        headers.iter().map(|(k, v)| format!("{}:{}\n", k, v.trim())).collect::<String>();
+
+    let signed_headers = headers.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>().join(";");
+
+    let payload_hash = sha256_hex(body_json.as_bytes());
+
+    let canonical_request =
+        format!("POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+
+    let credential_scope = format!("{}/{}/kms/aws4_request", date, REGION);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{cr_hash}",
+        amz_date = amz_date,
+        scope = credential_scope,
+        cr_hash = canonical_request_hash
+    );
+
+    let key = signing_key(&creds.secret_access_key, &date, REGION, "kms");
+    let signature = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes()));
+
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        creds.access_key_id, credential_scope, signed_headers, signature
+    );
+
+    let mut req = String::new();
+    req.push_str("POST / HTTP/1.1\r\n");
+    req.push_str(&format!("Host: {}\r\n", KMS_HOST));
+    req.push_str(&format!("Content-Type: {}\r\n", CONTENT_TYPE));
+    req.push_str(&format!("X-Amz-Target: {}\r\n", target));
+    req.push_str(&format!("X-Amz-Date: {}\r\n", amz_date));
+    if let Some(token) = &creds.session_token {
+        if !token.is_empty() {
+            req.push_str(&format!("X-Amz-Security-Token: {}\r\n", token));
+        }
+    }
+    req.push_str(&format!("Authorization: {}\r\n", authorization));
+    req.push_str(&format!("Content-Length: {}\r\n", body_json.as_bytes().len()));
+    req.push_str("\r\n");
+    req.push_str(body_json);
+
+    Ok(req)
+}
+
+#[cfg(feature = "nitro")]
+fn generate_data_key(creds: &AwsCredentials) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     use base64::{engine::general_purpose, Engine as _};
     use tracing::info;
 
     info!("Calling KMS proxy for GenerateDataKey");
-    let req = KmsGenerateRequest { Action: "GenerateDataKey", KeyId: KEY_ID, KeySpec: "AES_256" };
-    let req_json = serde_json::to_string(&req)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize KMS request: {}", e))?;
-    let resp = kms_proxy_call(&req_json)?;
-    let parsed: KmsGenerateResponse = serde_json::from_str(&resp)
-        .map_err(|e| anyhow::anyhow!("Failed to parse KMS response: {}", e))?;
+    let body = serde_json::json!({
+        "KeyId": KEY_ID,
+        "KeySpec": "AES_256"
+    })
+    .to_string();
+
+    let req = build_signed_http_request(creds, TARGET_GENERATE_DATA_KEY, &body, chrono::Utc::now())
+        .map_err(|e| anyhow::anyhow!("sign GenerateDataKey: {}", e))?;
+    let resp = kms_proxy_call(&req)?;
+    let (hdr, body) = split_http(&resp);
+    if !status_line(hdr).contains("200") {
+        return Err(anyhow::anyhow!("GenerateDataKey failed: {}", body));
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| anyhow::anyhow!("parse GenerateDataKey: {}", e))?;
+    let ciphertext_blob = parsed
+        .get("CiphertextBlob")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("GenerateDataKey missing CiphertextBlob"))?;
+    let plaintext = parsed
+        .get("Plaintext")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("GenerateDataKey missing Plaintext"))?;
+
     let plaintext = general_purpose::STANDARD
-        .decode(&parsed.Plaintext)
+        .decode(plaintext)
         .map_err(|e| anyhow::anyhow!("Failed to decode plaintext: {}", e))?;
     let ciphertext = general_purpose::STANDARD
-        .decode(&parsed.CiphertextBlob)
+        .decode(ciphertext_blob)
         .map_err(|e| anyhow::anyhow!("Failed to decode ciphertext: {}", e))?;
     Ok((plaintext, ciphertext))
 }
 
 #[cfg(feature = "nitro")]
-fn decrypt_data_key(ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn decrypt_data_key(creds: &AwsCredentials, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
     use base64::{engine::general_purpose, Engine as _};
     use tracing::info;
 
     info!("Calling KMS proxy for Decrypt");
     let ciphertext_b64 = general_purpose::STANDARD.encode(ciphertext);
-    let req = KmsDecryptRequest { Action: "Decrypt", CiphertextBlob: &ciphertext_b64 };
-    let req_json = serde_json::to_string(&req)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize KMS request: {}", e))?;
-    let resp = kms_proxy_call(&req_json)?;
-    let parsed: KmsDecryptResponse = serde_json::from_str(&resp)
-        .map_err(|e| anyhow::anyhow!("Failed to parse KMS response: {}", e))?;
+    let body = serde_json::json!({
+        "CiphertextBlob": ciphertext_b64
+    })
+    .to_string();
+
+    let req = build_signed_http_request(creds, TARGET_DECRYPT, &body, chrono::Utc::now())
+        .map_err(|e| anyhow::anyhow!("sign Decrypt: {}", e))?;
+    let resp = kms_proxy_call(&req)?;
+    let (hdr, body) = split_http(&resp);
+    if !status_line(hdr).contains("200") {
+        return Err(anyhow::anyhow!("Decrypt failed: {}", body));
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| anyhow::anyhow!("parse Decrypt: {}", e))?;
+    let plaintext = parsed
+        .get("Plaintext")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Decrypt missing Plaintext"))?;
     let plaintext = general_purpose::STANDARD
-        .decode(&parsed.Plaintext)
+        .decode(plaintext)
         .map_err(|e| anyhow::anyhow!("Failed to decode plaintext: {}", e))?;
     Ok(plaintext)
 }
 
 #[cfg(feature = "nitro")]
-fn handle_key_management_request(
-    req: ExecutorKeyRequest,
-) -> anyhow::Result<(EnclaveKeyResponse, Vec<u8>)> {
+fn handle_key_management_request(req: EnclaveKeyRequest) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     use tracing::info;
 
-    match req {
-        ExecutorKeyRequest::CreateNewKey => {
-            info!("Handling CreateNewKey request");
-            let (data_key, encrypted_data_key) = generate_data_key()?;
-            Ok((EnclaveKeyResponse::KeyCreated { encrypted_data_key }, data_key))
+    match req.encrypted_data_key {
+        Some(encrypted_data_key) => {
+            info!("Handling decrypt of existing encrypted data key");
+            let data_key = decrypt_data_key(&req.credentials, &encrypted_data_key)?;
+            Ok((data_key, encrypted_data_key))
         }
-        ExecutorKeyRequest::DecryptKey { encrypted_data_key } => {
-            info!("Handling DecryptKey request");
-            let data_key = decrypt_data_key(&encrypted_data_key)?;
-            Ok((EnclaveKeyResponse::KeyDecrypted, data_key))
+        None => {
+            info!("Handling GenerateDataKey request");
+            let (data_key, encrypted_data_key) = generate_data_key(&req.credentials)?;
+            Ok((data_key, encrypted_data_key))
         }
     }
 }
@@ -183,16 +324,12 @@ fn handle_key_management_request(
 fn main() -> anyhow::Result<()> {
     println!("Nitro enclave started");
 
-    let key_mgmt_addr = SockAddr::new_vsock(libc::VMADDR_CID_ANY, KEY_MANAGEMENT_PORT);
-    let key_mgmt_listener = VsockListener::bind(&key_mgmt_addr)?;
-    println!("Key management listener bound to port {}", KEY_MANAGEMENT_PORT);
-
-    let exec_addr = SockAddr::new_vsock(libc::VMADDR_CID_ANY, VSOCK_PORT);
-    let exec_listener = VsockListener::bind(&exec_addr)?;
-    println!("Execution listener bound to port {}", VSOCK_PORT);
+    let addr = SockAddr::new_vsock(libc::VMADDR_CID_ANY, VSOCK_PORT);
+    let listener = VsockListener::bind(&addr)?;
+    println!("Listener bound to port {}", VSOCK_PORT);
 
     let data_key = {
-        let (mut stream, _) = key_mgmt_listener
+        let (mut stream, _) = listener
             .accept()
             .map_err(|e| anyhow::anyhow!("Key management accept error: {:?}", e))?;
         println!("Accepted key management connection");
@@ -207,7 +344,7 @@ fn main() -> anyhow::Result<()> {
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf)?;
 
-        let req: ExecutorKeyRequest = bincode::deserialize(&buf).map_err(|e| {
+        let req: EnclaveKeyRequest = bincode::deserialize(&buf).map_err(|e| {
             let resp = EnclaveKeyResponse::Error(format!("Deserialize error: {}", e));
             let resp_bytes = bincode::serialize(&resp).unwrap_or_default();
             let resp_len = resp_bytes.len() as u32;
@@ -216,11 +353,12 @@ fn main() -> anyhow::Result<()> {
             anyhow::anyhow!("Failed to deserialize key request: {}", e)
         })?;
 
-        let (resp, data_key) = handle_key_management_request(req).map_err(|e| {
+        let (data_key, encrypted_data_key) = handle_key_management_request(req).map_err(|e| {
             eprintln!("Key management error: {}", e);
             anyhow::anyhow!("Key management failed: {}", e)
         })?;
 
+        let resp = EnclaveKeyResponse::EncryptedDataKey { encrypted_data_key };
         let resp_bytes = bincode::serialize(&resp)
             .map_err(|e| anyhow::anyhow!("Failed to serialize response: {}", e))?;
         let resp_len = resp_bytes.len() as u32;
@@ -236,7 +374,7 @@ fn main() -> anyhow::Result<()> {
         data_key
     };
 
-    let (mut stream, _) = exec_listener.accept()?;
+    let (mut stream, _) = listener.accept()?;
     println!("Accepted execution connection");
 
     let secret_key = SecretKey::from_bytes(data_key.as_slice().into())
@@ -283,11 +421,23 @@ fn main() -> anyhow::Result<()> {
     let pubkey = signing_key.verifying_key();
     let pubkey_bytes = pubkey.to_encoded_point(false).as_bytes().to_vec();
 
-    let signature: Signature = signing_key.sign(&result_hash);
+    let mut signing_hasher = Sha256::new();
+    signing_hasher.update(AsRef::<[u8]>::as_ref(&parent_hash));
+    signing_hasher.update(AsRef::<[u8]>::as_ref(&block_hash));
+    signing_hasher.update(AsRef::<[u8]>::as_ref(&events_hash.withdrawal_hash));
+    signing_hasher.update(AsRef::<[u8]>::as_ref(&events_hash.deposit_hash));
+    signing_hasher.update(result_hash.as_slice());
+    let signing_payload = signing_hasher.finalize();
+
+    let signature: Signature = signing_key.sign(signing_payload.as_slice());
 
     let user_data = AttestationUserData {
         pubkey: pubkey_bytes,
         signature: signature.to_bytes().to_vec(),
+        parent_hash: AsRef::<[u8]>::as_ref(&parent_hash).to_vec(),
+        block_hash: AsRef::<[u8]>::as_ref(&block_hash).to_vec(),
+        withdrawal_hash: AsRef::<[u8]>::as_ref(&events_hash.withdrawal_hash).to_vec(),
+        deposit_hash: AsRef::<[u8]>::as_ref(&events_hash.deposit_hash).to_vec(),
         result_hash: result_hash.to_vec(),
     };
 

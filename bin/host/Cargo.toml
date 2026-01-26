@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 default = ["sp1"]
 sp1 = ["rsp-host-executor/sp1"]
-nitro = ["rsp-host-executor/nitro"]
+nitro = ["rsp-host-executor/nitro", "rsp-client-executor/nitro"]
 
 [dependencies]
 tokio.workspace = true
