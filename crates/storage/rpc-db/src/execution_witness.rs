@@ -133,7 +133,7 @@ where
 
     async fn ancestor_headers(&self) -> Result<Vec<Header>, RpcDbError> {
         let mut ancestor_headers: Vec<Header> = self.ancestor_headers.values().cloned().collect();
-        ancestor_headers.sort_by(|a, b| b.number.cmp(&a.number));
+        ancestor_headers.sort_by_key(|b| std::cmp::Reverse(b.number));
         Ok(ancestor_headers)
     }
 }

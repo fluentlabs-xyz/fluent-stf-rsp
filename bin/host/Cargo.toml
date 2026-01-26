@@ -15,7 +15,6 @@ tracing-subscriber = "0.3.18"
 dotenv = "0.15.0"
 clap = { version = "4.5.7", features = ["derive", "env"] }
 eyre = "0.6.12"
-serde.workspace = true
 serde_json.workspace = true
 strum = "0.26"
 csv = "1.1"
@@ -51,6 +50,7 @@ rsp-client-executor.workspace = true
 serde_json = "1.0"
 thousands = "0.2.0"
 madato = "0.7.0"
+serde.workspace = true
 
 [build-dependencies]
 sp1-build.workspace = true

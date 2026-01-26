@@ -7,7 +7,6 @@ use rsp_client_executor::executor::{
     VALIDATE_EXECUTION,
 };
 use rsp_host_executor::ExecutionHooks;
-use serde::{Deserialize, Serialize};
 use sp1_core_executor::syscalls::SyscallCode;
 use sp1_sdk::ExecutionReport;
 use std::{fs::OpenOptions, path::PathBuf};
@@ -27,22 +26,6 @@ const PRECOMPILES: [&str; 10] = [
     "blake2f",
     "kzg-point-evaluation",
 ];
-
-#[derive(Serialize, Deserialize)]
-struct ExecutionReportData {
-    chain_id: u64,
-    block_number: u64,
-    gas_used: u64,
-    tx_count: usize,
-    number_cycles: u64,
-    number_syscalls: u64,
-    bn_add_cycles: u64,
-    bn_mul_cycles: u64,
-    bn_pair_cycles: u64,
-    kzg_point_eval_cycles: u64,
-    keccak_count: u64,
-    secp256k1_decompress_count: u64,
-}
 
 #[derive(Debug)]
 pub struct PersistExecutionReport {

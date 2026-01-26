@@ -73,7 +73,7 @@ fn merkle_root(mut leaves: Vec<B256>) -> B256 {
     }
 
     while leaves.len() > 1 {
-        if leaves.len() % 2 != 0 {
+        if !leaves.len().is_multiple_of(2) {
             leaves.push(*leaves.last().unwrap());
         }
 
