@@ -52,7 +52,7 @@ pub fn create_eth_block_execution_strategy_factory(
 //     OpEvmConfig::optimism(chain_spec)
 // }
 #[cfg(feature = "nitro")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct NitroConfig {
     pub enclave_cid: u32,
     pub enclave_port: u32,

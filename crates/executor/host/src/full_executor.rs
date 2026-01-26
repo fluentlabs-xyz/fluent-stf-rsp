@@ -21,9 +21,11 @@ use crate::{
     executor_components::MaybeProveWithCycles, Config, ExecutionHooks, ExecutorComponents,
     HostError, HostExecutor,
 };
-use rsp_client_executor::key::EnclaveKeyResponse;
+
 #[cfg(feature = "nitro")]
 use {
+    crate::NitroConfig,
+    rsp_client_executor::key::{AwsCredentials, EnclaveKeyRequest, EnclaveKeyResponse},
     serde::Deserialize,
     std::fs,
     std::io::{Read, Write},
@@ -182,10 +184,9 @@ where
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let nitro_config = config.nitro_config.as_ref().cloned().unwrap_or_default();
-    let enclave_cid = nitro_config.enclave_cid;
 
     info!("Initializing enclave key management...");
-    initialize_enclave_key(enclave_cid).await?;
+    initialize_enclave_key(nitro_config).await?;
 
     let provider =
         provider.ok_or_else(|| eyre::eyre!("Provider is required for Nitro executor"))?;
@@ -251,11 +252,11 @@ pub trait BlockExecutor<C: ExecutorComponents> {
             let input_block_hash = client_input.current_block.header.hash_slow();
 
             if input_block_hash != block_hash {
-                return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?
+                return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?;
             }
 
             if client_input.current_block.header.parent_hash != parent_hash {
-                return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?
+                return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?;
             }
 
             info!(?block_hash, "Execution successful");
@@ -418,54 +419,79 @@ struct EnclaveResponse {
 }
 
 #[cfg(feature = "nitro")]
-const KEY_MANAGEMENT_PORT: u32 = 5006;
-#[cfg(feature = "nitro")]
-const DATA_KEY_STORAGE: &str = "./data_key.enc";
+fn aws_access_key_id() -> String {
+    std::env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID environment variable must be set")
+}
 
 #[cfg(feature = "nitro")]
-async fn initialize_enclave_key(enclave_cid: u32) -> eyre::Result<()> {
+fn aws_secret_access_key() -> String {
+    std::env::var("AWS_SECRET_ACCESS_KEY")
+        .expect("AWS_SECRET_ACCESS_KEY environment variable must be set")
+}
+
+#[cfg(feature = "nitro")]
+fn aws_session_token() -> Option<String> {
+    std::env::var("AWS_SESSION_TOKEN").ok().filter(|s| !s.is_empty())
+}
+
+#[cfg(feature = "nitro")]
+fn data_key_storage() -> String {
+    std::env::var("DATA_KEY_STORAGE").unwrap_or_else(|_| "./data_key.enc".to_string())
+}
+
+#[cfg(feature = "nitro")]
+async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
     use tracing::info;
 
-    if let Ok(encrypted_dek) = fs::read(DATA_KEY_STORAGE) {
-        info!("Found existing encrypted data key, requesting decryption");
-        let resp = handle_key_management_request(
-            enclave_cid,
-            ExecutorKeyRequest::DecryptKey { encrypted_data_key: encrypted_dek },
-        )
-        .await?;
-
-        match resp {
-            EnclaveKeyResponse::KeyDecrypted { .. } => {
-                info!("Successfully decrypted existing key");
-                Ok(())
-            }
-            EnclaveKeyResponse::Error(e) => Err(eyre::eyre!("Key decryption failed: {}", e)),
-            _ => Err(eyre::eyre!("Unexpected response type")),
+    let data_key_path = data_key_storage();
+    let encrypted_dek = match fs::read(&data_key_path) {
+        Ok(data) => {
+            info!("Found existing encrypted data key, requesting decryption");
+            Some(data)
         }
-    } else {
-        info!("No existing key found, requesting new key creation");
-        let resp =
-            handle_key_management_request(enclave_cid, ExecutorKeyRequest::CreateNewKey).await?;
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            info!("No existing key found, requesting new key creation");
+            None
+        }
+        Err(err) => return Err(eyre::eyre!("Failed to read data key file: {}", err)),
+    };
 
-        match resp {
-            EnclaveKeyResponse::KeyCreated { sealed_key: _, encrypted_data_key } => {
-                if let Some(parent) = Path::new(DATA_KEY_STORAGE).parent() {
+    let request = EnclaveKeyRequest {
+        credentials: AwsCredentials {
+            access_key_id: aws_access_key_id(),
+            secret_access_key: aws_secret_access_key(),
+            session_token: aws_session_token(),
+        },
+        encrypted_data_key: encrypted_dek.clone(),
+    };
+
+    let resp =
+        handle_key_management_request(nitro_config.enclave_cid, nitro_config.enclave_port, request)
+            .await?;
+
+    match resp {
+        EnclaveKeyResponse::EncryptedDataKey { encrypted_data_key } => {
+            if encrypted_dek.as_deref() != Some(encrypted_data_key.as_slice()) {
+                let data_key_path = data_key_storage();
+                if let Some(parent) = Path::new(&data_key_path).parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(DATA_KEY_STORAGE, &encrypted_data_key)?;
-                info!("New key created and encrypted data key stored");
-                Ok(())
+                fs::write(&data_key_path, &encrypted_data_key)?;
+                info!("Encrypted data key updated");
+            } else {
+                info!("Encrypted data key unchanged");
             }
-            EnclaveKeyResponse::Error(e) => Err(eyre::eyre!("Key creation failed: {}", e)),
-            _ => Err(eyre::eyre!("Unexpected response type")),
+            Ok(())
         }
+        EnclaveKeyResponse::Error(e) => Err(eyre::eyre!("Key management failed: {}", e)),
     }
 }
 
 #[cfg(feature = "nitro")]
 async fn handle_key_management_request(
     enclave_cid: u32,
-    req: ExecutorKeyRequest,
+    enclave_port: u32,
+    req: EnclaveKeyRequest,
 ) -> eyre::Result<EnclaveKeyResponse> {
     use std::io::{Read, Write};
     use tracing::info;
@@ -473,7 +499,7 @@ async fn handle_key_management_request(
     info!("Handling key management request: {:?}", req);
 
     const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
-    let addr = SockAddr::new_vsock(enclave_cid, KEY_MANAGEMENT_PORT);
+    let addr = SockAddr::new_vsock(enclave_cid, enclave_port);
     let mut stream = VsockStream::connect(&addr)
         .map_err(|e| eyre::eyre!("Failed to connect to enclave for key management: {}", e))?;
 
