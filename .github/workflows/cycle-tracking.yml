@@ -10,13 +10,12 @@ concurrency:
 jobs:
   cycle-tracking:
     name: "Run client in SP1 and verify if cycle count hasn't increased"
-    runs-on:
-      ["runs-on", "runner=64cpu-linux-x64", "run-id=${{ github.run_id }}"]
+    runs-on: ubuntu-amd64-8core
     steps:
       - name: "Checkout sources"
         uses: "actions/checkout@v4"
         with:
-          fetch-depth: 0  
+          fetch-depth: 0
 
       - name: "Install sp1up"
         run: |
