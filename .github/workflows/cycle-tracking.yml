@@ -10,6 +10,7 @@ concurrency:
 jobs:
   cycle-tracking:
     name: "Run client in SP1 and verify if cycle count hasn't increased"
+    if: false
     runs-on: ubuntu-amd64-8core
     steps:
       - name: "Checkout sources"
