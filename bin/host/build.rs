@@ -29,18 +29,6 @@ fn build_nitro_binary() -> Result<(), Box<dyn std::error::Error>> {
     let target = "x86_64-unknown-linux-musl";
     let binary_name = "rsp-client";
 
-    println!("cargo:warning=Checking for musl target...");
-    let target_list = Command::new("rustup").args(&["target", "list", "--installed"]).output()?;
-
-    let target_list_str = String::from_utf8_lossy(&target_list.stdout);
-    if !target_list_str.contains(target) {
-        println!("cargo:warning=Installing musl target...");
-        let install_status = Command::new("rustup").args(&["target", "add", target]).status()?;
-
-        if !install_status.success() {
-            return Err(format!("Failed to install target: {}", target).into());
-        }
-    }
     let metadata_file = client_dir.join("Cargo.toml");
     let mut metadata_cmd = cargo_metadata::MetadataCommand::new();
     let metadata = metadata_cmd.manifest_path(metadata_file).exec().unwrap();

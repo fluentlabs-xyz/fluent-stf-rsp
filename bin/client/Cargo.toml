@@ -5,7 +5,7 @@ description = ""
 edition = "2021"
 
 [features]
-default = ["sp1"]
+default = ["nitro"]
 sp1 = [
     "dep:sp1-zkvm",
     "rsp-client-executor/sp1",
@@ -73,6 +73,8 @@ webpki-roots = { version = "0.26", optional = true }
 
 aws-sdk-kms = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
+hkdf = "0.12.4"
+k256 = "0.13.4"
 
 [patch.crates-io]
 # Precompile patches

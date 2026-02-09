@@ -3,8 +3,9 @@ use alloy_provider::Provider;
 use either::Either;
 use eyre::bail;
 use reth_primitives_traits::NodePrimitives;
+use revm_primitives::FixedBytes;
 use rsp_client_executor::io::ClientExecutorInput;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use sp1_prover::components::CpuProverComponents;
 use sp1_sdk::{ExecutionReport, Prover, SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey};
 use std::{
@@ -24,7 +25,7 @@ use crate::{
 #[cfg(feature = "nitro")]
 use {
     crate::NitroConfig,
-    rsp_client_executor::key::{AwsCredentials, EnclaveKeyRequest, EnclaveKeyResponse},
+    rsp_client_executor::nitro::{AwsCredentials, EnclaveRequest, EnclaveResponse},
     serde::Deserialize,
     std::fs,
     std::io::{Read, Write},
@@ -308,6 +309,8 @@ pub trait BlockExecutor<C: ExecutorComponents> {
         hooks: &C::Hooks,
     ) -> eyre::Result<()> {
         // Get enclave CID and port from config or use defaults
+
+        use rsp_client_executor::nitro::EthExecutionResponce;
         let nitro_config = self.config().nitro_config.as_ref().cloned().unwrap_or_default();
 
         let enclave_cid = nitro_config.enclave_cid;
@@ -319,8 +322,7 @@ pub trait BlockExecutor<C: ExecutorComponents> {
         let payload = bincode::serialize(&client_input)?;
 
         info!("Serialized input: {} bytes", payload.len());
-        let attestation_start = Instant::now();
-        let response = task::spawn_blocking(move || -> eyre::Result<EnclaveResponse> {
+        let response = task::spawn_blocking(move || -> eyre::Result<EthExecutionResponce> {
             const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
             let addr = SockAddr::new_vsock(enclave_cid, enclave_port);
             let mut stream = VsockStream::connect(&addr).map_err(|e| {
@@ -361,7 +363,7 @@ pub trait BlockExecutor<C: ExecutorComponents> {
             let resp_text = String::from_utf8_lossy(&resp_buf);
             info!("Received response ({} bytes): {}", resp_buf.len(), resp_text);
 
-            let parsed: EnclaveResponse = serde_json::from_slice(&resp_buf)
+            let parsed: EthExecutionResponce = bincode::deserialize(&resp_buf)
                 .map_err(|e| eyre::eyre!("Failed to parse JSON response from enclave: {}", e))?;
 
             Ok(parsed)
@@ -386,35 +388,10 @@ pub trait BlockExecutor<C: ExecutorComponents> {
                 hex::encode(AsRef::<[u8]>::as_ref(&response.parent_hash))
             ));
         }
-        let attestation_duration = attestation_start.elapsed();
-
-        hooks
-            .on_nitro_attestation_end(
-                client_input.current_block.number,
-                &response.attestation,
-                attestation_duration,
-            )
-            .await?;
 
         info!("Nitro enclave execution successful");
         Ok(())
     }
-}
-
-#[cfg(feature = "nitro")]
-#[derive(Debug, Deserialize)]
-struct EnclaveResponse {
-    #[serde(deserialize_with = "deserialize_b256_from_hex")]
-    parent_hash: B256,
-    #[serde(deserialize_with = "deserialize_b256_from_hex")]
-    block_hash: B256,
-    #[serde(deserialize_with = "deserialize_b256_from_hex")]
-    withdrawal_hash: B256,
-    #[serde(deserialize_with = "deserialize_b256_from_hex")]
-    deposit_hash: B256,
-    #[serde(deserialize_with = "deserialize_b256_from_hex")]
-    result_hash: B256,
-    attestation: Vec<u8>,
 }
 
 #[cfg(feature = "nitro")]
@@ -455,7 +432,7 @@ async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
         Err(err) => return Err(eyre::eyre!("Failed to read data key file: {}", err)),
     };
 
-    let request = EnclaveKeyRequest {
+    let request = EnclaveRequest {
         credentials: AwsCredentials {
             access_key_id: aws_access_key_id(),
             secret_access_key: aws_secret_access_key(),
@@ -469,20 +446,20 @@ async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
             .await?;
 
     match resp {
-        EnclaveKeyResponse::EncryptedDataKey { encrypted_data_key } => {
-            if encrypted_dek.as_deref() != Some(encrypted_data_key.as_slice()) {
+        EnclaveResponse::EncryptedDataKey { encrypted_signing_key, public_key, attestation } => {
+            if encrypted_dek.as_deref() != Some(encrypted_signing_key.as_slice()) {
                 let data_key_path = data_key_storage();
                 if let Some(parent) = Path::new(&data_key_path).parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(&data_key_path, &encrypted_data_key)?;
+                fs::write(&data_key_path, &encrypted_signing_key)?;
                 info!("Encrypted data key updated");
             } else {
                 info!("Encrypted data key unchanged");
             }
             Ok(())
         }
-        EnclaveKeyResponse::Error(e) => Err(eyre::eyre!("Key management failed: {}", e)),
+        EnclaveResponse::Error(e) => Err(eyre::eyre!("Key management failed: {}", e)),
     }
 }
 
@@ -490,8 +467,8 @@ async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
 async fn handle_key_management_request(
     enclave_cid: u32,
     enclave_port: u32,
-    req: EnclaveKeyRequest,
-) -> eyre::Result<EnclaveKeyResponse> {
+    req: EnclaveRequest,
+) -> eyre::Result<EnclaveResponse> {
     use std::io::{Read, Write};
     use tracing::info;
 
@@ -526,7 +503,7 @@ async fn handle_key_management_request(
     let mut resp_buf = vec![0u8; resp_len];
     stream.read_exact(&mut resp_buf).map_err(|e| eyre::eyre!("Failed to read response: {}", e))?;
 
-    let response: EnclaveKeyResponse = bincode::deserialize(&resp_buf)
+    let response: EnclaveResponse = bincode::deserialize(&resp_buf)
         .map_err(|e| eyre::eyre!("Failed to deserialize response: {}", e))?;
 
     Ok(response)

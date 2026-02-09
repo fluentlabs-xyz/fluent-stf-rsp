@@ -196,8 +196,8 @@ fn handle_custom_chains(
             // Skip extra data and Merge difficulty checks for Linea chains
             if matches!(
                 err,
-                ConsensusError::ExtraDataExceedsMax { .. } |
-                    ConsensusError::TheMergeDifficultyIsNotZero
+                ConsensusError::ExtraDataExceedsMax { .. }
+                    | ConsensusError::TheMergeDifficultyIsNotZero
             ) {
                 Ok(())
             } else {
