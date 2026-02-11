@@ -1,0 +1,42 @@
+# program/Cargo.toml
+[package]
+name = "nitro-validator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
+serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }
+
+# CBOR - используйте ТОЛЬКО ciborium (быстрее чем serde_cbor в zkVM)
+ciborium = { version = "0.2", default-features = false }
+
+# Crypto
+p384 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+
+# X.509 parsing
+x509-parser = { version = "0.16", default-features = false }
+
+sp1-zkvm = "5.2"
+getrandom = { version = "0.2", default-features = false, features = ["custom"] } 
+
+[dev-dependencies]
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+
+[patch.crates-io]
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", branch = "patch-sha2-v0.10.8" }
+
+# Big integer arithmetic
+crypto-bigint = { git = "https://github.com/sp1-patches/RustCrypto-bigint", branch = "patch-v0.5.5" }
+
+# ECDSA signatures
+ecdsa = { git = "https://github.com/sp1-patches/signatures", branch = "patch-ecdsa-v0.16.9-old" }

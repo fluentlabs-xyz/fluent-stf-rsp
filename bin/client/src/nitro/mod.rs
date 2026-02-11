@@ -179,14 +179,13 @@ pub fn main() -> anyhow::Result<()> {
     if let Some(encrypted_key) = encrypted_signing_key {
         let signing_pub_key_bytes =
             signing_key.verifying_key().to_encoded_point(false).as_bytes().to_vec();
-        let signing_pub_cbor = serde_cbor::to_vec(&signing_pub_key_bytes)?;
 
         let nsm_fd = driver::nsm_init();
         let response = driver::nsm_process_request(
             nsm_fd,
             Request::Attestation {
                 public_key: None,
-                user_data: Some(ByteBuf::from(signing_pub_cbor)),
+                user_data: Some(ByteBuf::from(signing_pub_key_bytes.clone())),
                 nonce: None,
             },
         );
@@ -197,9 +196,19 @@ pub fn main() -> anyhow::Result<()> {
         }?;
         driver::nsm_exit(nsm_fd);
 
+        use ciborium::{from_reader, into_writer, value::Value};
+
+        let mut attestation_doc_definite = Vec::new();
+
+        let value: Value = from_reader(attestation_doc.as_slice())
+            .map_err(|e| anyhow::anyhow!("Failed to decode CBOR: {}", e))?;
+
+        into_writer(&value, &mut attestation_doc_definite)
+            .map_err(|e| anyhow::anyhow!("Failed to encode CBOR: {}", e))?;
+
         let resp = EnclaveResponse::EncryptedDataKey {
             encrypted_signing_key: encrypted_key,
-            attestation: attestation_doc,
+            attestation: attestation_doc_definite,
             public_key: signing_pub_key_bytes,
         };
 

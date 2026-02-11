@@ -416,6 +416,11 @@ fn data_key_storage() -> String {
 }
 
 #[cfg(feature = "nitro")]
+fn attestation_storage() -> String {
+    std::env::var("ATTESTATION_KEY_STORAGE").unwrap_or_else(|_| "./attestation.bin".to_string())
+}
+
+#[cfg(feature = "nitro")]
 async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
     use tracing::info;
 
@@ -446,7 +451,11 @@ async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
             .await?;
 
     match resp {
-        EnclaveResponse::EncryptedDataKey { encrypted_signing_key, public_key, attestation } => {
+        Some(EnclaveResponse::EncryptedDataKey {
+            encrypted_signing_key,
+            public_key,
+            attestation,
+        }) => {
             if encrypted_dek.as_deref() != Some(encrypted_signing_key.as_slice()) {
                 let data_key_path = data_key_storage();
                 if let Some(parent) = Path::new(&data_key_path).parent() {
@@ -454,12 +463,21 @@ async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
                 }
                 fs::write(&data_key_path, &encrypted_signing_key)?;
                 info!("Encrypted data key updated");
+
+                let attestation_path = attestation_storage();
+                if let Some(parent) = Path::new(&attestation_path).parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&attestation_path, &attestation)?;
+                info!("Attestation updated");
             } else {
                 info!("Encrypted data key unchanged");
             }
+            info!("public_key: {:?}", hex::encode(&public_key));
             Ok(())
         }
-        EnclaveResponse::Error(e) => Err(eyre::eyre!("Key management failed: {}", e)),
+        Some(EnclaveResponse::Error(e)) => Err(eyre::eyre!("Key management failed: {}", e)),
+        _ => Ok(()),
     }
 }
 
@@ -468,7 +486,7 @@ async fn handle_key_management_request(
     enclave_cid: u32,
     enclave_port: u32,
     req: EnclaveRequest,
-) -> eyre::Result<EnclaveResponse> {
+) -> eyre::Result<Option<EnclaveResponse>> {
     use std::io::{Read, Write};
     use tracing::info;
 
@@ -488,25 +506,31 @@ async fn handle_key_management_request(
     stream.write_all(&req_bytes).map_err(|e| eyre::eyre!("Failed to write request: {}", e))?;
     stream.flush().map_err(|e| eyre::eyre!("Failed to flush: {}", e))?;
 
-    let mut resp_len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut resp_len_buf)
-        .map_err(|e| eyre::eyre!("Failed to read response length: {}", e))?;
-    let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
-    if resp_len > MAX_FRAME_SIZE {
-        return Err(eyre::eyre!(
-            "Response frame too large: {} bytes (cap {})",
-            resp_len,
-            MAX_FRAME_SIZE
-        ));
+    if req.encrypted_data_key.is_none() {
+        let mut resp_len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut resp_len_buf)
+            .map_err(|e| eyre::eyre!("Failed to read response length: {}", e))?;
+        let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+        if resp_len > MAX_FRAME_SIZE {
+            return Err(eyre::eyre!(
+                "Response frame too large: {} bytes (cap {})",
+                resp_len,
+                MAX_FRAME_SIZE
+            ));
+        }
+        let mut resp_buf = vec![0u8; resp_len];
+        stream
+            .read_exact(&mut resp_buf)
+            .map_err(|e| eyre::eyre!("Failed to read response: {}", e))?;
+
+        let response: EnclaveResponse = bincode::deserialize(&resp_buf)
+            .map_err(|e| eyre::eyre!("Failed to deserialize response: {}", e))?;
+
+        Ok(Some(response))
+    } else {
+        Ok(None)
     }
-    let mut resp_buf = vec![0u8; resp_len];
-    stream.read_exact(&mut resp_buf).map_err(|e| eyre::eyre!("Failed to read response: {}", e))?;
-
-    let response: EnclaveResponse = bincode::deserialize(&resp_buf)
-        .map_err(|e| eyre::eyre!("Failed to deserialize response: {}", e))?;
-
-    Ok(response)
 }
 
 #[cfg(feature = "nitro")]

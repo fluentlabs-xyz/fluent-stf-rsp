@@ -8,7 +8,7 @@ members = [
     "crates/primitives",
     "crates/provider",
     "crates/storage/rpc-db",
-    "crates/storage/witness-db",
+    "crates/storage/witness-db", "bin/aws-nitro-validator", "bin/aws-nitro-validator/script",
 ]
 exclude = []
 resolver = "2"

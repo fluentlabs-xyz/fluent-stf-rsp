@@ -1,4 +1,4 @@
-#[cfg(feature = "sp1")]
+// #[cfg(feature = "sp1")]
 use sp1_build::build_program;
 #[cfg(feature = "nitro")]
 use {
@@ -20,6 +20,9 @@ fn main() {
         if let Err(e) = build_nitro_binary() {
             panic!("Failed to build Nitro binary: {}", e);
         }
+
+        println!("cargo:warning=Building SP1 aws-nitro-validator");
+        build_program("../aws-nitro-validator");
     }
 }
 
