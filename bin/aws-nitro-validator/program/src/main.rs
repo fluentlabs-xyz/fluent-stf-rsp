@@ -1,6 +1,5 @@
-// #![no_std]
-// #![no_main]
-// sp1_zkvm::entrypoint!(main);
+#![no_main]
+sp1_zkvm::entrypoint!(main);
 
 extern crate alloc;
 
@@ -8,9 +7,12 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
-use serde_bytes::ByteBuf;
-use p384::ecdsa::{Signature, VerifyingKey, signature::{Verifier, DigestVerifier}};
+use p384::ecdsa::{
+    signature::DigestVerifier,
+    Signature, VerifyingKey,
+};
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha384};
 
 #[derive(Debug)]
@@ -177,10 +179,10 @@ mod opt_serde_bytes {
 /// COSE Sign1 structure (raw CBOR components)
 #[derive(Debug, Deserialize)]
 pub struct CoseSign1Raw(
-    pub ByteBuf,            // 0: protected headers
-    pub ciborium::Value,  // 1: unprotected headers (map or null)
-    pub ByteBuf,            // 2: payload (AttestationDoc in CBOR)
-    pub ByteBuf,            // 3: signature
+    pub ByteBuf,         // 0: protected headers
+    pub ciborium::Value, // 1: unprotected headers (map or null)
+    pub ByteBuf,         // 2: payload (AttestationDoc in CBOR)
+    pub ByteBuf,         // 3: signature
 );
 
 impl CoseSign1Raw {
@@ -221,12 +223,12 @@ impl NitroValidator {
             ValidationError::InvalidCBOR
         })?;
 
-        let att_doc = AttestationDoc::from_binary(&cose.payload())?;
+        let att_doc = AttestationDoc::from_binary(cose.payload())?;
         self.validate_syntax(&att_doc)?;
-        
+
         let verifying_key = self.validate_certificate_chain(&att_doc)?;
         self.verify_cose_signature(&cose, &verifying_key)?;
-        
+
         Ok(att_doc)
     }
 
@@ -308,7 +310,7 @@ impl NitroValidator {
         for ca_cert_der in &doc.cabundle {
             let (_, ca_cert) = X509Certificate::from_der(ca_cert_der)
                 .map_err(|_| ValidationError::InvalidCertificate)?;
-            
+
             Self::verify_cert_signature(&ca_cert, &current_public_key)?;
             current_public_key = ca_cert.public_key().subject_public_key.data.to_vec();
         }
@@ -316,7 +318,7 @@ impl NitroValidator {
         // Parse and verify leaf certificate
         let (_, leaf_cert) = X509Certificate::from_der(&doc.certificate)
             .map_err(|_| ValidationError::InvalidCertificate)?;
-        
+
         Self::verify_cert_signature(&leaf_cert, &current_public_key)?;
 
         // Extract P-384 public key from leaf certificate
@@ -337,8 +339,7 @@ impl NitroValidator {
             return Err(ValidationError::InvalidCertificate);
         }
 
-        VerifyingKey::from_sec1_bytes(sec1_bytes)
-            .map_err(|_| ValidationError::InvalidCertificate)
+        VerifyingKey::from_sec1_bytes(sec1_bytes).map_err(|_| ValidationError::InvalidCertificate)
     }
 
     /// Verify X.509 certificate signature using issuer's public key
@@ -370,7 +371,7 @@ impl NitroValidator {
     fn parse_signature(sig_bytes: &[u8]) -> core::result::Result<Signature, p384::ecdsa::Error> {
         if sig_bytes.len() == 96 {
             // Raw format (96 bytes for P-384: 48 bytes R + 48 bytes S)
-            Signature::from_bytes(sig_bytes.try_into().unwrap())
+            Signature::from_bytes(sig_bytes.into())
         } else {
             // DER format (variable length)
             Signature::from_der(sig_bytes)
@@ -378,10 +379,14 @@ impl NitroValidator {
     }
 
     /// Verify COSE Sign1 signature
-    fn verify_cose_signature(&self, cose: &CoseSign1Raw, verifying_key: &VerifyingKey) -> Result<()> {
+    fn verify_cose_signature(
+        &self,
+        cose: &CoseSign1Raw,
+        verifying_key: &VerifyingKey,
+    ) -> Result<()> {
         let sig_structure = self.construct_sig_structure(cose)?;
         let digest = Sha384::new().chain_update(&sig_structure);
-        
+
         let signature = Signature::from_bytes(cose.signature().into())
             .map_err(|_| ValidationError::InvalidSignature)?;
 
@@ -430,7 +435,6 @@ pub mod sp1 {
         &doc.module_id
     }
 }
-
 
 const AWS_ROOT_CERT: &[u8] = include_bytes!("../../root.der");
 

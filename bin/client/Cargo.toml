@@ -5,7 +5,7 @@ description = ""
 edition = "2021"
 
 [features]
-default = ["nitro"]
+default = ["sp1"]
 sp1 = [
     "dep:sp1-zkvm",
     "rsp-client-executor/sp1",

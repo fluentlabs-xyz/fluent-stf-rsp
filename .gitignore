@@ -27,3 +27,12 @@ elf
 
 input/
 .vscode
+
+
+# Foundry artifacts for sp1-verifier
+bin/aws-nitro-validator/sp1-verifier/cache/
+bin/aws-nitro-validator/sp1-verifier/out/
+bin/aws-nitro-validator/sp1-verifier/broadcast/
+bin/aws-nitro-validator/sp1-verifier/.env
+bin/aws-nitro-validator/sp1-verifier/lcov.info
+bin/aws-nitro-validator/sp1-verifier/.gas-snapshot

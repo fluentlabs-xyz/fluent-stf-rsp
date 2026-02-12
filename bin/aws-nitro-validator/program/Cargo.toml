@@ -1,4 +1,3 @@
-# program/Cargo.toml
 [package]
 name = "nitro-validator"
 version = "0.1.0"

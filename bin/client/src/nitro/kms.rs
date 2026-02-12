@@ -117,52 +117,56 @@ impl KmsClient {
     }
 
     fn build_signed_request(&self, target: &str, body: &str) -> anyhow::Result<String> {
-    let now = chrono::Utc::now();
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date_stamp = now.format("%Y%m%d").to_string();
+        let now = chrono::Utc::now();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date_stamp = now.format("%Y%m%d").to_string();
 
-    let mut headers = vec![
-        ("content-type", CONTENT_TYPE),
-        ("host", self.host.as_str()),
-        ("x-amz-date", amz_date.as_str()),
-        ("x-amz-target", target),
-    ];
-    if let Some(token) = &self.creds.session_token {
-        headers.push(("x-amz-security-token", token.as_str()));
+        let mut headers = vec![
+            ("content-type", CONTENT_TYPE),
+            ("host", self.host.as_str()),
+            ("x-amz-date", amz_date.as_str()),
+            ("x-amz-target", target),
+        ];
+        if let Some(token) = &self.creds.session_token {
+            headers.push(("x-amz-security-token", token.as_str()));
+        }
+        headers.sort_by_key(|a| a.0);
+
+        let canonical_headers: String =
+            headers.iter().map(|(k, v)| format!("{}:{}\n", k, v.trim())).collect();
+        let signed_headers =
+            headers.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>().join(";");
+
+        let payload_hash = hex::encode(Sha256::digest(body.as_bytes()));
+        let canonical_request =
+            format!("POST\n/\n\n{}\n{}\n{}", canonical_headers, signed_headers, payload_hash);
+
+        let credential_scope = format!("{}/{}/kms/aws4_request", date_stamp, self.region);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            amz_date,
+            credential_scope,
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let signing_key = self.get_signature_key(&date_stamp);
+        let signature = hex::encode(self.hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+        let mut req = format!("POST / HTTP/1.1\r\n");
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        for (k, v) in &headers {
+            req.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        let auth_header = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+            self.creds.access_key_id, credential_scope, signed_headers, signature
+        );
+        req.push_str(&format!("Authorization: {}\r\n", auth_header));
+        req.push_str("Connection: close\r\n"); // Важно для предотвращения зависаний
+        req.push_str("\r\n");
+        req.push_str(body);
+
+        Ok(req)
     }
-    headers.sort_by_key(|a| a.0);
-
-    let canonical_headers: String = headers.iter()
-        .map(|(k, v)| format!("{}:{}\n", k, v.trim()))
-        .collect();
-    let signed_headers = headers.iter()
-        .map(|(k, _)| k.to_string())
-        .collect::<Vec<_>>().join(";");
-
-    let payload_hash = hex::encode(Sha256::digest(body.as_bytes()));
-    let canonical_request = format!("POST\n/\n\n{}\n{}\n{}", canonical_headers, signed_headers, payload_hash);
-    
-    let credential_scope = format!("{}/{}/kms/aws4_request", date_stamp, self.region);
-    let string_to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", amz_date, credential_scope, hex::encode(Sha256::digest(canonical_request.as_bytes())));
-    let signing_key = self.get_signature_key(&date_stamp);
-    let signature = hex::encode(self.hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-
-    let mut req = format!("POST / HTTP/1.1\r\n");
-    req.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    for (k, v) in &headers {
-        req.push_str(&format!("{}: {}\r\n", k, v));
-    }
-    let auth_header = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-        self.creds.access_key_id, credential_scope, signed_headers, signature
-    );
-    req.push_str(&format!("Authorization: {}\r\n", auth_header));
-    req.push_str("Connection: close\r\n"); // Важно для предотвращения зависаний
-    req.push_str("\r\n");
-    req.push_str(body);
-
-    Ok(req)
-}
 
     fn get_signature_key(&self, date: &str) -> Vec<u8> {
         let k_date = self.hmac_sha256(

@@ -2,7 +2,6 @@ mod kms;
 mod params;
 mod vsock;
 
-use ::vsock::{SockAddr, VsockListener, VMADDR_CID_ANY};
 use anyhow::Context;
 use hkdf::Hkdf;
 pub use params::*;
@@ -21,6 +20,7 @@ use rsp_client_executor::{
     nitro::{EnclaveRequest, EnclaveResponse, EthExecutionResponce},
 };
 
+use ::vsock::{SockAddr, VsockListener, VMADDR_CID_ANY};
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -196,19 +196,9 @@ pub fn main() -> anyhow::Result<()> {
         }?;
         driver::nsm_exit(nsm_fd);
 
-        use ciborium::{from_reader, into_writer, value::Value};
-
-        let mut attestation_doc_definite = Vec::new();
-
-        let value: Value = from_reader(attestation_doc.as_slice())
-            .map_err(|e| anyhow::anyhow!("Failed to decode CBOR: {}", e))?;
-
-        into_writer(&value, &mut attestation_doc_definite)
-            .map_err(|e| anyhow::anyhow!("Failed to encode CBOR: {}", e))?;
-
         let resp = EnclaveResponse::EncryptedDataKey {
             encrypted_signing_key: encrypted_key,
-            attestation: attestation_doc_definite,
+            attestation: attestation_doc,
             public_key: signing_pub_key_bytes,
         };
 
