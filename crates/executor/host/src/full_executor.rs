@@ -3,7 +3,6 @@ use alloy_provider::Provider;
 use either::Either;
 use eyre::bail;
 use reth_primitives_traits::NodePrimitives;
-use revm_primitives::FixedBytes;
 use rsp_client_executor::io::ClientExecutorInput;
 use serde::{de::DeserializeOwned, Serialize};
 use sp1_prover::components::CpuProverComponents;

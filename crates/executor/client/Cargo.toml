@@ -39,8 +39,9 @@ reth-errors.workspace = true
 reth-chainspec.workspace = true
 
 # revm
-revm = { workspace = true, features = ["kzg-rs"] }
+revm = { workspace = true }
 revm-primitives = { workspace = true, features = ["serde"] }
+kzg-rs.workspace = true
 
 # alloy
 alloy-evm = { workspace = true, features = ["std"] }

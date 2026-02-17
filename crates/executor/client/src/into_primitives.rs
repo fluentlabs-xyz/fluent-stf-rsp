@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use alloy_consensus::{Block, Header, TxEnvelope};
+use alloy_consensus::{Block, Header, TxEnvelope, TxReceipt, proofs};
 use alloy_network::{Ethereum, Network};
+use alloy_primitives::Bloom;
 use reth_chainspec::{ChainSpec, EthChainSpec, NamedChain};
 use reth_consensus::HeaderValidator;
 use reth_consensus_common::validation::validate_body_against_header;
@@ -105,11 +106,21 @@ impl BlockValidator<ChainSpec> for EthPrimitives {
         chain_spec: Arc<ChainSpec>,
         execution_output: &BlockExecutionOutput<Self::Receipt>,
     ) -> Result<(), ConsensusError> {
+        let receipts = &execution_output.result.receipts;
+
+        let receipts_with_bloom: Vec<_> = receipts.iter().map(|r| r.with_bloom_ref()).collect();
+
+        let receipt_root_bloom = Some((
+            proofs::calculate_receipt_root(&receipts_with_bloom),
+            receipts_with_bloom.iter().fold(Bloom::ZERO, |b, r| b | r.bloom()),
+        ));
+
         reth_ethereum_consensus::validate_block_post_execution(
             block,
             &chain_spec,
             &execution_output.result.receipts,
             &execution_output.result.requests,
+            receipt_root_bloom,
         )
     }
 }

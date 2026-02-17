@@ -87,30 +87,19 @@ p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p2
 secp256k1 = { git = "https://github.com/sp1-patches/rust-secp256k1", tag = "patch-0.30.0-sp1-5.0.0" }
 
 
-#revm = { package = "revm-rwasm", version = "27.0.3", default-features = false }
-#revm-bytecode = { package = "revm-rwasm-primitives", version = "6.0.1", default-features = false }
-#revm-database = { package = "revm-rwasm-database", version = "7.0.1", default-features = false }
-#revm-state = { package = "revm-rwasm-state", version = "7.0.1", default-features = false }
-#revm-primitives = { package = "revm-rwasm-primitives", version = "20.0.1", default-features = false }
-#revm-interpreter = { package = "revm-rwasm-interpreter", version = "23.0.2", default-features = false }
-#revm-inspector = { package = "revm-rwasm-inspector", version = "8.0.3", default-features = false }
-#revm-context = { package = "revm-rwasm-context", version = "8.0.3", default-features = false }
-#revm-context-interface = { package = "revm-rwasm-context-interface", version = "8.0.1", default-features = false }
-#revm-database-interface = { package = "revm-rwasm-database-interface", version = "7.0.1", default-features = false }
-
-#revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-#revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-#revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-#revm-state = { package = "revm-state", git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-#revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-#revm-interpreter = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-#revm-inspector = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-#revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-#revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
-#revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel" }
+# All your patches go here at workspace level
+revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-state = { package = "revm-state", git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-interpreter = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-inspector = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
 op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel", default-features = false }
-alloy-evm = { git = "https://github.com/fluentlabs-xyz/alloy-rwasm.git", branch = "stf", features = ["std"] }
-#alloy-evm = { path = "../../../alloy-rwasm/crates/evm", default-features = false }
+alloy-evm = { git = "https://github.com/fluentlabs-xyz/alloy-rwasm.git", features = ["std"]}
 
 #[patch."https://github.com/fluentlabs-xyz/fluent"]
 #reth-evm = { path = "../fluent/crates/evm/evm", default-features = false }

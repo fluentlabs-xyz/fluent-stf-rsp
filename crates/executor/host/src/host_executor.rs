@@ -110,18 +110,12 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
 
         let block_executor = BasicBlockExecutor::new(self.evm_config.clone(), cache_db);
 
-        // Execute the block and fetch all the necessary data along the way.
-        tracing::info!(
-            "executing the block with rpc db: block_number={}, transaction_count={}",
-            block_number,
-            current_block.body().transactions().len()
-        );
-
         let block = current_block
             .clone()
             .try_into_recovered()
             .map_err(|_| HostError::FailedToRecoverSenders)
             .unwrap();
+
 
         // Validate the block header.
         C::Primitives::validate_header(
@@ -140,6 +134,7 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
             self.chain_spec.clone(),
             &execution_output,
         )?;
+        
 
         // Accumulate the logs bloom.
         tracing::info!("accumulating the logs bloom");
@@ -149,6 +144,7 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
         });
 
         let state = rpc_db.state(&execution_output.state).await?;
+        
 
         // Verify the state root.
         tracing::info!("verifying the state root");
@@ -159,6 +155,7 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
             ));
             mutated_state.state_root()
         };
+
         if state_root != current_block.header().state_root() {
             return Err(HostError::StateRootMismatch(
                 state_root,
@@ -199,6 +196,7 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
         let constructed_header_hash = header.hash_slow();
         let target_hash = current_block.header().hash_slow();
         if constructed_header_hash != target_hash {
+            println!("@@@@@@@@@@@@@@@@@@@@@@@");
             return Err(HostError::HeaderMismatch(constructed_header_hash, target_hash));
         }
 
