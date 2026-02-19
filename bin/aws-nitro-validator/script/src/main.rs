@@ -48,8 +48,8 @@ fn main() {
 
     let fixture = SP1EnclaveProofFixture {
         vkey: vk.bytes32().to_string(),
-        public_values: format!("0x{}", hex::encode(&proof_groth16.public_values.to_vec())),
-        proof: format!("0x{}", hex::encode(&proof_groth16.bytes())),
+        public_values: format!("0x{}", hex::encode(proof_groth16.public_values.to_vec())),
+        proof: format!("0x{}", hex::encode(proof_groth16.bytes())),
     };
 
     // Сохрани fixture в JSON

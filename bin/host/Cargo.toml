@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = ["sp1"]
-sp1 = ["rsp-host-executor/sp1"]
+sp1 = ["rsp-host-executor/sp1", "dep:sp1-build", "rsp-client-executor/sp1"]
 nitro = ["rsp-host-executor/nitro", "rsp-client-executor/nitro"]
 
 [dependencies]
@@ -20,7 +20,7 @@ strum = "0.26"
 csv = "1.1"
 
 # workspace
-rsp-client-executor.workspace = true
+rsp-client-executor = { workspace = true}
 rsp-host-executor = { workspace = true, default-features = false }
 rsp-primitives.workspace = true
 rsp-provider.workspace = true
@@ -32,9 +32,7 @@ alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-provider.workspace = true
 
-
 # reth
-#reth-primitives.workspace = true
 reth-primitives-traits.workspace = true
 
 # revm
@@ -53,5 +51,5 @@ madato = "0.7.0"
 serde.workspace = true
 
 [build-dependencies]
-sp1-build.workspace = true
-cargo_metadata = "0.18.1"
+sp1-build = { workspace = true, optional = true }
+cargo_metadata = { version = "0.18.1"}

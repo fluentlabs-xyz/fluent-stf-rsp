@@ -44,7 +44,7 @@ revm-primitives = { workspace = true, features = ["serde"] }
 kzg-rs.workspace = true
 
 # alloy
-alloy-evm = { workspace = true, features = ["std"] }
+alloy-evm = { workspace = true }
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-network.workspace = true
@@ -53,6 +53,8 @@ alloy-rpc-types.workspace = true
 bincode = "1.3.3"
 alloy-sol-types.workspace = true
 
+fluentbase-revm = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch="devel", default-features = false }
+
 [features]
 sp1 = []
-nitro = []
+nitro = ["fluentbase-revm/wasmtime"]

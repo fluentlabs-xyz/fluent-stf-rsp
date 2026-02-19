@@ -11,12 +11,13 @@ members = [
     "crates/storage/witness-db",
     "bin/aws-nitro-validator/script",
     "bin/aws-nitro-validator/program",
+    "bin/nitro-proxy",
 ]
 exclude = []
 resolver = "2"
 
 [workspace.features]
-default = ["sp1"]
+default = []
 sp1 = ["rsp-host-executor/sp1"]
 nitro = ["rsp-host-executor/nitro"]
 

@@ -17,7 +17,7 @@ use k256::SecretKey;
 use rsp_client_executor::{
     executor::EthClientExecutor,
     io::EthClientExecutorInput,
-    nitro::{EnclaveRequest, EnclaveResponse, EthExecutionResponce},
+    nitro::{EnclaveRequest, EnclaveResponse, EthExecutionResponse},
 };
 
 use ::vsock::{SockAddr, VsockListener, VMADDR_CID_ANY};
@@ -137,7 +137,7 @@ fn process_block_request(listener: &VsockListener, signing_key: &SigningKey) -> 
     let signature: Signature = signing_key.sign(signing_payload.as_slice());
 
     // Prepare response structure
-    let output = EthExecutionResponce {
+    let output = EthExecutionResponse {
         parent_hash,
         block_hash,
         withdrawal_hash: events_hash.withdrawal_hash,

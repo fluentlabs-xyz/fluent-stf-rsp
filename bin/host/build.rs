@@ -1,4 +1,4 @@
-// #[cfg(feature = "sp1")]
+#[cfg(feature = "sp1")]
 use sp1_build::build_program;
 #[cfg(feature = "nitro")]
 use {
@@ -22,7 +22,7 @@ fn main() {
         }
 
         println!("cargo:warning=Building SP1 aws-nitro-validator");
-        build_program("../aws-nitro-validator");
+        // build_program("../aws-nitro-validator/program");
     }
 }
 
@@ -39,7 +39,7 @@ fn build_nitro_binary() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:warning=Building for target: {}", target);
     let build_output = Command::new("cargo")
-        .args(&[
+        .args([
             "build",
             "--target",
             target,

@@ -4,8 +4,8 @@
 //!
 //! The [CustomEvmConfig] type implements the [ConfigureEvm] and [ConfigureEvmEnv] traits,
 //! configuring the custom CustomEvmConfig precompiles and instructions.
-use alloy_evm::fluentbase_revm::RwasmBuilder;
-use alloy_evm::{fluentbase_revm::DefaultRwasm, precompiles::PrecompilesMap, EthEvm};
+use fluentbase_revm::{RwasmBuilder, DefaultRwasm};
+use alloy_evm::{precompiles::PrecompilesMap, EthEvm};
 use reth_evm::{Database, EvmEnv, EvmFactory};
 use revm::{
     bytecode::opcode::OpCode,

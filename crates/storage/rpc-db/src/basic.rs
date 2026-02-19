@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use reth_storage_errors::{db::DatabaseError, provider::ProviderError};
 use revm_database::BundleState;
 use revm_database_interface::DatabaseRef;
-use revm_primitives::{Address, B256, KECCAK_EMPTY, address};
+use revm_primitives::{Address, B256, KECCAK_EMPTY};
 use revm_state::{AccountInfo, Bytecode};
 use rsp_mpt::EthereumState;
 use rsp_primitives::account_proof::eip1186_proof_to_account_proof;

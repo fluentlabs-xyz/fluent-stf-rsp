@@ -8,10 +8,12 @@ use rsp_host_executor::build_executor;
 #[cfg(feature = "nitro")]
 use rsp_host_executor::build_executor_with_nitro;
 use rsp_host_executor::{
-    create_eth_block_execution_strategy_factory, BlockExecutor, EthExecutorComponents,
+    create_eth_block_execution_strategy_factory,
 };
+#[cfg(feature = "sp1")]
+use rsp_host_executor::{BlockExecutor, EthExecutorComponents};
 use rsp_provider::create_provider;
-use sp1_sdk::{include_elf, EnvProver};
+use sp1_sdk::EnvProver;
 use std::sync::Arc;
 use tracing_subscriber::{
     filter::EnvFilter, fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
@@ -66,6 +68,8 @@ async fn main() -> eyre::Result<()> {
 
     #[cfg(feature = "sp1")]
     {
+        use sp1_sdk::include_elf;
+
         let executor = build_executor::<EthExecutorComponents<_>, _>(
             include_elf!("rsp-client").to_vec(),
             provider,

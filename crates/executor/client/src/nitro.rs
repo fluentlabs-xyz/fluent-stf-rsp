@@ -22,7 +22,7 @@ pub enum EnclaveResponse {
 /// Structure representing the result of Ethereum block execution.
 /// Fields are stored as Vec<u8> for flexible serialization.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct EthExecutionResponce {
+pub struct EthExecutionResponse {
     pub parent_hash: FixedBytes<32>,
     pub block_hash: FixedBytes<32>,
     pub withdrawal_hash: FixedBytes<32>,

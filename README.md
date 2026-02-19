@@ -259,7 +259,7 @@ AWS_SESSION_TOKEN=
 ### Run rsp with nitro
 
 ```cmd
-AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID cargo r --package rsp --release --no-default-features --features nitro -- --block-number <ACTUAL_BLOCK_NUMBER> --rpc-url https://rpc.testnet.fluent.xyz/ --genesis-path bin/host/genesis/fluent-devnet.json
+AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID cargo run --package rsp --release --no-default-features --features nitro -- --block-number <ACTUAL_BLOCK_NUMBER> --rpc-url https://rpc.testnet.fluent.xyz/ --genesis-path bin/host/genesis/fluent-devnet.json
 ```
 
 or

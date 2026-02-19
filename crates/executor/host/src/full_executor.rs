@@ -1,25 +1,34 @@
-use alloy_primitives::B256;
 use alloy_provider::Provider;
 use either::Either;
-use eyre::bail;
 use reth_primitives_traits::NodePrimitives;
 use rsp_client_executor::io::ClientExecutorInput;
-use serde::{de::DeserializeOwned, Serialize};
-use sp1_prover::components::CpuProverComponents;
-use sp1_sdk::{ExecutionReport, Prover, SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey};
+use serde::de::DeserializeOwned;
 use std::{
     fmt::{Debug, Formatter},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{task, time::sleep};
-use tracing::{info, info_span, warn};
+use tracing::warn;
 
-use crate::{
-    executor_components::MaybeProveWithCycles, Config, ExecutionHooks, ExecutorComponents,
-    HostError, HostExecutor,
+#[cfg(feature = "sp1")]
+use {
+    alloy_primitives::B256,
+    eyre::bail,
+    sp1_prover::components::CpuProverComponents,
+    sp1_sdk::{ExecutionReport, Prover, SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey},
+    std::time::Instant,
+    tracing::{info, info_span},
 };
+
+#[cfg(all(feature = "nitro", not(feature = "sp1")))]
+use tracing::info;
+
+use crate::{Config, ExecutionHooks, ExecutorComponents, HostExecutor};
+
+#[cfg(feature = "sp1")]
+use crate::HostError;
 
 #[cfg(feature = "nitro")]
 use {
@@ -34,6 +43,10 @@ use {
 };
 
 pub type EitherExecutor<C, P> = Either<FullExecutor<C, P>, CachedExecutor<C>>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_executor
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sp1")]
 pub async fn build_executor<C, P>(
@@ -62,6 +75,10 @@ where
 
     bail!("Either a RPC URL or a cache dir must be provided")
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_executor_with_nitro
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "nitro")]
 pub async fn build_executor_with_nitro<C, P>(
@@ -96,7 +113,6 @@ where
         .map_err(|e| eyre::eyre!("Failed to copy binary to temp directory: {}", e))?;
     info!("Copied binary to: {:?}", docker_binary_path);
 
-    // Create Dockerfile
     let dockerfile_content = format!(
         r#"FROM alpine:latest
             COPY {} .
@@ -113,7 +129,7 @@ where
     let eif_name = "rsp-client-enclave";
     info!("Building Docker image...");
     let docker_build_output = TokioCommand::new("docker")
-        .args(&[
+        .args([
             "build",
             "-t",
             eif_name,
@@ -133,7 +149,7 @@ where
     let eif_path = client_dir.join(format!("{}.eif", eif_name));
     info!("Building EIF with nitro-cli...");
     let nitro_build_output = TokioCommand::new("nitro-cli")
-        .args(&[
+        .args([
             "build-enclave",
             "--docker-uri",
             eif_name,
@@ -157,7 +173,7 @@ where
 
     info!("Running enclave...");
     let run_output = TokioCommand::new("nitro-cli")
-        .args(&[
+        .args([
             "run-enclave",
             "--eif-path",
             eif_path.to_str().unwrap(),
@@ -202,6 +218,10 @@ where
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BlockExecutor trait
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub trait BlockExecutor<C: ExecutorComponents> {
     #[allow(async_fn_in_trait)]
     async fn execute(&self, block_number: u64) -> eyre::Result<()>;
@@ -227,10 +247,10 @@ pub trait BlockExecutor<C: ExecutorComponents> {
         // Execute the block inside the zkVM.
         let mut stdin = SP1Stdin::new();
         let buffer = bincode::serialize(&client_input).unwrap();
-
         stdin.write_vec(buffer);
 
         let stdin = Arc::new(stdin);
+
         if self.config().skip_client_execution {
             info!("Client execution skipped");
         } else {
@@ -305,23 +325,22 @@ pub trait BlockExecutor<C: ExecutorComponents> {
     async fn process_nitro_client(
         &self,
         client_input: ClientExecutorInput<C::Primitives>,
-        hooks: &C::Hooks,
+        _hooks: &C::Hooks,
     ) -> eyre::Result<()> {
         // Get enclave CID and port from config or use defaults
 
-        use rsp_client_executor::nitro::EthExecutionResponce;
-        let nitro_config = self.config().nitro_config.as_ref().cloned().unwrap_or_default();
+        use rsp_client_executor::nitro::EthExecutionResponse;
 
+        let nitro_config = self.config().nitro_config.as_ref().cloned().unwrap_or_default();
         let enclave_cid = nitro_config.enclave_cid;
         let enclave_port = nitro_config.enclave_port;
 
         info!("Connecting to Nitro enclave at CID={} PORT={}", enclave_cid, enclave_port);
 
-        // Serialize the client input to bincode
         let payload = bincode::serialize(&client_input)?;
-
         info!("Serialized input: {} bytes", payload.len());
-        let response = task::spawn_blocking(move || -> eyre::Result<EthExecutionResponce> {
+
+        let response = task::spawn_blocking(move || -> eyre::Result<EthExecutionResponse> {
             const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
             let addr = SockAddr::new_vsock(enclave_cid, enclave_port);
             let mut stream = VsockStream::connect(&addr).map_err(|e| {
@@ -362,8 +381,8 @@ pub trait BlockExecutor<C: ExecutorComponents> {
             let resp_text = String::from_utf8_lossy(&resp_buf);
             info!("Received response ({} bytes): {}", resp_buf.len(), resp_text);
 
-            let parsed: EthExecutionResponce = bincode::deserialize(&resp_buf)
-                .map_err(|e| eyre::eyre!("Failed to parse JSON response from enclave: {}", e))?;
+            let parsed: EthExecutionResponse = bincode::deserialize(&resp_buf)
+                .map_err(|e| eyre::eyre!("Failed to parse response from enclave: {}", e))?;
 
             Ok(parsed)
         })
@@ -383,7 +402,9 @@ pub trait BlockExecutor<C: ExecutorComponents> {
         if client_input.current_block.header.parent_hash != response.parent_hash {
             return Err(eyre::eyre!(
                 "Parent hash mismatch: expected {}, got {}",
-                hex::encode(AsRef::<[u8]>::as_ref(&client_input.current_block.header.parent_hash)),
+                hex::encode(AsRef::<[u8]>::as_ref(
+                    &client_input.current_block.header.parent_hash
+                )),
                 hex::encode(AsRef::<[u8]>::as_ref(&response.parent_hash))
             ));
         }
@@ -421,8 +442,6 @@ fn attestation_storage() -> String {
 
 #[cfg(feature = "nitro")]
 async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
-    use tracing::info;
-
     let data_key_path = data_key_storage();
     let encrypted_dek = match fs::read(&data_key_path) {
         Ok(data) => {
@@ -487,7 +506,6 @@ async fn handle_key_management_request(
     req: EnclaveRequest,
 ) -> eyre::Result<Option<EnclaveResponse>> {
     use std::io::{Read, Write};
-    use tracing::info;
 
     info!("Handling key management request: {:?}", req);
 
@@ -533,7 +551,7 @@ async fn handle_key_management_request(
 }
 
 #[cfg(feature = "nitro")]
-fn deserialize_b256_from_hex<'de, D>(deserializer: D) -> Result<B256, D::Error>
+fn deserialize_b256_from_hex<'de, D>(deserializer: D) -> Result<alloy_primitives::B256, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -546,7 +564,7 @@ where
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
-    Ok(B256::from(arr))
+    Ok(alloy_primitives::B256::from(arr))
 }
 
 impl<C, P> BlockExecutor<C> for EitherExecutor<C, P>
@@ -647,7 +665,6 @@ where
 
     pub async fn wait_for_block(&self, block_number: u64) -> eyre::Result<()> {
         let block_number = block_number.into();
-
         while self.provider.get_block_by_number(block_number).await?.is_none() {
             sleep(Duration::from_millis(100)).await;
         }
@@ -704,7 +721,6 @@ where
 
                     let input_path = input_folder.join(format!("{block_number}.bin"));
                     let mut cache_file = std::fs::File::create(input_path)?;
-
                     bincode::serialize_into(&mut cache_file, &client_input)?;
                 }
 
@@ -719,7 +735,7 @@ where
             #[cfg(feature = "nitro")]
             self.process_nitro_client(client_input, &self.hooks).await?;
         } else {
-            return Err(eyre::eyre!("No features of proving engine enable"));
+            return Err(eyre::eyre!("No features of proving engine enabled"));
         }
 
         Ok(())
@@ -812,7 +828,7 @@ where
             #[cfg(feature = "nitro")]
             self.process_nitro_client(client_input, &self.hooks).await?;
         } else {
-            return Err(eyre::eyre!("No features of proving engine enable"));
+            return Err(eyre::eyre!("No features of proving engine enabled"));
         }
 
         Ok(())
@@ -846,7 +862,7 @@ where
     }
 }
 
-// Block execution in SP1 is a long-running, blocking task, so run it in a separate thread.
+#[cfg(feature = "sp1")]
 async fn execute_client<P: Prover<CpuProverComponents> + 'static>(
     number: u64,
     client: Arc<P>,
@@ -871,10 +887,8 @@ fn try_load_input_from_cache<P: NodePrimitives + DeserializeOwned>(
     let cache_path = cache_dir.join(format!("input/{chain_id}/{block_number}.bin"));
 
     if cache_path.exists() {
-        // TODO: prune the cache if invalid instead
         let mut cache_file = std::fs::File::open(cache_path)?;
         let client_input = bincode::deserialize_from(&mut cache_file)?;
-
         Ok(Some(client_input))
     } else {
         Ok(None)

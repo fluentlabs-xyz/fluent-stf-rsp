@@ -10,9 +10,7 @@ use reth_evm::{
     ConfigureEvm,
 };
 use reth_evm_ethereum::EthEvmConfig;
-// use reth_optimism_chainspec::OpChainSpec;
-// use reth_optimism_evm::OpEvmConfig;
-use reth_primitives_traits::{Block, BlockBody, SealedHeader};
+use reth_primitives_traits::{Block, SealedHeader};
 use reth_trie::{HashedPostState, KeccakKeyHasher};
 use revm::database::CacheDB;
 use revm_primitives::Address;
@@ -25,8 +23,6 @@ use rsp_rpc_db::RpcDb;
 use crate::HostError;
 
 pub type EthHostExecutor = HostExecutor<EthEvmConfig<ChainSpec, CustomEvmFactory>, ChainSpec>;
-
-// pub type OpHostExecutor = HostExecutor<OpEvmConfig, OpChainSpec>;
 
 /// An executor that fetches data from a [Provider] to execute blocks in the [ClientExecutor].
 #[derive(Debug, Clone)]
@@ -46,12 +42,6 @@ impl EthHostExecutor {
         }
     }
 }
-
-// impl OpHostExecutor {
-//     pub fn optimism(chain_spec: Arc<OpChainSpec>) -> Self {
-//         Self { evm_config: OpEvmConfig::optimism(chain_spec.clone()), chain_spec }
-//     }
-// }
 
 impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
     /// Creates a new [HostExecutor].
@@ -196,7 +186,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
         let constructed_header_hash = header.hash_slow();
         let target_hash = current_block.header().hash_slow();
         if constructed_header_hash != target_hash {
-            println!("@@@@@@@@@@@@@@@@@@@@@@@");
             return Err(HostError::HeaderMismatch(constructed_header_hash, target_hash));
         }
 
