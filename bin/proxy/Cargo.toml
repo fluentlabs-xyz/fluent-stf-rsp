@@ -1,5 +1,5 @@
 [package]
-name = "nitro-proxy"
+name = "proxy"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -34,5 +34,6 @@ reth-chainspec.workspace = true
 reth-evm-ethereum.workspace = true
 reth-ethereum-primitives.workspace = true
 tracing-subscriber = "0.3.22"
+sp1-sdk.workspace = true
 [lints]
 workspace = true

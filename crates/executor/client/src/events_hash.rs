@@ -166,8 +166,8 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
             .iter()
             .flat_map(|receipt| receipt.iter().filter(TxReceipt::status).flat_map(TxReceipt::logs))
             .filter(|log| {
-                &log.address == bridge_address
-                    && log.data.topics().first().map(|topic| topic == send_topic).unwrap_or(false)
+                &log.address == bridge_address &&
+                    log.data.topics().first().map(|topic| topic == send_topic).unwrap_or(false)
             })
             .map(|log| &log.data)
             .collect::<Vec<_>>()

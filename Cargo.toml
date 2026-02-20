@@ -11,7 +11,7 @@ members = [
     "crates/storage/witness-db",
     "bin/aws-nitro-validator/script",
     "bin/aws-nitro-validator/program",
-    "bin/nitro-proxy",
+    "bin/proxy",
 ]
 exclude = []
 resolver = "2"

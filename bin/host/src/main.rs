@@ -7,9 +7,7 @@ use execute::PersistExecutionReport;
 use rsp_host_executor::build_executor;
 #[cfg(feature = "nitro")]
 use rsp_host_executor::build_executor_with_nitro;
-use rsp_host_executor::{
-    create_eth_block_execution_strategy_factory,
-};
+use rsp_host_executor::create_eth_block_execution_strategy_factory;
 #[cfg(feature = "sp1")]
 use rsp_host_executor::{BlockExecutor, EthExecutorComponents};
 use rsp_provider::create_provider;

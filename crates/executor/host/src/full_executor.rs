@@ -402,9 +402,7 @@ pub trait BlockExecutor<C: ExecutorComponents> {
         if client_input.current_block.header.parent_hash != response.parent_hash {
             return Err(eyre::eyre!(
                 "Parent hash mismatch: expected {}, got {}",
-                hex::encode(AsRef::<[u8]>::as_ref(
-                    &client_input.current_block.header.parent_hash
-                )),
+                hex::encode(AsRef::<[u8]>::as_ref(&client_input.current_block.header.parent_hash)),
                 hex::encode(AsRef::<[u8]>::as_ref(&response.parent_hash))
             ));
         }

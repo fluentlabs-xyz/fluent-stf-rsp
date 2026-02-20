@@ -3,14 +3,9 @@ sp1_zkvm::entrypoint!(main);
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::fmt;
-use p384::ecdsa::{
-    signature::DigestVerifier,
-    Signature, VerifyingKey,
-};
+use p384::ecdsa::{signature::DigestVerifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha384};
@@ -91,8 +86,7 @@ impl AttestationDoc {
 /// Serde helper for PCRs
 mod pcrs_serde {
     use super::*;
-    use alloc::collections::BTreeMap;
-    use alloc::vec::Vec;
+    use alloc::{collections::BTreeMap, vec::Vec};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(

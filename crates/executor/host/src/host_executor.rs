@@ -106,7 +106,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
             .map_err(|_| HostError::FailedToRecoverSenders)
             .unwrap();
 
-
         // Validate the block header.
         C::Primitives::validate_header(
             &SealedHeader::seal_slow(C::Primitives::into_consensus_header(
@@ -124,7 +123,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
             self.chain_spec.clone(),
             &execution_output,
         )?;
-        
 
         // Accumulate the logs bloom.
         tracing::info!("accumulating the logs bloom");
@@ -134,7 +132,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
         });
 
         let state = rpc_db.state(&execution_output.state).await?;
-        
 
         // Verify the state root.
         tracing::info!("verifying the state root");

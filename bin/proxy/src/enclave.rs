@@ -1,4 +1,8 @@
-use std::{fs, io::{Read, Write}, path::Path};
+use std::{
+    fs,
+    io::{Read, Write},
+    path::Path,
+};
 
 use revm_primitives::hex;
 use tokio::{process::Command as TokioCommand, task};
@@ -6,7 +10,7 @@ use tracing::info;
 
 use vsock::{VsockAddr, VsockStream};
 
-use crate::{AwsCredentials, EnclaveRequest, EnclaveResponse, NitroConfig};
+use crate::types::{AwsCredentials, EnclaveRequest, EnclaveResponse, NitroConfig};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -62,7 +66,9 @@ async fn terminate_enclave() -> eyre::Result<()> {
                     .args(["terminate-enclave", "--enclave-id", enclave_id])
                     .output()
                     .await
-                    .map_err(|e| eyre::eyre!("Failed to terminate enclave {}: {}", enclave_id, e))?;
+                    .map_err(|e| {
+                        eyre::eyre!("Failed to terminate enclave {}: {}", enclave_id, e)
+                    })?;
 
                 info!("Terminated enclave {}", enclave_id);
             }
@@ -205,7 +211,11 @@ async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
             .await?;
 
     match resp {
-        Some(EnclaveResponse::EncryptedDataKey { encrypted_signing_key, public_key, attestation }) => {
+        Some(EnclaveResponse::EncryptedDataKey {
+            encrypted_signing_key,
+            public_key,
+            attestation,
+        }) => {
             write_file(&data_key_path, &encrypted_signing_key)?;
             info!("Encrypted data key updated");
 
@@ -255,19 +265,19 @@ async fn handle_key_management_request(
             .map_err(|e| eyre::eyre!("Failed to connect to enclave: {}", e))?;
 
         let req_len = req_bytes.len() as u32;
-        stream.write_all(&req_len.to_be_bytes())
+        stream
+            .write_all(&req_len.to_be_bytes())
             .map_err(|e| eyre::eyre!("Failed to write request length: {}", e))?;
-        stream.write_all(&req_bytes)
-            .map_err(|e| eyre::eyre!("Failed to write request: {}", e))?;
-        stream.flush()
-            .map_err(|e| eyre::eyre!("Failed to flush stream: {}", e))?;
+        stream.write_all(&req_bytes).map_err(|e| eyre::eyre!("Failed to write request: {}", e))?;
+        stream.flush().map_err(|e| eyre::eyre!("Failed to flush stream: {}", e))?;
 
         if !expect_response {
             return Ok(None);
         }
 
         let mut resp_len_buf = [0u8; 4];
-        stream.read_exact(&mut resp_len_buf)
+        stream
+            .read_exact(&mut resp_len_buf)
             .map_err(|e| eyre::eyre!("Failed to read response length: {}", e))?;
         let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
         if resp_len > MAX_FRAME_SIZE {
@@ -279,7 +289,8 @@ async fn handle_key_management_request(
         }
 
         let mut resp_buf = vec![0u8; resp_len];
-        stream.read_exact(&mut resp_buf)
+        stream
+            .read_exact(&mut resp_buf)
             .map_err(|e| eyre::eyre!("Failed to read response body: {}", e))?;
 
         let response: EnclaveResponse = bincode::deserialize(&resp_buf)

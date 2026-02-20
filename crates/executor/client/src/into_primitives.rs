@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use alloy_consensus::{Block, Header, TxEnvelope, TxReceipt, proofs};
+use alloy_consensus::{proofs, Block, Header, TxEnvelope, TxReceipt};
 use alloy_network::{Ethereum, Network};
 use alloy_primitives::Bloom;
 use reth_chainspec::{ChainSpec, EthChainSpec, NamedChain};
@@ -207,8 +207,8 @@ fn handle_custom_chains(
             // Skip extra data and Merge difficulty checks for Linea chains
             if matches!(
                 err,
-                ConsensusError::ExtraDataExceedsMax { .. }
-                    | ConsensusError::TheMergeDifficultyIsNotZero
+                ConsensusError::ExtraDataExceedsMax { .. } |
+                    ConsensusError::TheMergeDifficultyIsNotZero
             ) {
                 Ok(())
             } else {
