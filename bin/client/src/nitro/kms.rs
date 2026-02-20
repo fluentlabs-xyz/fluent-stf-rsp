@@ -7,7 +7,7 @@ use std::{
     io::{Read, Write},
     sync::Arc,
 };
-use vsock::{SockAddr, VsockStream};
+use vsock::{VsockAddr, VsockStream};
 
 use crate::nitro::{
     CONTENT_TYPE, HOST_CID, KEY_ID, KMS_HOST, KMS_PORT, REGION, TARGET_DECRYPT, TARGET_ENCRYPT,
@@ -20,7 +20,7 @@ pub struct KmsClient {
     region: String,
     host: String,
     key_id: String,
-    vsock_addr: SockAddr,
+    vsock_addr: VsockAddr,
 }
 
 impl KmsClient {
@@ -30,7 +30,7 @@ impl KmsClient {
             region: REGION.to_string(),
             host: KMS_HOST.to_string(),
             key_id: KEY_ID.to_string(),
-            vsock_addr: SockAddr::new_vsock(HOST_CID, KMS_PORT),
+            vsock_addr: VsockAddr::new(HOST_CID, KMS_PORT),
         }
     }
 

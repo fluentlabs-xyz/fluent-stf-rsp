@@ -7,7 +7,7 @@ pub mod sp1;
 fn main() {
     #[cfg(feature = "nitro")]
     {
-        nitro::main();
+        let _ = nitro::main();
     }
     
     #[cfg(feature = "sp1")]

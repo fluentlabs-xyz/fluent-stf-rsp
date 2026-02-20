@@ -20,7 +20,7 @@ use rsp_client_executor::{
     nitro::{EnclaveRequest, EnclaveResponse, EthExecutionResponse},
 };
 
-use ::vsock::{SockAddr, VsockListener, VMADDR_CID_ANY};
+use ::vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -130,11 +130,11 @@ fn process_block_request(listener: &VsockListener, signing_key: &SigningKey) -> 
 
     // The signing payload includes the execution result hash
     let mut signing_hasher = common_hasher;
-    signing_hasher.update(result_hash.as_slice());
+    signing_hasher.update(result_hash);
     let signing_payload = signing_hasher.finalize();
 
     // Sign the resulting payload
-    let signature: Signature = signing_key.sign(signing_payload.as_slice());
+    let signature: Signature = signing_key.sign(&signing_payload);
 
     // Prepare response structure
     let output = EthExecutionResponse {
@@ -155,7 +155,7 @@ fn process_block_request(listener: &VsockListener, signing_key: &SigningKey) -> 
 pub fn main() -> anyhow::Result<()> {
     println!("Nitro enclave started");
 
-    let addr = SockAddr::new_vsock(VMADDR_CID_ANY, VSOCK_PORT);
+    let addr = VsockAddr::new(VMADDR_CID_ANY, VSOCK_PORT);
     let listener = VsockListener::bind(&addr).context("Failed to bind vsock listener")?;
     println!("Listener bound to port {}", VSOCK_PORT);
 
