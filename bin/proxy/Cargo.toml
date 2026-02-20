@@ -1,39 +1,43 @@
 [package]
 name = "proxy"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 exclude.workspace = true
-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-alloy-provider.workspace = true
-axum = "0.8.8"
-bincode = "1.3.3"
-eyre = "0.6.12"
-revm-primitives.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10.9"
-tokio = {workspace = true, features = ["process", "macros"]}
+tokio = { workspace = true, features = ["process", "macros"] }
 tracing.workspace = true
-vsock = "0.5.2"
-
-rsp-provider = { path = "../../crates/provider" }
-rsp-host-executor = { workspace = true, default-features = false }
-
-rsp-primitives = { workspace = true, default-features = false }
-
-rsp-client-executor = { workspace = true }
-
-
+tracing-subscriber.workspace = true
+eyre.workspace = true
 url.workspace = true
+bincode.workspace = true
+sha2 = "0.10.9"  # direct dep, not going through workspace patch
+axum.workspace = true
+vsock.workspace = true
+
+# workspace crates
+rsp-provider.workspace = true
+rsp-host-executor = { workspace = true, default-features = false }
+rsp-primitives = { workspace = true, default-features = false }
+rsp-client-executor.workspace = true
+
+# alloy
+alloy-provider.workspace = true
+revm-primitives.workspace = true
+
+# reth
 reth-chainspec.workspace = true
 reth-evm-ethereum.workspace = true
 reth-ethereum-primitives.workspace = true
-tracing-subscriber = "0.3.22"
+
+# sp1
 sp1-sdk.workspace = true
-[lints]
-workspace = true

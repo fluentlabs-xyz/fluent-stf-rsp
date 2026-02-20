@@ -12,6 +12,8 @@ use std::{
 use tokio::{task, time::sleep};
 use tracing::warn;
 
+use crate::executor_components::MaybeProveWithCycles;
+
 #[cfg(feature = "sp1")]
 use {
     alloy_primitives::B256,

@@ -1,8 +1,14 @@
-[workspace.package]
+# NOTE: This is a standalone SP1 zkVM program — it is intentionally NOT part of
+# the main workspace. It has its own [patch.crates-io] because sp1-zkvm programs
+# require specific precompile patches that differ from the host workspace.
+
 [package]
 name = "rsp-client"
 description = ""
 edition = "2021"
+version = "0.1.0"
+
+[workspace]
 
 [features]
 default = ["sp1"]
@@ -23,7 +29,6 @@ nitro = [
     "dep:nix",
     "dep:signature",
     "dep:rand_core",
-    "dep:serde_cbor",
     "dep:p256",
     "dep:aes-gcm",
     "dep:base64",
@@ -37,15 +42,22 @@ nitro = [
 
 [dependencies]
 bincode = "1.3.3"
+serde = { version = "1.0", features = ["derive"] }
+hkdf = "0.12.4"
+k256 = "0.13.4"
+ciborium = "0.2.2"
 
-# workspace
+# Statically turns off logging
+log = { version = "0.4", features = ["max_level_off", "release_max_level_off"] }
+tracing = { version = "0.1", features = ["max_level_off", "release_max_level_off"] }
+
 rsp-client-executor = { path = "../../crates/executor/client", features = [] }
 
 # sp1
 sp1-zkvm = { version = "5.1.0", optional = true }
 
 # nitro
-vsock = { version = "0.2", optional = true }
+vsock = { version = "0.5.2", optional = true }
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
 serde_json = { version = "1.0", optional = true }
@@ -54,40 +66,28 @@ aws-nitro-enclaves-nsm-api = { version = "0.4.0", optional = true }
 anyhow = { version = "1.0", optional = true }
 nix = { version = "0.26.4", optional = true }
 signature = { version = "2.2.0", optional = true }
-
-# Statically turns off logging
-log = { version = "0.4", features = ["max_level_off", "release_max_level_off"] }
-tracing = { version = "0.1", features = ["max_level_off", "release_max_level_off"] }
-
 rand_core = { version = "0.6.4", optional = true }
 rand = { version = "0.8", optional = true }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_cbor = { version = "0.11.2", optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 aes-gcm = { version = "0.10", optional = true }
-base64 = { version = "0.21", optional = true }
+base64 = { version = "0.22", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 hmac = { version = "0.12", optional = true }
 rustls = { version = "0.21.12", default-features = false, features = ["tls12"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
-
 aws-sdk-kms = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
-hkdf = "0.12.4"
-k256 = "0.13.4"
-ciborium = "0.2.2"
 
 [patch.crates-io]
-# Precompile patches
+# sp1 precompile patches
 sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha2-0.10.9-sp1-4.0.0", package = "sha2" }
-bn = { git = "https://github.com/sp1-patches/bn", tag = "patch-0.6.0-sp1-5.0.0", package = "substrate-bn" }
 sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha3-0.10.8-sp1-4.0.0" }
+bn = { git = "https://github.com/sp1-patches/bn", tag = "patch-0.6.0-sp1-5.0.0", package = "substrate-bn" }
 k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-5.0.0" }
 p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p256-13.2-sp1-5.0.0" }
 secp256k1 = { git = "https://github.com/sp1-patches/rust-secp256k1", tag = "patch-0.30.0-sp1-5.0.0" }
 
-
-# All your patches go here at workspace level
+# revm patches
 revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
 revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
 revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
@@ -98,11 +98,5 @@ revm-inspector = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", bra
 revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
 revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
 revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "devel", default-features = false }
-alloy-evm = { git = "https://github.com/fluentlabs-xyz/alloy-rwasm.git", features = ["std"]}
-
-#[patch."https://github.com/fluentlabs-xyz/fluent"]
-#reth-evm = { path = "../fluent/crates/evm/evm", default-features = false }
-
-#[patch."https://github.com/fluentlabs-xyz/fluentbase"]
-#fluentbase-types = { path = "../../../fluentbase/crates/types", features = ["svm"] }
+op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+alloy-evm = { git = "https://github.com/fluentlabs-xyz/alloy-rwasm.git", features = ["std"] }
