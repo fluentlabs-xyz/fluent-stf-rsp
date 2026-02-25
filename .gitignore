@@ -36,3 +36,5 @@ bin/aws-nitro-validator/sp1-verifier/broadcast/
 bin/aws-nitro-validator/sp1-verifier/.env
 bin/aws-nitro-validator/sp1-verifier/lcov.info
 bin/aws-nitro-validator/sp1-verifier/.gas-snapshot
+
+bin/host/genesis/genesis-v0.5.0.json

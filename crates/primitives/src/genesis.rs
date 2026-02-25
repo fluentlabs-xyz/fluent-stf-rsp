@@ -5,12 +5,20 @@ use std::{
 
 use crate::error::ChainSpecError;
 use alloy_genesis::ChainConfig;
-use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, EthereumHardfork};
+use alloy_primitives::{b256, Bloom, Bytes, B256, U256};
+use reth_chainspec::{
+    BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, EthereumHardfork, DEV_HARDFORKS,
+};
+use reth_primitives_traits::{Header, SealedHeader};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 pub const LINEA_GENESIS_JSON: &str = include_str!("../../../bin/host/genesis/59144.json");
 pub const OP_SEPOLIA_GENESIS_JSON: &str = include_str!("../../../bin/host/genesis/11155420.json");
+
+// If this fails to compile, run: make download-genesis
+pub const FLUENT_DEVNET_GENESIS_JSON: &str =
+    include_str!("../../../bin/host/genesis/genesis-v0.5.0.json");
 
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -20,16 +28,18 @@ pub enum Genesis {
     OpMainnet,
     Sepolia,
     Linea,
+    FluentDevnet,
     Custom(#[serde_as(as = "serde_bincode_compat::ChainConfig")] ChainConfig),
 }
 
 impl Hash for Genesis {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            Genesis::Mainnet => 1.hash(state),
-            Genesis::OpMainnet => 10.hash(state),
-            Genesis::Sepolia => 11155111.hash(state),
-            Genesis::Linea => 59144.hash(state),
+            Genesis::Mainnet => 1u64.hash(state),
+            Genesis::OpMainnet => 10u64.hash(state),
+            Genesis::Sepolia => 11155111u64.hash(state),
+            Genesis::Linea => 59144u64.hash(state),
+            Genesis::FluentDevnet => 0x5201u64.hash(state),
             Self::Custom(config) => {
                 let buf = serde_json::to_vec(config).unwrap();
                 buf.hash(state);
@@ -47,7 +57,7 @@ impl FromStr for Genesis {
     }
 }
 
-/// Returns the [alloy_genesis::Genesis] fron a json string.
+/// Returns the [alloy_genesis::Genesis] from a json string.
 pub fn genesis_from_json(json: &str) -> Result<alloy_genesis::Genesis, serde_json::Error> {
     serde_json::from_str::<alloy_genesis::Genesis>(json)
 }
@@ -61,6 +71,7 @@ impl TryFrom<u64> for Genesis {
             10 => Ok(Genesis::OpMainnet),
             59144 => Ok(Genesis::Linea),
             11155111 => Ok(Genesis::Sepolia),
+            0x5201 => Ok(Genesis::FluentDevnet),
             id => Err(ChainSpecError::ChainNotSupported(id)),
         }
     }
@@ -102,6 +113,58 @@ impl TryFrom<&Genesis> for ChainSpec {
             }
             Genesis::OpMainnet => Err(ChainSpecError::InvalidConversion),
             Genesis::Linea => Ok(ChainSpec::from_genesis(genesis_from_json(LINEA_GENESIS_JSON)?)),
+            Genesis::FluentDevnet => {
+                let genesis = genesis_from_json(FLUENT_DEVNET_GENESIS_JSON).unwrap();
+                let hardforks = DEV_HARDFORKS.clone();
+
+                let header = Header {
+                    parent_hash: B256::ZERO,
+                    ommers_hash: b256!(
+                        "1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
+                    ),
+                    beneficiary: Default::default(),
+                    state_root: b256!(
+                        "cf2fcbcc6931d27e5076e98a90b8e31860b024a0ed2786dfe21aa853cf5c3df0"
+                    ),
+                    transactions_root: b256!(
+                        "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+                    ),
+                    receipts_root: b256!(
+                        "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+                    ),
+                    logs_bloom: Bloom::ZERO,
+                    difficulty: U256::ZERO,
+                    number: 0,
+                    gas_limit: 30_000_000,
+                    gas_used: 0,
+                    timestamp: 1_687_223_762,
+                    extra_data: Bytes::default(),
+                    mix_hash: B256::ZERO,
+                    nonce: 0x0000000000000000u64.into(),
+                    base_fee_per_gas: Some(1_000_000_000),
+                    withdrawals_root: Some(b256!(
+                        "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+                    )),
+                    blob_gas_used: Some(0),
+                    excess_blob_gas: Some(0),
+                    parent_beacon_block_root: Some(B256::ZERO),
+                    requests_hash: Some(b256!(
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    )),
+                };
+
+                let chain_spec = ChainSpec {
+                    chain: Chain::from(0x5201u64),
+                    genesis_header: SealedHeader::new_unhashed(header),
+                    genesis: genesis.clone(),
+                    paris_block_and_final_difficulty: Some((0, U256::from(0))),
+                    hardforks,
+                    base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::ethereum()),
+                    deposit_contract: None,
+                    ..Default::default()
+                };
+                Ok(chain_spec)
+            }
             Genesis::Custom(config) => {
                 let chain_spec = ChainSpec::from_genesis(alloy_genesis::Genesis {
                     config: config.clone(),

@@ -4,6 +4,7 @@ TARGET := x86_64-unknown-linux-musl
 CLIENT := bin/client
 BINARY := rsp-client
 EIF := rsp-client-enclave.eif
+TAG ?= v0.5.0
 
 build-enclave:
 	cargo build \
@@ -23,6 +24,12 @@ run-enclave:
 		--memory 256 \
 		--enclave-cid 10 \
 		--debug-mode
+
+download-genesis:
+	mkdir -p ./bin/host/genesis
+	curl -L -o ./bin/host/genesis/genesis-$(TAG).json.gz \
+		https://github.com/fluentlabs-xyz/fluentbase/releases/download/$(TAG)/genesis-$(TAG).json.gz
+	gunzip -f ./bin/host/genesis/genesis-$(TAG).json.gz
 
 clean:
 	rm -f $(EIF)
