@@ -11,6 +11,11 @@
 //!
 //! Both endpoints share the same block-fetching and host-execution pipeline
 //! ([`build_client_input`]) and are protected by an API key middleware.
+//!
+//! ## Optional backends
+//!
+//! - Nitro enclave is enabled by passing `--eif_path <path>` at startup.
+//! - SP1 prover is enabled by setting the `SP1_ELF_PATH` environment variable.
 
 mod enclave;
 mod types;
@@ -73,12 +78,19 @@ const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
 struct AppState {
     api_key: String,
-    nitro_config: NitroConfig,
+    /// Nitro enclave state. `None` when `--eif_path` is not provided.
+    nitro: Option<NitroState>,
     block_execution_strategy_factory: EthEvmConfig<ChainSpec, FluentEvmFactory>,
     genesis: Genesis,
     chain_spec: Arc<ChainSpec>,
     /// SP1 prover state. `None` when `SP1_ELF_PATH` is not set.
     sp1: Option<Sp1State>,
+}
+
+/// Nitro-specific state initialised once at startup and shared across requests.
+#[derive(Clone)]
+struct NitroState {
+    config: NitroConfig,
 }
 
 /// SP1-specific state initialised once at startup and shared across requests.
@@ -170,15 +182,19 @@ async fn build_client_input(
 /// Executes `block_number` inside the AWS Nitro Enclave and returns a signed
 /// [`EthExecutionResponse`].
 ///
-/// The enclave signs the result with its KMS-backed key so callers can verify
-/// the computation was performed in a genuine, attested environment.
+/// Returns HTTP 500 if the server was started without `--eif_path`.
 async fn block(
     State(state): State<AppState>,
     Json(req): Json<BlockRequest>,
 ) -> Result<Json<EthExecutionResponse>, HandlerError> {
+    let nitro = state
+        .nitro
+        .as_ref()
+        .ok_or_else(|| internal("Nitro enclave not configured (pass --eif_path at startup)"))?;
+
     let client_input = build_client_input(req.block_number, &req.rpc_url, &state).await?;
 
-    let response = process_nitro_client(client_input, state.nitro_config)
+    let response = process_nitro_client(client_input, nitro.config)
         .await
         .map_err(|e| internal(format!("Enclave processing failed: {e}")))?;
 
@@ -359,13 +375,26 @@ async fn process_sp1_client(
 async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let eif_path = std::env::args()
-        .skip_while(|a| a != "--eif_path")
-        .nth(1)
-        .ok_or_else(|| eyre::eyre!("Usage: proxy --eif_path <path-to.eif>"))?;
+    // -----------------------------------------------------------------------
+    // Nitro enclave initialisation
+    //
+    //   --eif_path <path>   path to the compiled EIF (required to enable Nitro)
+    // -----------------------------------------------------------------------
 
-    let nitro_config = NitroConfig::default();
-    maybe_restart_enclave(Path::new(&eif_path), nitro_config).await?;
+    let eif_path = std::env::args().skip_while(|a| a != "--eif_path").nth(1);
+
+    let nitro = match eif_path {
+        None => {
+            info!("--eif_path not provided — /block endpoint disabled");
+            None
+        }
+        Some(ref path) => {
+            let nitro_config = NitroConfig::default();
+            maybe_restart_enclave(Path::new(path), nitro_config).await?;
+            info!("Nitro enclave initialised from {path}");
+            Some(NitroState { config: nitro_config })
+        }
+    };
 
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
@@ -400,9 +429,7 @@ async fn main() -> eyre::Result<()> {
             );
 
             let client = ProverClient::from_env().await;
-
             let pk = client.setup(elf).await.unwrap();
-
             let vk = pk.verifying_key();
 
             info!(vk_hash = %hex::encode(vk.hash_bytes()), "SP1 prover initialised");
@@ -411,9 +438,13 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
+    if nitro.is_none() && sp1.is_none() {
+        eyre::bail!("No backends configured: provide --eif_path and/or SP1_ELF_PATH");
+    }
+
     let state = AppState {
         api_key,
-        nitro_config,
+        nitro,
         block_execution_strategy_factory,
         genesis,
         chain_spec,

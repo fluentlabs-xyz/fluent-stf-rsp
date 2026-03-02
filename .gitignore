@@ -39,3 +39,9 @@ bin/aws-nitro-validator/sp1-verifier/.gas-snapshot
 
 bin/host/genesis/genesis-v0.5.3.json
 crates/primitives/src/fluent_genesis_bin
+
+# SP1 ELF
+bin/client/elf/
+
+# Nitro enclave image
+*.eif
