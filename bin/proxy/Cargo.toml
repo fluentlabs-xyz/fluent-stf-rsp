@@ -26,7 +26,7 @@ vsock.workspace = true
 
 # workspace crates
 rsp-provider.workspace = true
-rsp-host-executor = { workspace = true, default-features = false }
+rsp-host-executor = { workspace = true, features = ["sp1"] }
 rsp-primitives = { workspace = true, default-features = false }
 rsp-client-executor.workspace = true
 

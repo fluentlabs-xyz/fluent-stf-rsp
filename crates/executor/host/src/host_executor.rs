@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use alloy_consensus::{BlockHeader, Header, TxReceipt};
+use crate::HostError;
+use alloy_consensus::{BlockHeader, Header, Transaction, TxReceipt};
 use alloy_network::BlockResponse;
 use alloy_primitives::{Bloom, Sealable};
 use alloy_provider::{Network, Provider};
@@ -15,14 +16,12 @@ use reth_trie::{HashedPostState, KeccakKeyHasher};
 use revm::database::CacheDB;
 use revm_primitives::Address;
 use rsp_client_executor::{
-    custom::CustomEvmFactory, io::ClientExecutorInput, BlockValidator, IntoInput, IntoPrimitives,
+    evm::FluentEvmFactory, io::ClientExecutorInput, BlockValidator, IntoInput, IntoPrimitives,
 };
 use rsp_primitives::genesis::Genesis;
 use rsp_rpc_db::RpcDb;
 
-use crate::HostError;
-
-pub type EthHostExecutor = HostExecutor<EthEvmConfig<ChainSpec, CustomEvmFactory>, ChainSpec>;
+pub type EthHostExecutor = HostExecutor<EthEvmConfig<ChainSpec, FluentEvmFactory>, ChainSpec>;
 
 /// An executor that fetches data from a [Provider] to execute blocks in the [ClientExecutor].
 #[derive(Debug, Clone)]
@@ -32,11 +31,11 @@ pub struct HostExecutor<C: ConfigureEvm, CS> {
 }
 
 impl EthHostExecutor {
-    pub fn eth(chain_spec: Arc<ChainSpec>, custom_beneficiary: Option<Address>) -> Self {
+    pub fn eth(chain_spec: Arc<ChainSpec>, _custom_beneficiary: Option<Address>) -> Self {
         Self {
             evm_config: EthEvmConfig::new_with_evm_factory(
                 chain_spec.clone(),
-                CustomEvmFactory::new(custom_beneficiary),
+                FluentEvmFactory::default(),
             ),
             chain_spec,
         }
@@ -98,7 +97,7 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
 
         let cache_db = CacheDB::new(&rpc_db);
 
-        let block_executor = BasicBlockExecutor::new(self.evm_config.clone(), cache_db);
+        let block_executor = BasicBlockExecutor::new(self.evm_config.clone(), cache_db.clone());
 
         let block = current_block
             .clone()
@@ -193,6 +192,11 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
             constructed_header_hash,
             state_root
         );
+
+        match current_block.clone().try_into_recovered() {
+            Ok(_) => println!("recovery OK on host"),
+            Err(e) => println!("recovery FAILED on host: {:?}", e),
+        }
 
         // Create the client input.
         let client_input = ClientExecutorInput {

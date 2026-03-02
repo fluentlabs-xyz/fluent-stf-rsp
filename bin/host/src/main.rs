@@ -1,18 +1,15 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-use alloy_provider::RootProvider;
+use std::sync::Arc;
+
 use clap::Parser;
 use execute::PersistExecutionReport;
-#[cfg(feature = "sp1")]
-use rsp_host_executor::build_executor;
-#[cfg(feature = "nitro")]
-use rsp_host_executor::build_executor_with_nitro;
-use rsp_host_executor::create_eth_block_execution_strategy_factory;
-#[cfg(feature = "sp1")]
-use rsp_host_executor::{BlockExecutor, EthExecutorComponents};
+use rsp_host_executor::{
+    build_executor, create_eth_block_execution_strategy_factory,
+    BlockExecutor, EthExecutorComponents,
+};
 use rsp_provider::create_provider;
-use sp1_sdk::EnvProver;
-use std::sync::Arc;
+use sp1_sdk::{env::EnvProver};
 use tracing_subscriber::{
     filter::EnvFilter, fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
 };
@@ -54,12 +51,12 @@ async fn main() -> eyre::Result<()> {
         args.opcode_tracking,
     );
 
-    let prover_client = Arc::new(EnvProver::new());
+    let prover_client = Arc::new(EnvProver::new().await);
 
     let block_execution_strategy_factory =
         create_eth_block_execution_strategy_factory(&config.genesis, config.custom_beneficiary);
-    let provider: Option<RootProvider> =
-        config.rpc_url.as_ref().map(|url| create_provider(url.clone()));
+
+    let provider = config.rpc_url.as_ref().map(|url| create_provider(url.clone()));
 
     #[cfg(all(feature = "sp1", feature = "nitro"))]
     compile_error!("Features `sp1` and `nitro` are mutually exclusive");

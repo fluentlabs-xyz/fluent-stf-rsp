@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use hex as _;
+use rsp_client_executor::evm::FluentEvmFactory;
 use serde_json as _;
 
 use alloy_chains::Chain;
@@ -10,7 +11,6 @@ use reth_evm_ethereum::EthEvmConfig;
 // use reth_optimism_chainspec::OpChainSpec;
 // use reth_optimism_evm::OpEvmConfig;
 use revm_primitives::Address;
-use rsp_client_executor::custom::CustomEvmFactory;
 use rsp_primitives::genesis::Genesis;
 use sp1_sdk::SP1ProofMode;
 use std::{path::PathBuf, sync::Arc};
@@ -39,11 +39,11 @@ pub use host_executor::{EthHostExecutor, HostExecutor};
 
 pub fn create_eth_block_execution_strategy_factory(
     genesis: &Genesis,
-    custom_beneficiary: Option<Address>,
-) -> EthEvmConfig<ChainSpec, CustomEvmFactory> {
+    _custom_beneficiary: Option<Address>,
+) -> EthEvmConfig<ChainSpec, FluentEvmFactory> {
     let chain_spec: Arc<ChainSpec> = Arc::new(genesis.try_into().unwrap());
 
-    EthEvmConfig::new_with_evm_factory(chain_spec, CustomEvmFactory::new(custom_beneficiary))
+    EthEvmConfig::new_with_evm_factory(chain_spec, FluentEvmFactory::default())
 }
 
 // pub fn create_op_block_execution_strategy_factory(genesis: &Genesis) -> OpEvmConfig {

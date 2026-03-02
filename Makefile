@@ -4,7 +4,7 @@ TARGET := x86_64-unknown-linux-musl
 CLIENT := bin/client
 BINARY := rsp-client
 EIF := rsp-client-enclave.eif
-TAG ?= v0.5.0
+TAG ?= v0.5.3
 
 build-enclave:
 	cargo build \

@@ -3,9 +3,8 @@ use reth_errors::BlockExecutionError;
 use reth_evm::{block::BlockExecutor, execute::Executor, ConfigureEvm, OnStateHook};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
-use revm::database::{states::bundle_state::BundleRetention, State};
+use revm::{database::{State, states::bundle_state::BundleRetention}, inspector::NoOpInspector};
 
-use crate::custom::OpCodeTrackingInspector;
 
 /// A generic block executor that uses a [`BlockExecutionStrategy`] to
 /// execute blocks.
@@ -43,7 +42,7 @@ where
         let evm = self.evm_config.evm_with_env_and_inspector(
             &mut self.db,
             evm_env.unwrap(),
-            OpCodeTrackingInspector::default(),
+            NoOpInspector,
         );
         let ctx = self.evm_config.context_for_block(block).unwrap();
         let mut strategy = self.evm_config.create_executor(evm, ctx);

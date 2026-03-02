@@ -3,11 +3,11 @@ use std::{
     str::FromStr,
 };
 
-use crate::error::ChainSpecError;
+use crate::{error::ChainSpecError, fluent_genesis};
 use alloy_genesis::ChainConfig;
 use alloy_primitives::{b256, Bloom, Bytes, B256, U256};
-use reth_chainspec::{
-    BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, EthereumHardfork, DEV_HARDFORKS,
+use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, EthereumHardfork,
+    DEV_HARDFORKS,
 };
 use reth_primitives_traits::{Header, SealedHeader};
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ pub const OP_SEPOLIA_GENESIS_JSON: &str = include_str!("../../../bin/host/genesi
 
 // If this fails to compile, run: make download-genesis
 pub const FLUENT_DEVNET_GENESIS_JSON: &str =
-    include_str!("../../../bin/host/genesis/genesis-v0.5.0.json");
+    include_str!("../../../bin/host/genesis/genesis-v0.5.3.json");
 
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,7 +114,7 @@ impl TryFrom<&Genesis> for ChainSpec {
             Genesis::OpMainnet => Err(ChainSpecError::InvalidConversion),
             Genesis::Linea => Ok(ChainSpec::from_genesis(genesis_from_json(LINEA_GENESIS_JSON)?)),
             Genesis::FluentDevnet => {
-                let genesis = genesis_from_json(FLUENT_DEVNET_GENESIS_JSON).unwrap();
+                let genesis = fluent_genesis::genesis();
                 let hardforks = DEV_HARDFORKS.clone();
 
                 let header = Header {
@@ -124,7 +124,7 @@ impl TryFrom<&Genesis> for ChainSpec {
                     ),
                     beneficiary: Default::default(),
                     state_root: b256!(
-                        "cf2fcbcc6931d27e5076e98a90b8e31860b024a0ed2786dfe21aa853cf5c3df0"
+                        "46469066cad3f4124bf849eba31776f3160d6a546f674f14238917b66c1b3afe"
                     ),
                     transactions_root: b256!(
                         "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
@@ -135,9 +135,9 @@ impl TryFrom<&Genesis> for ChainSpec {
                     logs_bloom: Bloom::ZERO,
                     difficulty: U256::ZERO,
                     number: 0,
-                    gas_limit: 30_000_000,
+                    gas_limit: 100_000_000,
                     gas_used: 0,
-                    timestamp: 1_687_223_762,
+                    timestamp: 1_772_049_597,
                     extra_data: Bytes::default(),
                     mix_hash: B256::ZERO,
                     nonce: 0x0000000000000000u64.into(),
@@ -154,9 +154,9 @@ impl TryFrom<&Genesis> for ChainSpec {
                 };
 
                 let chain_spec = ChainSpec {
-                    chain: Chain::from(0x5201u64),
+                    chain: Chain::from(0x5201),
                     genesis_header: SealedHeader::new_unhashed(header),
-                    genesis: genesis.clone(),
+                    genesis,
                     paris_block_and_final_difficulty: Some((0, U256::from(0))),
                     hardforks,
                     base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::ethereum()),
@@ -175,52 +175,6 @@ impl TryFrom<&Genesis> for ChainSpec {
         }
     }
 }
-
-// #[cfg(feature = "optimism")]
-// impl TryFrom<&Genesis> for reth_optimism_chainspec::OpChainSpec {
-//     type Error = ChainSpecError;
-//
-//     fn try_from(value: &Genesis) -> Result<Self, Self::Error> {
-//         match value {
-//             Genesis::OpMainnet => {
-//                 use reth_chainspec::Hardfork;
-//                 use reth_optimism_forks::OpHardfork;
-//
-//                 let op_mainnet = reth_optimism_chainspec::OpChainSpec {
-//                     inner: ChainSpec {
-//                         chain: Chain::optimism_mainnet(),
-//                         genesis: Default::default(),
-//                         genesis_header: Default::default(),
-//                         paris_block_and_final_difficulty: Default::default(),
-//                         hardforks: reth_optimism_forks::OP_MAINNET_HARDFORKS.clone(),
-//                         deposit_contract: Default::default(),
-//                         base_fee_params: BaseFeeParamsKind::Variable(
-//                             vec![
-//                                 (EthereumHardfork::London.boxed(), BaseFeeParams::optimism()),
-//                                 (OpHardfork::Canyon.boxed(), BaseFeeParams::optimism_canyon()),
-//                             ]
-//                             .into(),
-//                         ),
-//                         prune_delete_limit: 10000,
-//                         blob_params: Default::default(),
-//                     },
-//                 };
-//
-//                 Ok(op_mainnet)
-//             }
-//             Genesis::Custom(config) => {
-//                 let custom =
-//                     reth_optimism_chainspec::OpChainSpec::from_genesis(alloy_genesis::Genesis {
-//                         config: config.clone(),
-//                         ..Default::default()
-//                     });
-//
-//                 Ok(custom)
-//             }
-//             _ => Err(ChainSpecError::InvalidConversion),
-//         }
-//     }
-// }
 
 pub(crate) mod serde_bincode_compat {
     use std::collections::BTreeMap;

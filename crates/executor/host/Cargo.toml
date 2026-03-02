@@ -41,7 +41,7 @@ anyhow = { workspace = true, optional = true }
 
 # workspace crates
 rsp-rpc-db.workspace = true
-rsp-client-executor.workspace = true
+rsp-client-executor = {workspace = true, features=["wasmtime"]}
 rsp-mpt.workspace = true
 rsp-primitives = { workspace = true, features = ["optimism"] }
 

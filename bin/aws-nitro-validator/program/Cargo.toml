@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "nitro-validator"
 version = "0.1.0"
@@ -12,8 +14,13 @@ ciborium = { version = "0.2", default-features = false }
 p384 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 x509-parser = { version = "0.16", default-features = false }
-sp1-zkvm = "5.1.0"
+sp1-zkvm = "5.2.0"
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+common = {path = "../common"}
 
 [dev-dependencies]
 hex = "0.4"
+
+[patch.crates-io]
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.9-sp1-4.0.0" }
+crypto-bigint = { git = "https://github.com/sp1-patches/RustCrypto-bigint", tag = "patch-0.5.5-sp1-4.0.0" }

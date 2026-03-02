@@ -3,14 +3,17 @@ use either::Either;
 use reth_primitives_traits::NodePrimitives;
 use rsp_client_executor::io::ClientExecutorInput;
 use serde::de::DeserializeOwned;
+use sp1_sdk::{Elf, ProvingKey};
 use std::{
     fmt::{Debug, Formatter},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use tokio::{task, time::sleep};
+use tokio::time::sleep;
 use tracing::warn;
+
+use sp1_sdk::Prover;
 
 use crate::executor_components::MaybeProveWithCycles;
 
@@ -18,10 +21,9 @@ use crate::executor_components::MaybeProveWithCycles;
 use {
     alloy_primitives::B256,
     eyre::bail,
-    sp1_prover::components::CpuProverComponents,
-    sp1_sdk::{ExecutionReport, Prover, SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey},
+    sp1_sdk::{SP1Stdin, SP1VerifyingKey},
     std::time::Instant,
-    tracing::{info, info_span},
+    tracing::info,
 };
 
 #[cfg(all(feature = "nitro", not(feature = "sp1")))]
@@ -45,10 +47,6 @@ use {
 };
 
 pub type EitherExecutor<C, P> = Either<FullExecutor<C, P>, CachedExecutor<C>>;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_executor
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sp1")]
 pub async fn build_executor<C, P>(
@@ -77,10 +75,6 @@ where
 
     bail!("Either a RPC URL or a cache dir must be provided")
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_executor_with_nitro
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "nitro")]
 pub async fn build_executor_with_nitro<C, P>(
@@ -220,10 +214,6 @@ where
     })
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BlockExecutor trait
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub trait BlockExecutor<C: ExecutorComponents> {
     #[allow(async_fn_in_trait)]
     async fn execute(&self, block_number: u64) -> eyre::Result<()>;
@@ -231,14 +221,13 @@ pub trait BlockExecutor<C: ExecutorComponents> {
     fn client(&self) -> Arc<C::Prover>;
 
     #[cfg(feature = "sp1")]
-    fn pk(&self) -> Arc<SP1ProvingKey>;
+    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey>;
 
     #[cfg(feature = "sp1")]
     fn vk(&self) -> Arc<SP1VerifyingKey>;
 
     fn config(&self) -> &Config;
 
-    #[cfg(feature = "sp1")]
     #[allow(async_fn_in_trait)]
     async fn process_client(
         &self,
@@ -248,28 +237,26 @@ pub trait BlockExecutor<C: ExecutorComponents> {
         // Generate the proof.
         // Execute the block inside the zkVM.
         let mut stdin = SP1Stdin::new();
-        let buffer = bincode::serialize(&client_input).unwrap();
-        stdin.write_vec(buffer);
 
-        let stdin = Arc::new(stdin);
+        let buffer = bincode::serialize(&client_input).unwrap();
+
+        stdin.write_vec(buffer);
 
         if self.config().skip_client_execution {
             info!("Client execution skipped");
         } else {
             // Only execute the program.
-            let execute_result = execute_client(
-                client_input.current_block.number,
-                self.client(),
-                self.pk(),
-                stdin.clone(),
-            )
-            .await?;
-            let (mut public_values, execution_report) = execute_result?;
+            let elf = self.pk().elf().clone();
+
+            let (mut public_values, execution_report) = self
+                .client()
+                .execute(elf, stdin.clone())
+                .await
+                .map_err(|err| eyre::eyre!("{err}"))?;
 
             // Read the block header.
             let parent_hash = public_values.read::<B256>();
             let block_hash = public_values.read::<B256>();
-
             let input_block_hash = client_input.current_block.header.hash_slow();
 
             if input_block_hash != block_hash {
@@ -295,13 +282,10 @@ pub trait BlockExecutor<C: ExecutorComponents> {
             let client = self.client();
             let pk = self.pk();
 
-            let (proof, cycle_count) = task::spawn_blocking(move || {
-                client
-                    .prove_with_cycles(pk.as_ref(), &stdin, prove_mode)
-                    .map_err(|err| eyre::eyre!("{err}"))
-            })
-            .await
-            .map_err(|err| eyre::eyre!("{err}"))??;
+            let (proof, cycle_count) = client
+                .prove_with_cycles(pk.as_ref(), stdin, prove_mode)
+                .await
+                .map_err(|err| eyre::eyre!("{err}"))?;
 
             let proving_duration = proving_start.elapsed();
             let proof_bytes = bincode::serialize(&proof.proof).unwrap();
@@ -413,7 +397,6 @@ pub trait BlockExecutor<C: ExecutorComponents> {
         Ok(())
     }
 }
-
 #[cfg(feature = "nitro")]
 fn aws_access_key_id() -> String {
     std::env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID environment variable must be set")
@@ -587,7 +570,7 @@ where
     }
 
     #[cfg(feature = "sp1")]
-    fn pk(&self) -> Arc<SP1ProvingKey> {
+    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey> {
         match self {
             Either::Left(ref executor) => executor.pk.clone(),
             Either::Right(ref executor) => executor.pk.clone(),
@@ -619,7 +602,7 @@ where
     host_executor: HostExecutor<C::EvmConfig, C::ChainSpec>,
     client: Arc<C::Prover>,
     #[cfg(feature = "sp1")]
-    pk: Arc<SP1ProvingKey>,
+    pk: Arc<<C::Prover as Prover>::ProvingKey>,
     #[cfg(feature = "sp1")]
     vk: Arc<SP1VerifyingKey>,
     hooks: C::Hooks,
@@ -631,7 +614,6 @@ where
     C: ExecutorComponents,
     P: Provider<C::Network> + Clone + std::fmt::Debug,
 {
-    #[cfg(feature = "sp1")]
     pub async fn try_new(
         provider: P,
         elf: Vec<u8>,
@@ -640,14 +622,10 @@ where
         hooks: C::Hooks,
         config: Config,
     ) -> eyre::Result<Self> {
-        let cloned_client = client.clone();
-
-        // Setup the proving key and verification key.
-        let (pk, vk) = task::spawn_blocking(move || {
-            let (pk, vk) = cloned_client.setup(&elf);
-            (pk, vk)
-        })
-        .await?;
+        // Setup the proving key.
+        let pk =
+            client.setup(Elf::from(elf.as_slice())).await.map_err(|err| eyre::eyre!("{err}"))?;
+        let vk = pk.verifying_key().clone();
 
         Ok(Self {
             provider,
@@ -665,6 +643,7 @@ where
 
     pub async fn wait_for_block(&self, block_number: u64) -> eyre::Result<()> {
         let block_number = block_number.into();
+
         while self.provider.get_block_by_number(block_number).await?.is_none() {
             sleep(Duration::from_millis(100)).await;
         }
@@ -721,6 +700,7 @@ where
 
                     let input_path = input_folder.join(format!("{block_number}.bin"));
                     let mut cache_file = std::fs::File::create(input_path)?;
+
                     bincode::serialize_into(&mut cache_file, &client_input)?;
                 }
 
@@ -746,7 +726,7 @@ where
     }
 
     #[cfg(feature = "sp1")]
-    fn pk(&self) -> Arc<SP1ProvingKey> {
+    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey> {
         self.pk.clone()
     }
 
@@ -777,7 +757,7 @@ where
     cache_dir: PathBuf,
     client: Arc<C::Prover>,
     #[cfg(feature = "sp1")]
-    pk: Arc<SP1ProvingKey>,
+    pk: Arc<<C::Prover as Prover>::ProvingKey>,
     #[cfg(feature = "sp1")]
     vk: Arc<SP1VerifyingKey>,
     hooks: C::Hooks,
@@ -788,7 +768,6 @@ impl<C> CachedExecutor<C>
 where
     C: ExecutorComponents,
 {
-    #[cfg(feature = "sp1")]
     pub async fn try_new(
         elf: Vec<u8>,
         client: Arc<C::Prover>,
@@ -796,14 +775,10 @@ where
         cache_dir: PathBuf,
         config: Config,
     ) -> eyre::Result<Self> {
-        let cloned_client = client.clone();
-
-        // Setup the proving key and verification key.
-        let (pk, vk) = task::spawn_blocking(move || {
-            let (pk, vk) = cloned_client.setup(&elf);
-            (pk, vk)
-        })
-        .await?;
+        // Setup the proving key.
+        let pk =
+            client.setup(Elf::from(elf.as_slice())).await.map_err(|err| eyre::eyre!("{err}"))?;
+        let vk = pk.verifying_key().clone();
 
         Ok(Self { cache_dir, client, pk: Arc::new(pk), vk: Arc::new(vk), hooks, config })
     }
@@ -839,7 +814,7 @@ where
     }
 
     #[cfg(feature = "sp1")]
-    fn pk(&self) -> Arc<SP1ProvingKey> {
+    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey> {
         self.pk.clone()
     }
 
@@ -862,23 +837,6 @@ where
     }
 }
 
-#[cfg(feature = "sp1")]
-async fn execute_client<P: Prover<CpuProverComponents> + 'static>(
-    number: u64,
-    client: Arc<P>,
-    pk: Arc<SP1ProvingKey>,
-    stdin: Arc<SP1Stdin>,
-) -> eyre::Result<eyre::Result<(SP1PublicValues, ExecutionReport)>> {
-    task::spawn_blocking(move || {
-        info_span!("execute_client", number).in_scope(|| {
-            let result = client.execute(&pk.elf, &stdin);
-            result.map_err(|err| eyre::eyre!("{err}"))
-        })
-    })
-    .await
-    .map_err(|err| eyre::eyre!("{err}"))
-}
-
 fn try_load_input_from_cache<P: NodePrimitives + DeserializeOwned>(
     cache_dir: &Path,
     chain_id: u64,
@@ -887,8 +845,10 @@ fn try_load_input_from_cache<P: NodePrimitives + DeserializeOwned>(
     let cache_path = cache_dir.join(format!("input/{chain_id}/{block_number}.bin"));
 
     if cache_path.exists() {
+        // TODO: prune the cache if invalid instead
         let mut cache_file = std::fs::File::open(cache_path)?;
         let client_input = bincode::deserialize_from(&mut cache_file)?;
+
         Ok(Some(client_input))
     } else {
         Ok(None)

@@ -35,7 +35,7 @@ use axum::{
     Router,
 };
 use revm_primitives::{hex, FixedBytes};
-use rsp_primitives::genesis::{genesis_from_json, Genesis};
+use rsp_primitives::genesis::Genesis;
 use url::Url;
 
 use serde::{Deserialize, Serialize};
@@ -44,15 +44,16 @@ use alloy_provider::RootProvider;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm_ethereum::EthEvmConfig;
-use rsp_client_executor::{custom::CustomEvmFactory, io::ClientExecutorInput};
+use rsp_client_executor::{evm::FluentEvmFactory, io::ClientExecutorInput};
 use rsp_host_executor::{create_eth_block_execution_strategy_factory, HostExecutor};
 use rsp_provider::create_provider;
 
 use sp1_sdk::{
-    network::NetworkMode, CpuProver, HashableKey, NetworkProver, NetworkSigner, Prover,
-    SP1ProofWithPublicValues, SP1ProvingKey, SP1Stdin, SP1VerifyingKey,
+    env::{EnvProver, EnvProvingKey},
+    Elf, HashableKey, Prover, ProverClient, ProvingKey, SP1Stdin,
 };
 
+use sp1_sdk::ProveRequest;
 use tokio::task;
 use tracing::info;
 use vsock::{VsockAddr, VsockStream};
@@ -62,73 +63,7 @@ use vsock::{VsockAddr, VsockStream};
 // ---------------------------------------------------------------------------
 
 /// Maximum allowed VSOCK frame size (64 MiB).
-/// Applied to both incoming responses and outgoing requests.
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
-
-// ---------------------------------------------------------------------------
-// SP1 backend abstraction
-// ---------------------------------------------------------------------------
-
-/// Wraps the two concrete SP1 prover implementations behind a single
-/// async `prove()` method.
-///
-/// Both variants produce identical output (`SP1ProofWithPublicValues`) and
-/// use `spawn_blocking` because the underlying SDK calls are synchronous —
-/// the local prover is CPU-bound and the network prover blocks on HTTP polling.
-#[derive(Clone)]
-enum ProverBackend {
-    /// Runs Groth16 proving on the host machine (CPU or GPU).
-    Local(Arc<CpuProver>),
-    /// Delegates proving to the Succinct prover network via HTTPS.
-    Network(Arc<NetworkProver>),
-}
-
-impl ProverBackend {
-    /// Generates a Groth16 proof for `stdin` using the given proving key.
-    ///
-    /// The call is offloaded to a blocking thread pool via `spawn_blocking`
-    /// so the Tokio runtime is never stalled.
-    async fn prove(
-        &self,
-        pk: Arc<SP1ProvingKey>,
-        stdin: SP1Stdin,
-    ) -> eyre::Result<SP1ProofWithPublicValues> {
-        match self {
-            ProverBackend::Local(client) => {
-                let client = client.clone();
-                task::spawn_blocking(move || {
-                    client
-                        .prove(pk.as_ref(), &stdin)
-                        .groth16()
-                        .run()
-                        .map_err(|e| eyre::eyre!("Local proving failed: {e}"))
-                })
-                .await
-                .map_err(|e| eyre::eyre!("Blocking task panicked: {e}"))?
-            }
-            ProverBackend::Network(client) => {
-                let client = client.clone();
-                task::spawn_blocking(move || {
-                    client
-                        .prove(pk.as_ref(), &stdin)
-                        .groth16()
-                        .run()
-                        .map_err(|e| eyre::eyre!("Network proving failed: {e}"))
-                })
-                .await
-                .map_err(|e| eyre::eyre!("Blocking task panicked: {e}"))?
-            }
-        }
-    }
-
-    /// Human-readable backend name used in log messages.
-    fn name(&self) -> &'static str {
-        match self {
-            ProverBackend::Local(_) => "local",
-            ProverBackend::Network(_) => "network",
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -137,46 +72,38 @@ impl ProverBackend {
 /// Shared state cloned into every request handler via Axum's `State` extractor.
 #[derive(Clone)]
 struct AppState {
-    /// Expected value of the `x-api-key` request header.
     api_key: String,
     nitro_config: NitroConfig,
-    block_execution_strategy_factory: EthEvmConfig<ChainSpec, CustomEvmFactory>,
+    block_execution_strategy_factory: EthEvmConfig<ChainSpec, FluentEvmFactory>,
     genesis: Genesis,
     chain_spec: Arc<ChainSpec>,
-    /// SP1 prover state.  `None` when `SP1_ELF_PATH` is not set;
-    /// the `/block/sp1-proof` endpoint returns HTTP 500 in that case.
+    /// SP1 prover state. `None` when `SP1_ELF_PATH` is not set.
     sp1: Option<Sp1State>,
 }
 
 /// SP1-specific state initialised once at startup and shared across requests.
 #[derive(Clone)]
 struct Sp1State {
-    backend: ProverBackend,
+    client: Arc<EnvProver>,
     /// Proving key derived from the compiled zkVM ELF.
-    pk: Arc<SP1ProvingKey>,
-    /// Verifying key — its hash is returned to callers as `vk_hash`.
-    vk: Arc<SP1VerifyingKey>,
+    pk: Arc<EnvProvingKey>,
 }
 
 // ---------------------------------------------------------------------------
 // HTTP request / response types
 // ---------------------------------------------------------------------------
 
-/// Request body shared by both `/block` and `/block/sp1-proof`.
 #[derive(Deserialize)]
 struct BlockRequest {
     block_number: u64,
-    /// JSON-RPC endpoint used to fetch the block and its execution witnesses.
     rpc_url: String,
 }
 
-/// Generic JSON error body returned on 4xx / 5xx responses.
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
 }
 
-// Convenience type alias so handler return types stay readable.
 type HandlerError = (StatusCode, Json<ErrorResponse>);
 
 fn bad_request(msg: impl ToString) -> HandlerError {
@@ -191,7 +118,6 @@ fn internal(msg: impl ToString) -> HandlerError {
 // Middleware
 // ---------------------------------------------------------------------------
 
-/// Rejects requests that do not carry a valid `x-api-key` header.
 async fn require_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -277,15 +203,12 @@ async fn block_sp1_proof(
         .ok_or_else(|| internal("SP1 prover not configured (set SP1_ELF_PATH)"))?;
 
     let client_input = build_client_input(req.block_number, &req.rpc_url, &state).await?;
-
-    // Capture the expected hash before moving client_input into the prover.
     let expected_block_hash = client_input.current_block.header.hash_slow();
 
     let response = process_sp1_client(client_input, sp1.clone())
         .await
         .map_err(|e| internal(format!("SP1 proof generation failed: {e}")))?;
 
-    // Sanity check: the proof must commit to the block we requested.
     if response.block_hash != expected_block_hash {
         return Err(internal(format!(
             "Block hash mismatch: requested {}, proof contains {}",
@@ -316,7 +239,6 @@ async fn process_nitro_client(
         .map_err(|e| eyre::eyre!("Failed to serialize client input: {}", e))?;
     info!("Serialized input: {} bytes", payload.len());
 
-    // Offload all blocking VSOCK I/O to the thread pool.
     let response = task::spawn_blocking(move || -> eyre::Result<EthExecutionResponse> {
         let addr = VsockAddr::new(config.enclave_cid, config.enclave_port);
         let mut stream = VsockStream::connect(&addr).map_err(|e| {
@@ -340,7 +262,6 @@ async fn process_nitro_client(
         stream.flush().map_err(|e| eyre::eyre!("Failed to flush stream: {}", e))?;
         info!("Sent {} bytes to enclave", payload.len());
 
-        // Read the length-prefixed response.
         let mut resp_len_buf = [0u8; 4];
         stream
             .read_exact(&mut resp_len_buf)
@@ -366,7 +287,6 @@ async fn process_nitro_client(
     .await
     .map_err(|e| eyre::eyre!("Blocking task panicked: {}", e))??;
 
-    // Verify the enclave processed the exact block we requested.
     let input_block_hash = client_input.current_block.header.hash_slow();
     if input_block_hash != response.block_hash {
         return Err(eyre::eyre!(
@@ -391,83 +311,45 @@ async fn process_nitro_client(
 // SP1 proof generation
 // ---------------------------------------------------------------------------
 
-/// Serialises `client_input` into SP1 stdin, runs the zkVM program to
-/// generate a Groth16 proof, and extracts the three fields required by the
-/// on-chain verifier contract.
+/// Serialises `client_input` into SP1 stdin and generates a Groth16 proof.
 async fn process_sp1_client(
     client_input: ClientExecutorInput<EthPrimitives>,
     sp1: Sp1State,
 ) -> eyre::Result<Sp1ProofResponse> {
     let block_number = client_input.current_block.number;
 
-    // Serialise the full block input for the zkVM guest program.
     let mut stdin = SP1Stdin::new();
     stdin.write_vec(
         bincode::serialize(&client_input)
             .map_err(|e| eyre::eyre!("Failed to serialize client input: {e}"))?,
     );
 
-    info!(block_number, backend = sp1.backend.name(), "Starting SP1 Groth16 proof generation");
+    info!(block_number, "Starting SP1 Groth16 proof generation");
 
-    let proof = sp1.backend.prove(sp1.pk.clone(), stdin).await?;
+    let proof = sp1
+        .client
+        .prove(sp1.pk.as_ref(), stdin)
+        .groth16()
+        .await
+        .map_err(|e| eyre::eyre!("Proving failed: {e}"))?;
 
     info!(block_number, "SP1 proof generated successfully");
 
-    // --- Extract fields for ISP1Verifier.verifyProof() ---------------------
-
-    // public_values: raw bytes committed by the guest via `sp1_zkvm::io::commit`.
     let public_values = proof.public_values.as_slice().to_vec();
 
-    // Read block_hash back from public values (layout: parent_hash ++ block_hash ++ …).
     let block_hash = {
         let mut pv = proof.public_values.clone();
         let _parent_hash: FixedBytes<32> = pv.read();
         pv.read::<FixedBytes<32>>()
     };
 
-    // proof_bytes: bincode-serialised Groth16 proof, passed verbatim to the contract.
     let proof_bytes = bincode::serialize(&proof.proof)
         .map_err(|e| eyre::eyre!("Failed to serialize proof: {e}"))?;
 
-    // vk_hash: bytes32 commitment to the program, first arg to verifyProof().
-    let vk_hash = FixedBytes::from(sp1.vk.hash_bytes());
+    let vk_hash = FixedBytes::from(sp1.pk.verifying_key().hash_bytes());
 
     Ok(Sp1ProofResponse { block_number, block_hash, vk_hash, public_values, proof_bytes })
 }
-
-// ---------------------------------------------------------------------------
-// Genesis configuration
-// ---------------------------------------------------------------------------
-
-/// Fallback genesis used when `GENESIS_JSON` is not set in the environment.
-/// Matches the devnet chain (chainId 20993) with all EIPs active from block 0.
-static DEVNET_GENESIS: &str = r#"{
-    "config": {
-      "chainId": 20993,
-      "homesteadBlock": 0,
-      "daoForkBlock": 0,
-      "daoForkSupport": true,
-      "eip150Block": 0,
-      "eip155Block": 0,
-      "eip158Block": 0,
-      "byzantiumBlock": 0,
-      "constantinopleBlock": 0,
-      "petersburgBlock": 0,
-      "istanbulBlock": 0,
-      "muirGlacierBlock": 0,
-      "berlinBlock": 0,
-      "londonBlock": 0,
-      "arrowGlacierBlock": 0,
-      "grayGlacierBlock": 0,
-      "mergeNetsplitBlock": 0,
-      "shanghaiTime": 0,
-      "cancunTime": 0,
-      "pragueTime": 0,
-      "osakaTime": 0,
-      "terminalTotalDifficulty": 0,
-      "terminalTotalDifficultyPassed": false
-    }
-}"#;
 
 // ---------------------------------------------------------------------------
 // Entry-point
@@ -477,45 +359,18 @@ static DEVNET_GENESIS: &str = r#"{
 async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
 
-    // -----------------------------------------------------------------------
-    // CLI
-    // -----------------------------------------------------------------------
-
     let eif_path = std::env::args()
         .skip_while(|a| a != "--eif_path")
         .nth(1)
         .ok_or_else(|| eyre::eyre!("Usage: proxy --eif_path <path-to.eif>"))?;
 
-    // -----------------------------------------------------------------------
-    // Nitro enclave — start / restart if needed
-    // -----------------------------------------------------------------------
-
     let nitro_config = NitroConfig::default();
     maybe_restart_enclave(Path::new(&eif_path), nitro_config).await?;
-
-    // -----------------------------------------------------------------------
-    // Environment
-    // -----------------------------------------------------------------------
 
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
-    // -----------------------------------------------------------------------
-    // Genesis
-    // -----------------------------------------------------------------------
-
-    // Allow operators to point at a different network without recompiling.
-    let genesis_json = match std::env::var("GENESIS_PATH") {
-        Ok(path) => std::fs::read_to_string(&path)
-            .map_err(|e| eyre::eyre!("Failed to read genesis file {path}: {e}"))?,
-        Err(_) => {
-            info!("GENESIS_PATH not set — using built-in devnet genesis");
-            DEVNET_GENESIS.to_string()
-        }
-    };
-    let alloy_genesis =
-        genesis_from_json(&genesis_json).map_err(|e| eyre::eyre!("Invalid genesis: {e}"))?;
-    let genesis = Genesis::Custom(alloy_genesis.config);
+    let genesis = Genesis::FluentDevnet;
     let block_execution_strategy_factory =
         create_eth_block_execution_strategy_factory(&genesis, None);
 
@@ -525,12 +380,12 @@ async fn main() -> eyre::Result<()> {
     );
 
     // -----------------------------------------------------------------------
-    // SP1 initialisation — optional, controlled by env vars:
+    // SP1 initialisation
     //
     //   SP1_ELF_PATH            path to the compiled zkVM ELF (required to enable SP1)
-    //   SP1_PROVER              "local" (default) | "network"
+    //   SP1_PROVER              "cpu" (default) | "network"
     //   SP1_PRIVATE_KEY         required when SP1_PROVER=network
-    //   SP1_PROVER_NETWORK_RPC  optional custom RPC (default: Succinct production network)
+    //   SP1_PROVER_NETWORK_RPC  optional custom RPC
     // -----------------------------------------------------------------------
 
     let sp1 = match std::env::var("SP1_ELF_PATH") {
@@ -539,45 +394,22 @@ async fn main() -> eyre::Result<()> {
             None
         }
         Ok(elf_path) => {
-            let elf = std::fs::read(&elf_path)
-                .map_err(|e| eyre::eyre!("Failed to read SP1 ELF {elf_path}: {e}"))?;
+            let elf = Elf::from(
+                std::fs::read(&elf_path)
+                    .map_err(|e| eyre::eyre!("Failed to read SP1 ELF {elf_path}: {e}"))?,
+            );
 
-            let backend = match std::env::var("SP1_PROVER").as_deref() {
-                Ok("network") => {
-                    let private_key = std::env::var("SP1_PRIVATE_KEY").map_err(|_| {
-                        eyre::eyre!("SP1_PRIVATE_KEY must be set when SP1_PROVER=network")
-                    })?;
-                    let rpc_url = std::env::var("SP1_PROVER_NETWORK_RPC")
-                        .unwrap_or_else(|_| "https://rpc.production.succinct.xyz".to_string());
+            let client = ProverClient::from_env().await;
 
-                    // TODO: consider AWS KMS signer for production key management.
-                    let signer = NetworkSigner::local(&private_key)
-                        .map_err(|e| eyre::eyre!("Invalid SP1_PRIVATE_KEY: {e}"))?;
+            let pk = client.setup(elf).await.unwrap();
 
-                    info!("SP1 backend: prover network (rpc={})", rpc_url);
-                    let client = NetworkProver::new(signer, &rpc_url, NetworkMode::default());
-                    ProverBackend::Network(Arc::new(client))
-                }
-                _ => {
-                    info!("SP1 backend: local CPU");
-                    ProverBackend::Local(Arc::new(CpuProver::new()))
-                }
-            };
-
-            // setup() only reads the ELF — identical for both backends.
-            let (pk, vk) = match &backend {
-                ProverBackend::Local(c) => c.setup(&elf),
-                ProverBackend::Network(c) => c.setup(&elf),
-            };
+            let vk = pk.verifying_key();
 
             info!(vk_hash = %hex::encode(vk.hash_bytes()), "SP1 prover initialised");
-            Some(Sp1State { backend, pk: Arc::new(pk), vk: Arc::new(vk) })
+
+            Some(Sp1State { client: Arc::new(client), pk: Arc::new(pk) })
         }
     };
-
-    // -----------------------------------------------------------------------
-    // HTTP server
-    // -----------------------------------------------------------------------
 
     let state = AppState {
         api_key,

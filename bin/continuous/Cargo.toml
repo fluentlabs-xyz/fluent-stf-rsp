@@ -1,21 +1,19 @@
 [package]
+version = "0.1.0"
 name = "continuous"
-version.workspace = true
-edition.workspace = true
+edition = "2021"
 
 [dependencies]
 serde.workspace = true
 tokio.workspace = true
 url.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-eyre.workspace = true
-clap.workspace = true
-dotenv.workspace = true
-futures.workspace = true
-
-sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "chrono"] }
+clap = { version = "4.5.7", features = ["derive", "env"] }
+dotenv = "0.15.0"
+eyre = "0.6.12"
 futures-util = "0.3.31"
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "chrono"] }
+tracing-subscriber = "0.3.18"
 
 # workspace
 rsp-host-executor = { workspace = true, features = ["alerting"] }
@@ -32,7 +30,7 @@ alloy-rpc-client.workspace = true
 alloy-transport.workspace = true
 alloy-transport-ws.workspace = true
 
-# reth
+# reth 
 reth-evm.workspace = true
 reth-primitives-traits.workspace = true
 
