@@ -45,3 +45,4 @@ bin/client/elf/
 
 # Nitro enclave image
 *.eif
+*.elf

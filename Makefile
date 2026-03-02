@@ -4,29 +4,36 @@
 # ─── Paths ────────────────────────────────────────────────────────────────────
 CLIENT_DIR   := bin/client
 PROXY_DIR    := bin/proxy
-ELF_PATH     := $(CLIENT_DIR)/elf/riscv32im-succinct-zkvm-elf
 
 # ─── Nitro / enclave ──────────────────────────────────────────────────────────
 TARGET       := x86_64-unknown-linux-musl
 BINARY       := rsp-client
 EIF          := rsp-client-enclave.eif
+ELF          := rsp-client.elf
 
 # ─── Config (override via env or CLI) ─────────────────────────────────────────
 EIF_PATH     ?= $(EIF)
+ELF_PATH     ?= $(ELF)
 API_KEY      ?= secret
 LISTEN_ADDR  ?= 0.0.0.0:8080
 SP1_PROVER   ?= cpu          # cpu | network
 TAG          ?= v0.5.3
+RUST_LOG 	 ?= info
 
 # ─── SP1 ELF ──────────────────────────────────────────────────────────────────
 
 ## Quick ELF build (dev)
 build-client:
-	cargo build --manifest-path $(CLIENT_DIR)/Cargo.toml
+	cd $(CLIENT_DIR) && cargo prove build \
+		--elf-name $(ELF) \
+		--output-directory ../../
 
 ## Reproducible ELF build via Docker (prod)
 build-client-docker:
-	SP1_DOCKER=1 cargo build --manifest-path $(CLIENT_DIR)/Cargo.toml
+	cd $(CLIENT_DIR) && cargo prove build \
+		--elf-name $(ELF) \
+		--output-directory ../../ \
+		--docker
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────
 
@@ -64,6 +71,7 @@ run: build-client build-proxy
 	SP1_PROVER=$(SP1_PROVER) \
 	API_KEY=$(API_KEY) \
 	LISTEN_ADDR=$(LISTEN_ADDR) \
+	RUST_LOG=$(RUST_LOG) \
 	./target/release/proxy --eif_path $(EIF_PATH)
 
 ## Build and run with SP1 only (no Nitro)
@@ -72,6 +80,7 @@ run-sp1-only: build-client build-proxy
 	SP1_PROVER=$(SP1_PROVER) \
 	API_KEY=$(API_KEY) \
 	LISTEN_ADDR=$(LISTEN_ADDR) \
+	RUST_LOG=$(RUST_LOG) \
 	./target/release/proxy
 
 # ─── Misc ─────────────────────────────────────────────────────────────────────
@@ -84,7 +93,7 @@ download-genesis:
 
 clean:
 	cargo clean
-	rm -f $(EIF)
+	rm -f $(EIF) $(ELF)
 
 help:
 	@echo "Targets:"
@@ -100,6 +109,7 @@ help:
 	@echo ""
 	@echo "Overrides:"
 	@echo "  EIF_PATH=$(EIF_PATH)"
+	@echo "  ELF_PATH=$(ELF_PATH)"
 	@echo "  API_KEY=$(API_KEY)"
 	@echo "  LISTEN_ADDR=$(LISTEN_ADDR)"
 	@echo "  SP1_PROVER=$(SP1_PROVER)"
