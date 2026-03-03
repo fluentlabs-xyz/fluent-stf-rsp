@@ -39,13 +39,13 @@ use axum::{
     routing::post,
     Router,
 };
-use revm_primitives::{hex, FixedBytes};
+use revm_primitives::{B256, FixedBytes, hex};
 use rsp_primitives::genesis::Genesis;
 use url::Url;
 
 use serde::{Deserialize, Serialize};
 
-use alloy_provider::RootProvider;
+use alloy_provider::{Provider, RootProvider};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm_ethereum::EthEvmConfig;
@@ -107,7 +107,8 @@ struct Sp1State {
 
 #[derive(Deserialize)]
 struct BlockRequest {
-    block_number: u64,
+    block_number: Option<u64>,
+    block_hash: Option<B256>,
     rpc_url: String,
 }
 
@@ -159,12 +160,27 @@ async fn require_api_key(
 /// This is intentionally shared between [`block`] and [`block_sp1_proof`] so
 /// the two endpoints always use identical witness data.
 async fn build_client_input(
-    block_number: u64,
-    rpc_url: &str,
+    req: BlockRequest,
     state: &AppState,
 ) -> Result<ClientExecutorInput<EthPrimitives>, HandlerError> {
-    let url = Url::parse(rpc_url).map_err(|e| bad_request(format!("Invalid rpc_url: {e}")))?;
+    let url = Url::parse(&req.rpc_url).map_err(|e| bad_request(format!("Invalid rpc_url: {e}")))?;
     let provider: RootProvider = create_provider(url);
+
+    let block_number = match (req.block_number, req.block_hash) {
+        (_, Some(hash)) => {
+            provider
+                .get_block_by_hash(hash)
+                .await
+                .map_err(|e| internal(format!("RPC error: {e}")))?
+                .ok_or_else(|| bad_request(format!("Block not found for hash: {hash}")))?
+                .header
+                .number
+        }
+        (Some(number), _) => number,
+        (None, None) => {
+            return Err(bad_request("Either block_number or block_hash must be provided".to_string()))
+        }
+    };
 
     let host_executor =
         HostExecutor::new(state.block_execution_strategy_factory.clone(), state.chain_spec.clone());
@@ -192,7 +208,7 @@ async fn block(
         .as_ref()
         .ok_or_else(|| internal("Nitro enclave not configured (pass --eif_path at startup)"))?;
 
-    let client_input = build_client_input(req.block_number, &req.rpc_url, &state).await?;
+    let client_input = build_client_input(req, &state).await?;
 
     let response = process_nitro_client(client_input, nitro.config)
         .await
@@ -218,7 +234,7 @@ async fn block_sp1_proof(
         .as_ref()
         .ok_or_else(|| internal("SP1 prover not configured (set SP1_ELF_PATH)"))?;
 
-    let client_input = build_client_input(req.block_number, &req.rpc_url, &state).await?;
+    let client_input = build_client_input(req, &state).await?;
     let expected_block_hash = client_input.current_block.header.hash_slow();
 
     let response = process_sp1_client(client_input, sp1.clone())

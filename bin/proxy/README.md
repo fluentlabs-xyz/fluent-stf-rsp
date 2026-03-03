@@ -60,6 +60,18 @@ All requests must include the header:
 x-api-key: <API_KEY>
 ```
 
+### Request fields
+
+Exactly one of `block_number` or `block_hash` must be provided. Passing both fields simultaneously is not allowed.
+
+| Field | Type | Description |
+|---|---|---|
+| `block_number` | `uint64` | Block number. Mutually exclusive with `block_hash` |
+| `block_hash` | `bytes32` | Block hash. Mutually exclusive with `block_number` |
+| `rpc_url` | `string` | RPC endpoint URL used to fetch block data |
+
+---
+
 ### POST /nitro
 
 Executes a block inside the AWS Nitro Enclave and returns a signed result.
@@ -68,6 +80,13 @@ Executes a block inside the AWS Nitro Enclave and returns a signed result.
 ```json
 {
   "block_number": 1234567,
+  "rpc_url": "https://your-rpc-endpoint"
+}
+```
+or
+```json
+{
+  "block_hash": "0x…",
   "rpc_url": "https://your-rpc-endpoint"
 }
 ```
@@ -96,6 +115,13 @@ Generates a Groth16 SP1 proof for a block. Returns HTTP 500 if `SP1_ELF_PATH` is
 ```json
 {
   "block_number": 1234567,
+  "rpc_url": "https://your-rpc-endpoint"
+}
+```
+or
+```json
+{
+  "block_hash": "0x…",
   "rpc_url": "https://your-rpc-endpoint"
 }
 ```

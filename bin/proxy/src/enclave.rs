@@ -258,6 +258,8 @@ async fn handle_key_management_request(
     // Whether we expect a response depends on whether this is a "create key" or
     // "load key" request. Only "create key" (no existing DEK) returns data.
     let expect_response = req.encrypted_data_key.is_none();
+    
+    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
     task::spawn_blocking(move || -> eyre::Result<Option<EnclaveResponse>> {
         let addr = VsockAddr::new(enclave_cid, enclave_port);

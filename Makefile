@@ -46,7 +46,7 @@ build-enclave:
 		--features nitro \
 		--no-default-features
 	tar -C $(CLIENT_DIR)/target/$(TARGET)/release/ -cf - $(BINARY) \
-		| docker import - $(BINARY)
+		| docker import --change "ENTRYPOINT [\"/$(BINARY)\"]" - $(BINARY)
 	nitro-cli build-enclave --docker-uri $(BINARY) --output-file $(EIF)
 
 ## Run enclave locally (debug)
@@ -54,7 +54,7 @@ run-enclave:
 	nitro-cli run-enclave \
 		--eif-path $(EIF_PATH) \
 		--cpu-count 2 \
-		--memory 256 \
+		--memory 512 \
 		--enclave-cid 10 \
 		--debug-mode
 
@@ -66,7 +66,7 @@ build-proxy:
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
 ## Build and run with both backends (Nitro + SP1)
-run: build-client build-proxy
+run: build-client build-enclave build-proxy
 	SP1_ELF_PATH=$(ELF_PATH) \
 	SP1_PROVER=$(SP1_PROVER) \
 	API_KEY=$(API_KEY) \

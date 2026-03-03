@@ -46,3 +46,7 @@ bin/client/elf/
 # Nitro enclave image
 *.eif
 *.elf
+
+attestation.bin
+data_key.enc
+public_key.hex

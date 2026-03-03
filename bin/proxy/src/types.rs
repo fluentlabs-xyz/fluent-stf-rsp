@@ -125,6 +125,6 @@ pub(crate) struct NitroConfig {
 
 impl Default for NitroConfig {
     fn default() -> Self {
-        Self { enclave_cid: 10, enclave_port: 5005, cpu_count: 2, memory_mib: 256 }
+        Self { enclave_cid: 10, enclave_port: 5005, cpu_count: 2, memory_mib: 4096 }
     }
 }
