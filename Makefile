@@ -16,7 +16,7 @@ EIF_PATH     ?= $(EIF)
 ELF_PATH     ?= $(ELF)
 API_KEY      ?= secret
 LISTEN_ADDR  ?= 0.0.0.0:8080
-SP1_PROVER   ?= cpu          # cpu | network
+SP1_PROVER   ?= network          # cpu | network
 TAG          ?= v0.5.3
 RUST_LOG 	 ?= info
 
@@ -77,10 +77,11 @@ run: build-client build-proxy
 ## Build and run with SP1 only (no Nitro)
 run-sp1-only: build-client build-proxy
 	SP1_ELF_PATH=$(ELF_PATH) \
-	SP1_PROVER=$(SP1_PROVER) \
+	SP1_PROVER=network \
 	API_KEY=$(API_KEY) \
 	LISTEN_ADDR=$(LISTEN_ADDR) \
 	RUST_LOG=$(RUST_LOG) \
+	NETWORK_PRIVATE_KEY=$(NETWORK_PRIVATE_KEY) \
 	./target/release/proxy
 
 # ─── Misc ─────────────────────────────────────────────────────────────────────

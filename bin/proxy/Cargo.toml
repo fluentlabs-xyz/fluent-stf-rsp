@@ -40,4 +40,4 @@ reth-evm-ethereum.workspace = true
 reth-ethereum-primitives.workspace = true
 
 # sp1
-sp1-sdk.workspace = true
+sp1-sdk = {workspace = true, features =["network"]}

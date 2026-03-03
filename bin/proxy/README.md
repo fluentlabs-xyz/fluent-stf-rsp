@@ -60,7 +60,7 @@ All requests must include the header:
 x-api-key: <API_KEY>
 ```
 
-### POST /block
+### POST /nitro
 
 Executes a block inside the AWS Nitro Enclave and returns a signed result.
 
@@ -88,7 +88,7 @@ Executes a block inside the AWS Nitro Enclave and returns a signed result.
 
 ---
 
-### POST /block/sp1-proof
+### POST /sp1
 
 Generates a Groth16 SP1 proof for a block. Returns HTTP 500 if `SP1_ELF_PATH` is not set.
 
@@ -119,6 +119,43 @@ ISP1Verifier(verifier).verifyProof(
     response.proof_bytes
 );
 ```
+
+---
+
+### POST /sp1-mock
+
+Returns a hardcoded Groth16 SP1 proof for block **316** on Fluent Devnet. Does not require `SP1_ELF_PATH` to be set. Useful for integration testing without a live prover.
+
+**Request**
+```json
+{
+  "block_number": 316,
+  "rpc_url": "https://your-rpc-endpoint"
+}
+```
+> The request body is accepted but ignored — the response is always the same hardcoded proof.
+
+**Response**
+```json
+{
+  "block_number": 316,
+  "block_hash":   "0x07d2de84641375cc25710327abfa4ed7a86a7cfeb560619d08ca4842e0cdd3d5",
+  "vk_hash":      "0x282233864d7d8e6f6c3a096b5dcc088d76367e553118e432197d3eb215a2023d",
+  "public_values": "0x…",
+  "proof_bytes":   "0x…"
+}
+```
+
+The response fields are identical in shape to `POST /block/sp1-proof` and can be passed directly to any `ISP1Verifier`-compatible contract:
+```solidity
+ISP1Verifier(verifier).verifyProof(
+    bytes32(response.vk_hash),
+    response.public_values,
+    response.proof_bytes
+);
+```
+
+> ⚠️ **Mock only.** This proof is real and was generated on Fluent Devnet, but it always corresponds to block 316 regardless of the requested `block_number`. Do not use in production.
 
 ---
 
