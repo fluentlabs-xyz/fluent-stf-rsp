@@ -8,7 +8,7 @@ pub use params::*;
 
 use aws_nitro_enclaves_nsm_api::{
     api::{Request, Response},
-    driver::{self},
+    driver,
 };
 
 use k256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -17,8 +17,9 @@ use k256::SecretKey;
 use rsp_client_executor::{
     executor::EthClientExecutor,
     io::EthClientExecutorInput,
-    nitro::{EnclaveRequest, EnclaveResponse, EthExecutionResponse},
+    
 };
+use nitro_types::{EnclaveRequest, EnclaveResponse, EthExecutionResponse};
 
 use ::vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 use serde_bytes::ByteBuf;
@@ -27,194 +28,233 @@ use std::sync::Arc;
 
 use crate::nitro::{kms::KmsClient, vsock::VsockChannel};
 
-/// Retrieves high-quality hardware entropy from the AWS Nitro Security Module (NSM).
-/// Used for secure key derivation inside the enclave.
-fn get_r_local() -> anyhow::Result<Vec<u8>> {
-    let nsm_fd = driver::nsm_init();
-    let request = Request::GetRandom;
-    let response = driver::nsm_process_request(nsm_fd, request);
-
-    let r_local = match response {
-        Response::GetRandom { random } => Ok(random),
-        _ => Err(anyhow::anyhow!("Failed to get entropy from NSM")),
-    }?;
-
-    driver::nsm_exit(nsm_fd);
-    Ok(r_local)
+/// The core enclave runtime. Encapsulates the full lifecycle:
+/// bind → handshake → process blocks.
+struct Enclave {
+    listener: VsockListener,
+    signing_key: SigningKey,
 }
 
-/// Derives a valid secp256k1 private key from entropy using HKDF.
-/// Ensures the resulting key is within the valid elliptic curve range.
-fn derive_valid_ecdsa_key(data_key: &[u8], r_local: &[u8]) -> anyhow::Result<[u8; 32]> {
-    let (_, hk) = Hkdf::<Sha256>::extract(Some(r_local), data_key);
-    let mut counter = 0u32;
+impl Enclave {
+    fn init() -> anyhow::Result<Self> {
+        let listener = VsockListener::bind(&VsockAddr::new(VMADDR_CID_ANY, VSOCK_PORT))
+            .context("Failed to bind VSOCK listener")?;
 
-    loop {
-        let mut candidate = [0u8; 32];
-        let info = format!("enclave-signing-key-v1-{}", counter);
+        let signing_key = Self::handshake(&listener)?;
 
-        hk.expand(info.as_bytes(), &mut candidate)
-            .map_err(|_| anyhow::anyhow!("KDF expansion failed"))?;
+        Ok(Self { listener, signing_key })
+    }
 
-        // Rejection sampling: ensure the key is valid for secp256k1
-        if SecretKey::from_slice(&candidate).is_ok() {
-            return Ok(candidate);
+    fn handshake(listener: &VsockListener) -> anyhow::Result<SigningKey> {
+        let mut channel =
+            VsockChannel::accept(listener).context("Failed to accept handshake connection")?;
+
+        let result = Self::try_handshake(&mut channel);
+
+        if let Err(ref e) = result {
+            let resp = EnclaveResponse::Error(format!("{e:#}"));
+            let _ = channel.send_bincode(&resp);
         }
 
-        counter += 1;
-        if counter > 100 {
-            return Err(anyhow::anyhow!("Failed to derive a valid key after 100 iterations"));
+        result
+    }
+
+    fn try_handshake(channel: &mut VsockChannel) -> anyhow::Result<SigningKey> {
+        let raw = channel.receive().context("Failed to receive handshake")?;
+        let req: EnclaveRequest =
+            bincode::deserialize(&raw).context("Failed to deserialize handshake")?;
+
+        let kms = KmsClient::new(req.credentials);
+
+        let (signing_key, resp) = match req.encrypted_data_key {
+            Some(blob) => Self::restore_key(&kms, &blob)?,
+            None => Self::generate_key(&kms)?,
+        };
+
+        channel.send_bincode(&resp).context("Failed to send handshake response")?;
+        Ok(signing_key)
+    }
+
+    /// Restores an existing signing key by decrypting the blob via KMS.
+    fn restore_key(
+        kms: &KmsClient,
+        encrypted_blob: &[u8],
+    ) -> anyhow::Result<(SigningKey, EnclaveResponse)> {
+        let key_bytes = kms.decrypt(encrypted_blob).context("KMS decrypt failed")?;
+        let signing_key = signing_key_from_bytes(&key_bytes)?;
+        let public_key = encode_public_key(&signing_key);
+
+        let resp = EnclaveResponse::KeyRestored { public_key };
+
+        Ok((signing_key, resp))
+    }
+
+    /// Generates a fresh signing key, encrypts it via KMS,
+    /// and produces an attestation document.
+    fn generate_key(kms: &KmsClient) -> anyhow::Result<(SigningKey, EnclaveResponse)> {
+        let (data_key, _) = kms.generate_data_key().context("KMS GenerateDataKey failed")?;
+        let r_local = get_nsm_entropy().context("Failed to get NSM entropy")?;
+
+        let key_bytes = derive_valid_ecdsa_key(&data_key, &r_local)?;
+        let encrypted = kms.encrypt(&key_bytes).context("KMS encrypt failed")?;
+
+        let signing_key = signing_key_from_bytes(&key_bytes)?;
+        let public_key = encode_public_key(&signing_key);
+        let attestation = create_attestation(&public_key)?;
+
+        let resp = EnclaveResponse::KeyGenerated {
+            encrypted_signing_key: encrypted,
+            attestation,
+            public_key,
+        };
+
+        Ok((signing_key, resp))
+    }
+
+    /// Main loop: accept connections, execute blocks, always reply.
+    fn run(&self) -> ! {
+        println!("Enclave ready to process block requests");
+
+        loop {
+            if let Err(e) = self.handle_one_block() {
+                eprintln!("Block session error: {e:#}");
+            }
         }
+    }
+
+    fn handle_one_block(&self) -> anyhow::Result<()> {
+        let mut channel =
+            VsockChannel::accept(&self.listener).context("Failed to accept block connection")?;
+
+        let result = self.try_execute_block(&mut channel);
+
+        if let Err(ref e) = result {
+            let err_resp = EnclaveResponse::Error(format!("{e:#}"));
+            let _ = channel.send_bincode(&err_resp);
+        }
+
+        result
+    }
+
+    fn try_execute_block(&self, channel: &mut VsockChannel) -> anyhow::Result<()> {
+        let raw = channel.receive().context("Failed to receive block input")?;
+        let input: EthClientExecutorInput =
+            bincode::deserialize(&raw).context("Failed to deserialize block input")?;
+
+        let output = execute_block(input, &self.signing_key)?;
+        channel.send_bincode(&output).context("Failed to send execution result")
     }
 }
 
-/// Handles initialization requests: either decrypts an existing key or generates a new one.
-fn handle_key_management_request(
-    req: EnclaveRequest,
-) -> anyhow::Result<(Vec<u8>, Option<Vec<u8>>)> {
-    use tracing::info;
-    let kms = KmsClient::new(req.credentials);
+// ---------------------------------------------------------------------------
+// Pure helper functions
+// ---------------------------------------------------------------------------
 
-    match req.encrypted_data_key {
-        Some(encrypted_data_key) => {
-            info!("Decrypting existing signing key from KMS");
-            let signing_key = kms.decrypt(&encrypted_data_key)?;
-            Ok((signing_key, None))
-        }
-        None => {
-            info!("Generating new signing key and encrypting it via KMS");
-            let (data_key, _) = kms.generate_data_key()?;
-            let r_local = get_r_local()?;
-
-            let signing_key = derive_valid_ecdsa_key(&data_key, &r_local)?;
-            let encrypted_signing_key = kms.encrypt(&signing_key)?;
-
-            Ok((signing_key.to_vec(), Some(encrypted_signing_key)))
-        }
-    }
-}
-
-/// Processes a single Ethereum block execution request.
-/// Includes deserialization, execution, hashing of results, and signing.
-fn process_block_request(listener: &VsockListener, signing_key: &SigningKey) -> anyhow::Result<()> {
-    // Accept incoming connection for a new block request
-    let mut stream = VsockChannel::accept(listener).context("Failed to accept vsock connection")?;
-
-    // Receive and deserialize input data
-    let raw_input = stream.receive().context("Failed to receive data")?;
-    let input: EthClientExecutorInput = bincode::deserialize(&raw_input)
-        .map_err(|e| anyhow::anyhow!("Input deserialization failed: {}", e))?;
-
-    // Initialize the Ethereum executor
+fn execute_block(
+    input: EthClientExecutorInput,
+    signing_key: &SigningKey,
+) -> anyhow::Result<EthExecutionResponse> {
     let genesis = (&input.genesis)
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid genesis configuration"))?;
 
     let executor = EthClientExecutor::eth(Arc::new(genesis), input.custom_beneficiary);
 
-    // Execute the client logic
-    let (header, events_hash) =
-        executor.execute(input).map_err(|e| anyhow::anyhow!("Block execution failed: {:?}", e))?;
+    let (header, events_hash) = executor
+        .execute(input)
+        .map_err(|e| anyhow::anyhow!("Block execution failed: {e:?}"))?;
 
     let block_hash = header.hash_slow();
     let parent_hash = header.parent_hash;
 
-    // Compute hashes for commitment and signing
-    let mut common_hasher = Sha256::new();
-    common_hasher.update(parent_hash.as_slice());
-    common_hasher.update(block_hash.as_slice());
-    common_hasher.update(events_hash.withdrawal_hash.as_slice());
-    common_hasher.update(events_hash.deposit_hash.as_slice());
+    let mut hasher = Sha256::new();
+    hasher.update(parent_hash.as_slice());
+    hasher.update(block_hash.as_slice());
+    hasher.update(events_hash.withdrawal_hash.as_slice());
+    hasher.update(events_hash.deposit_hash.as_slice());
 
-    let result_hash = common_hasher.clone().finalize();
+    let result_hash = hasher.clone().finalize();
 
-    // The signing payload includes the execution result hash
-    let mut signing_hasher = common_hasher;
-    signing_hasher.update(result_hash);
-    let signing_payload = signing_hasher.finalize();
+    hasher.update(result_hash);
+    let signing_payload = hasher.finalize();
 
-    // Sign the resulting payload
     let signature: Signature = signing_key.sign(&signing_payload);
 
-    // Prepare response structure
-    let output = EthExecutionResponse {
+    Ok(EthExecutionResponse {
         parent_hash,
         block_hash,
         withdrawal_hash: events_hash.withdrawal_hash,
         deposit_hash: events_hash.deposit_hash,
         result_hash: result_hash.to_vec(),
         signature: signature.to_vec(),
-    };
-
-    // Send the serialized output back to the host
-    stream.send_bincode(&output).context("Failed to send execution output")?;
-
-    Ok(())
+    })
 }
 
-pub fn main() -> anyhow::Result<()> {
-    println!("Nitro enclave started");
+fn signing_key_from_bytes(bytes: &[u8]) -> anyhow::Result<SigningKey> {
+    let secret = SecretKey::from_bytes(bytes.into()).context("Invalid secp256k1 key bytes")?;
+    Ok(SigningKey::from(secret))
+}
 
-    let addr = VsockAddr::new(VMADDR_CID_ANY, VSOCK_PORT);
-    let listener = VsockListener::bind(&addr).context("Failed to bind vsock listener")?;
-    println!("Listener bound to port {}", VSOCK_PORT);
+fn encode_public_key(key: &SigningKey) -> Vec<u8> {
+    key.verifying_key().to_encoded_point(false).as_bytes().to_vec()
+}
 
-    // Step 1: Initial Handshake (Key Management)
-    // This part runs once to set up the signing identity of the enclave.
-    let mut init_stream = VsockChannel::accept(&listener)?;
+fn get_nsm_entropy() -> anyhow::Result<Vec<u8>> {
+    let fd = driver::nsm_init();
+    let response = driver::nsm_process_request(fd, Request::GetRandom);
+    driver::nsm_exit(fd);
 
-    let req: EnclaveRequest = bincode::deserialize(&init_stream.receive()?).map_err(|e| {
-        let resp = EnclaveResponse::Error(format!("Handshake deserialize error: {}", e));
-        let _ = init_stream.send_bincode(&resp);
-        anyhow::anyhow!("Handshake failed: {}", e)
-    })?;
-
-    let (signing_key_bin, encrypted_signing_key) = handle_key_management_request(req)?;
-
-    let secret_key = SecretKey::from_bytes(signing_key_bin.as_slice().into())
-        .map_err(|e| anyhow::anyhow!("Failed to reconstruct secret key: {}", e))?;
-    let signing_key = SigningKey::from(secret_key);
-
-    // If a new key was generated, provide an attestation document to the host
-    if let Some(encrypted_key) = encrypted_signing_key {
-        let signing_pub_key_bytes =
-            signing_key.verifying_key().to_encoded_point(false).as_bytes().to_vec();
-
-        let nsm_fd = driver::nsm_init();
-        let response = driver::nsm_process_request(
-            nsm_fd,
-            Request::Attestation {
-                public_key: None,
-                user_data: Some(ByteBuf::from(signing_pub_key_bytes.clone())),
-                nonce: None,
-            },
-        );
-
-        let attestation_doc = match response {
-            Response::Attestation { document } => Ok(document),
-            _ => Err(anyhow::anyhow!("Attestation failed")),
-        }?;
-        driver::nsm_exit(nsm_fd);
-
-        let resp = EnclaveResponse::EncryptedDataKey {
-            encrypted_signing_key: encrypted_key,
-            attestation: attestation_doc,
-            public_key: signing_pub_key_bytes,
-        };
-
-        init_stream.send_bincode(&resp)?;
+    match response {
+        Response::GetRandom { random } => Ok(random),
+        _ => Err(anyhow::anyhow!("NSM GetRandom returned unexpected response")),
     }
+}
 
-    // Explicitly drop the initialization stream to free resources
-    drop(init_stream);
+fn create_attestation(public_key: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let fd = driver::nsm_init();
+    let response = driver::nsm_process_request(
+        fd,
+        Request::Attestation {
+            public_key: None,
+            user_data: Some(ByteBuf::from(public_key.to_vec())),
+            nonce: None,
+        },
+    );
+    driver::nsm_exit(fd);
 
-    // Step 2: Main Execution Loop
-    // Continues running and processing block requests until the enclave is terminated.
-    println!("Enclave ready to process block requests");
-    loop {
-        if let Err(e) = process_block_request(&listener, &signing_key) {
-            // Log error but keep the loop running for the next connection
-            eprintln!("Error processing session: {:?}", e);
+    match response {
+        Response::Attestation { document } => Ok(document),
+        _ => Err(anyhow::anyhow!("NSM Attestation failed")),
+    }
+}
+
+fn derive_valid_ecdsa_key(data_key: &[u8], r_local: &[u8]) -> anyhow::Result<[u8; 32]> {
+    let (_, hk) = Hkdf::<Sha256>::extract(Some(r_local), data_key);
+
+    for counter in 0..=100u32 {
+        let mut candidate = [0u8; 32];
+        let info = format!("enclave-signing-key-v1-{counter}");
+
+        hk.expand(info.as_bytes(), &mut candidate)
+            .map_err(|_| anyhow::anyhow!("HKDF expansion failed"))?;
+
+        if SecretKey::from_slice(&candidate).is_ok() {
+            return Ok(candidate);
         }
     }
+
+    Err(anyhow::anyhow!("Failed to derive valid key after 100 iterations"))
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+pub fn main() -> anyhow::Result<()> {
+    println!("Nitro enclave starting");
+
+    let enclave = Enclave::init().context("Enclave initialization failed")?;
+
+    println!("Initialization complete");
+    enclave.run();
 }

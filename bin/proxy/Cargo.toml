@@ -29,6 +29,7 @@ rsp-provider.workspace = true
 rsp-host-executor = { workspace = true, features = ["sp1"] }
 rsp-primitives = { workspace = true, default-features = false }
 rsp-client-executor.workspace = true
+nitro-types.workspace = true
 
 # alloy
 alloy-provider.workspace = true
@@ -41,3 +42,7 @@ reth-ethereum-primitives.workspace = true
 
 # sp1
 sp1-sdk = {workspace = true, features =["network"]}
+
+
+aws-config = { version = "1"}
+aws-credential-types = "1"

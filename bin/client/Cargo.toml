@@ -39,6 +39,7 @@ nitro = [
     "dep:rustls",
     "dep:webpki-roots",
     "rsp-client-executor/nitro",
+    "dep:nitro-types"
 ]
 
 [dependencies]
@@ -53,7 +54,7 @@ log = { version = "0.4", features = ["max_level_off", "release_max_level_off"] }
 tracing = { version = "0.1", features = ["max_level_off", "release_max_level_off"] }
 
 rsp-client-executor = { path = "../../crates/executor/client", features = [] }
-
+nitro-types = { path = "../../crates/nitro-types", optional = true }
 # sp1
 sp1-zkvm = { version = "6.0.1", optional = true }
 

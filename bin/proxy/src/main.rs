@@ -23,9 +23,9 @@ mod enclave;
 mod types;
 
 use crate::{
-    enclave::maybe_restart_enclave,
-    types::{EthExecutionResponse, NitroConfig, Sp1ProofResponse},
+    enclave::maybe_restart_enclave, types::{NitroConfig, Sp1ProofResponse},
 };
+use nitro_types::{EthExecutionResponse};
 
 use std::{
     io::{Read, Write},

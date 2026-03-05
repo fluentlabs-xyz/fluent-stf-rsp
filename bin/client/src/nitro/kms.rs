@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use hmac::{Hmac, Mac};
-use rsp_client_executor::nitro::AwsCredentials;
+use nitro_types::AwsCredentials;
 use rustls::{ClientConfig, ClientConnection, OwnedTrustAnchor, RootCertStore, StreamOwned};
 use sha2::{Digest, Sha256};
 use std::{

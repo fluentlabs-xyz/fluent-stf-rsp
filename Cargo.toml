@@ -11,7 +11,7 @@ members = [
     "crates/provider",
     "crates/storage/rpc-db",
     "crates/storage/witness-db",
-    "bin/aws-nitro-validator/script",
+    "bin/aws-nitro-validator/script", "crates/nitro-types",
 ]
 exclude = []
 resolver = "2"
@@ -71,6 +71,7 @@ rsp-host-executor = { path = "./crates/executor/host", default-features = false 
 rsp-mpt = { path = "./crates/mpt" }
 rsp-primitives = { path = "./crates/primitives" }
 rsp-provider = { path = "./crates/provider" }
+nitro-types = { path = "./crates/nitro-types" }
 
 # --- sp1 ---
 sp1-build = "6.0.1"

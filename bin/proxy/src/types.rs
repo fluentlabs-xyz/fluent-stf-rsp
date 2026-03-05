@@ -1,78 +1,8 @@
-use revm_primitives::FixedBytes;
-
-// ---------------------------------------------------------------------------
-// AWS credentials
-// ---------------------------------------------------------------------------
-
-/// AWS credentials forwarded to the enclave so it can call KMS for key
-/// wrapping / unwrapping.  Passed as part of every [`EnclaveRequest`].
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct AwsCredentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    /// Present when using temporary STS credentials (e.g. an EC2 instance profile).
-    pub session_token: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Nitro enclave protocol
-// ---------------------------------------------------------------------------
-
-/// Request sent to the enclave over VSOCK for key management.
-///
-/// - `encrypted_data_key = None`  → the enclave generates a fresh signing key, wraps it with KMS,
-///   and returns the ciphertext.
-/// - `encrypted_data_key = Some`  → the enclave unwraps the existing key with KMS and loads it into
-///   memory; no response is sent back.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct EnclaveRequest {
-    pub credentials: AwsCredentials,
-    pub encrypted_data_key: Option<Vec<u8>>,
-}
-
-/// Response returned by the enclave after generating a new signing key.
-/// Only sent when `EnclaveRequest::encrypted_data_key` is `None`.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) enum EnclaveResponse {
-    /// The enclave successfully generated and wrapped a signing key.
-    EncryptedDataKey {
-        /// KMS-wrapped signing key ciphertext.  Persist this to disk.
-        encrypted_signing_key: Vec<u8>,
-        /// The corresponding secp256k1 public key (uncompressed, 65 bytes).
-        public_key: Vec<u8>,
-        /// Raw NSM attestation document for the current enclave instance.
-        attestation: Vec<u8>,
-    },
-    /// The enclave encountered an error; the string contains the reason.
-    Error(String),
-}
-
-// ---------------------------------------------------------------------------
-// Nitro block execution result
-// ---------------------------------------------------------------------------
-
-/// Result of Ethereum block execution returned by the Nitro enclave.
-///
-/// The enclave signs `result_hash` with its loaded signing key and returns
-/// the signature so callers can verify execution was performed inside a
-/// genuine, attested enclave.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct EthExecutionResponse {
-    pub parent_hash: FixedBytes<32>,
-    pub block_hash: FixedBytes<32>,
-    /// Hash of the EIP-4895 withdrawals root (`0x0` pre-Shanghai).
-    pub withdrawal_hash: FixedBytes<32>,
-    /// Hash of the EIP-6110 deposit receipts root (`0x0` pre-Prague).
-    pub deposit_hash: FixedBytes<32>,
-    /// Keccak256 of the full execution result committed by the enclave.
-    pub result_hash: Vec<u8>,
-    /// ECDSA signature over `result_hash` produced by the enclave signing key.
-    pub signature: Vec<u8>,
-}
-
 // ---------------------------------------------------------------------------
 // SP1 proof result
 // ---------------------------------------------------------------------------
+
+use {revm_primitives::FixedBytes};
 
 /// Everything a Solidity contract needs to call `ISP1Verifier.verifyProof()`.
 ///

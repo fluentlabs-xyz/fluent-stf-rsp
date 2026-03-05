@@ -8,8 +8,6 @@ pub mod evm;
 pub mod error;
 mod events_hash;
 pub mod executor;
-#[cfg(feature = "nitro")]
-pub mod nitro;
 pub mod tracking;
 
 mod into_primitives;

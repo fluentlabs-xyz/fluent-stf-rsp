@@ -15,7 +15,17 @@ pub struct EnclaveRequest {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum EnclaveResponse {
-    EncryptedDataKey { encrypted_signing_key: Vec<u8>, public_key: Vec<u8>, attestation: Vec<u8> },
+    /// A brand-new signing key was generated, encrypted via KMS, and attested.
+    KeyGenerated {
+        encrypted_signing_key: Vec<u8>,
+        attestation: Vec<u8>,
+        public_key: Vec<u8>,
+    },
+    /// An existing encrypted key was successfully decrypted and loaded.
+    KeyRestored {
+        public_key: Vec<u8>,
+    },
+    /// Something went wrong inside the enclave.
     Error(String),
 }
 
