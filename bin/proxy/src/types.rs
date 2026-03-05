@@ -88,11 +88,6 @@ pub(crate) struct EthExecutionResponse {
 /// but are included for indexing and sanity checks on the caller side.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Sp1ProofResponse {
-    // -- Indexing convenience ------------------------------------------------
-    pub block_number: u64,
-    /// Keccak256 block hash, read back from the SP1 public values.
-    pub block_hash: FixedBytes<32>,
-
     // -- Required by ISP1Verifier.verifyProof() ------------------------------
     /// `bytes32` program verification key hash — first argument to `verifyProof`.
     pub vk_hash: FixedBytes<32>,
@@ -125,6 +120,6 @@ pub(crate) struct NitroConfig {
 
 impl Default for NitroConfig {
     fn default() -> Self {
-        Self { enclave_cid: 10, enclave_port: 5005, cpu_count: 2, memory_mib: 4096 }
+        Self { enclave_cid: 10, enclave_port: 5005, cpu_count: 2, memory_mib: 1024 }
     }
 }

@@ -5,9 +5,11 @@
 //! 1. **Nitro enclave** (`POST /nitro`) — executes an Ethereum block inside an AWS Nitro Enclave
 //!    and returns a signed execution result.
 //!
-//! 2. **SP1 prover** (`POST /sp1`) — executes the same block inside the SP1 zkVM and
+//! 2. **SP1 prover** — executes the same block inside the SP1 zkVM and
 //!    returns a Groth16 proof that can be verified on-chain by any `ISP1Verifier`-compatible
 //!    contract.
+//!    - `POST /sp1/request` — submits a block for async proof generation, returns a `request_id`.
+//!    - `POST /sp1/status`  — polls by `request_id`, returns the proof when ready.
 //!
 //! Both endpoints share the same block-fetching and host-execution pipeline
 //! ([`build_client_input`]) and are protected by an API key middleware.
@@ -39,7 +41,7 @@ use axum::{
     routing::post,
     Router,
 };
-use revm_primitives::{B256, FixedBytes, hex};
+use revm_primitives::{B256, FixedBytes, hex::{self, FromHex}};
 use rsp_primitives::genesis::Genesis;
 use url::Url;
 
@@ -54,8 +56,8 @@ use rsp_host_executor::{create_eth_block_execution_strategy_factory, HostExecuto
 use rsp_provider::create_provider;
 
 use sp1_sdk::{
-    env::{EnvProver, EnvProvingKey},
-    Elf, HashableKey, Prover, ProverClient, ProvingKey, SP1Stdin,
+    network::{prover::NetworkProver, NetworkMode},
+    Elf, HashableKey, Prover, ProverClient, ProvingKey, SP1ProvingKey, SP1Stdin,
 };
 
 use sp1_sdk::ProveRequest;
@@ -96,9 +98,9 @@ struct NitroState {
 /// SP1-specific state initialised once at startup and shared across requests.
 #[derive(Clone)]
 struct Sp1State {
-    client: Arc<EnvProver>,
+    client: Arc<NetworkProver>,
     /// Proving key derived from the compiled zkVM ELF.
-    pk: Arc<EnvProvingKey>,
+    pk: Arc<SP1ProvingKey>,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +112,16 @@ struct BlockRequest {
     block_number: Option<u64>,
     block_hash: Option<B256>,
     rpc_url: String,
+}
+
+#[derive(Deserialize)]
+struct Sp1StatusRequest {
+    request_id: B256,
+}
+
+#[derive(Serialize)]
+struct Sp1RequestResponse {
+    request_id: B256,
 }
 
 #[derive(Serialize)]
@@ -157,7 +169,7 @@ async fn require_api_key(
 /// Fetches `block_number` from `rpc_url` and runs the host-side execution
 /// phase to produce a [`ClientExecutorInput`] ready for either backend.
 ///
-/// This is intentionally shared between [`block`] and [`block_sp1_proof`] so
+/// This is intentionally shared between [`block`] and [`block_sp1_request`] so
 /// the two endpoints always use identical witness data.
 async fn build_client_input(
     req: BlockRequest,
@@ -218,55 +230,125 @@ async fn block(
 }
 
 // ---------------------------------------------------------------------------
-// Handler: POST /sp1  —  SP1 Groth16 proof generation
+// Handler: POST /sp1/request  —  submit async SP1 proof request
 // ---------------------------------------------------------------------------
 
-/// Executes `block_number` inside the SP1 zkVM and returns a Groth16
-/// [`Sp1ProofResponse`] that can be verified on-chain.
-///
-/// Returns HTTP 500 if the server was started without `SP1_ELF_PATH`.
-async fn block_sp1_proof(
+/// Builds client input for the given block, submits it to the SP1 prover
+/// asynchronously, and returns the `request_id` for later polling.
+async fn block_sp1_request(
     State(state): State<AppState>,
     Json(req): Json<BlockRequest>,
-) -> Result<Json<Sp1ProofResponse>, HandlerError> {
+) -> Result<Json<Sp1RequestResponse>, HandlerError> {
     let sp1 = state
         .sp1
         .as_ref()
         .ok_or_else(|| internal("SP1 prover not configured (set SP1_ELF_PATH)"))?;
 
     let client_input = build_client_input(req, &state).await?;
-    let expected_block_hash = client_input.current_block.header.hash_slow();
+    let block_number = client_input.current_block.number;
 
-    let response = process_sp1_client(client_input, sp1.clone())
+    let mut stdin = SP1Stdin::new();
+    stdin.write_vec(
+        bincode::serialize(&client_input)
+            .map_err(|e| internal(format!("Failed to serialize client input: {e}")))?,
+    );
+
+    info!(block_number, "Submitting async SP1 Groth16 proof request");
+
+    let request_id: B256 = sp1
+        .client
+        .prove(sp1.pk.as_ref(), stdin)
+        .groth16()
+        .request()
         .await
-        .map_err(|e| internal(format!("SP1 proof generation failed: {e}")))?;
+        .map_err(|e| internal(format!("Failed to submit proof request: {e}")))?;
 
-    if response.block_hash != expected_block_hash {
-        return Err(internal(format!(
-            "Block hash mismatch: requested {}, proof contains {}",
-            hex::encode(expected_block_hash),
-            hex::encode(response.block_hash),
-        )));
-    }
+    info!(block_number, request_id = %hex::encode(request_id), "SP1 proof request submitted");
 
-    Ok(Json(response))
+    Ok(Json(Sp1RequestResponse { request_id }))
 }
 
 // ---------------------------------------------------------------------------
-// Handler: POST /sp1/mock  —  hardcoded SP1 proof response
+// Handler: POST /sp1/status  —  poll for SP1 proof result
 // ---------------------------------------------------------------------------
 
-/// Returns a hardcoded [`Sp1ProofResponse`] for testing purposes.
-/// Does not require SP1_ELF_PATH to be set.
-async fn block_sp1_proof_mock(
+/// Checks the status of a previously submitted SP1 proof request.
+///
+/// - **200** — proof is ready, body contains [`Sp1ProofResponse`].
+/// - **202** — proof is still being generated (empty body).
+/// - **404** — `request_id` not found on the SP1 network.
+async fn block_sp1_status(
+    State(state): State<AppState>,
+    Json(req): Json<Sp1StatusRequest>,
+) -> impl IntoResponse {
+    let sp1 = match state.sp1.as_ref() {
+        Some(s) => s,
+        None => return internal("SP1 prover not configured (set SP1_ELF_PATH)").into_response(),
+    };
+
+    let (status, maybe_proof) = match sp1.client.get_proof_status(req.request_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Proof not found for request_id {}: {e}",
+                        hex::encode(req.request_id)
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let proof = match maybe_proof {
+        None => {
+            info!(request_id = %hex::encode(req.request_id), ?status, "SP1 proof still pending");
+            return StatusCode::ACCEPTED.into_response();
+        }
+        Some(p) => p,
+    };
+
+    info!(request_id = %hex::encode(req.request_id), "SP1 proof ready");
+
+    let public_values = proof.public_values.as_slice().to_vec();
+
+    let proof_bytes = match bincode::serialize(&proof.proof) {
+        Ok(b) => b,
+        Err(e) => return internal(format!("Failed to serialize proof: {e}")).into_response(),
+    };
+
+    let vk_hash = FixedBytes::from(sp1.pk.verifying_key().hash_bytes());
+
+    (StatusCode::OK, Json(Sp1ProofResponse { vk_hash, public_values, proof_bytes })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handler: POST /sp1/mock/request  —  mock request_id generation
+// ---------------------------------------------------------------------------
+
+/// Generates a random `request_id` and returns it as if an SP1 proof request
+/// had been submitted.  Does not require `SP1_ELF_PATH`.
+async fn block_sp1_mock_request(
     State(_): State<AppState>,
     Json(_): Json<BlockRequest>,
+) -> Result<Json<Sp1RequestResponse>, HandlerError> {
+    let request_id = B256::from_hex("0x137").unwrap_or_default();
+
+    Ok(Json(Sp1RequestResponse { request_id }))
+}
+
+// ---------------------------------------------------------------------------
+// Handler: POST /sp1/mock/status  —  hardcoded SP1 proof response
+// ---------------------------------------------------------------------------
+
+/// Returns a hardcoded [`Sp1ProofResponse`] for testing purposes, regardless
+/// of the `request_id` provided.  Does not require `SP1_ELF_PATH`.
+async fn block_sp1_mock_status(
+    State(_): State<AppState>,
+    Json(_): Json<Sp1StatusRequest>,
 ) -> Result<Json<Sp1ProofResponse>, HandlerError> {
-    let block_hash = FixedBytes::from([
-        0x07, 0xd2, 0xde, 0x84, 0x64, 0x13, 0x75, 0xcc, 0x25, 0x71, 0x03, 0x27, 0xab, 0xfa, 0x4e,
-        0xd7, 0xa8, 0x6a, 0x7c, 0xfe, 0xb5, 0x60, 0x61, 0x9d, 0x08, 0xca, 0x48, 0x42, 0xe0, 0xcd,
-        0xd3, 0xd5,
-    ]);
     let vk_hash = FixedBytes::from([
         0x28, 0x22, 0x33, 0x86, 0x4d, 0x7d, 0x8e, 0x6f, 0x6c, 0x3a, 0x09, 0x6b, 0x5d, 0xcc, 0x08,
         0x8d, 0x76, 0x36, 0x7e, 0x55, 0x31, 0x18, 0xe4, 0x32, 0x19, 0x7d, 0x3e, 0xb2, 0x15, 0xa2,
@@ -364,8 +446,6 @@ async fn block_sp1_proof_mock(
     ];
 
     Ok(Json(Sp1ProofResponse {
-        block_number: 316,
-        block_hash,
         vk_hash,
         public_values,
         proof_bytes,
@@ -460,50 +540,6 @@ async fn process_nitro_client(
 }
 
 // ---------------------------------------------------------------------------
-// SP1 proof generation
-// ---------------------------------------------------------------------------
-
-/// Serialises `client_input` into SP1 stdin and generates a Groth16 proof.
-async fn process_sp1_client(
-    client_input: ClientExecutorInput<EthPrimitives>,
-    sp1: Sp1State,
-) -> eyre::Result<Sp1ProofResponse> {
-    let block_number = client_input.current_block.number;
-
-    let mut stdin = SP1Stdin::new();
-    stdin.write_vec(
-        bincode::serialize(&client_input)
-            .map_err(|e| eyre::eyre!("Failed to serialize client input: {e}"))?,
-    );
-
-    info!(block_number, "Starting SP1 Groth16 proof generation");
-
-    let proof = sp1
-        .client
-        .prove(sp1.pk.as_ref(), stdin)
-        .groth16()
-        .await
-        .map_err(|e| eyre::eyre!("Proving failed: {e}"))?;
-
-    info!(block_number, "SP1 proof generated successfully");
-
-    let public_values = proof.public_values.as_slice().to_vec();
-
-    let block_hash = {
-        let mut pv = proof.public_values.clone();
-        let _parent_hash: FixedBytes<32> = pv.read();
-        pv.read::<FixedBytes<32>>()
-    };
-
-    let proof_bytes = bincode::serialize(&proof.proof)
-        .map_err(|e| eyre::eyre!("Failed to serialize proof: {e}"))?;
-
-    let vk_hash = FixedBytes::from(sp1.pk.verifying_key().hash_bytes());
-
-    Ok(Sp1ProofResponse { block_number, block_hash, vk_hash, public_values, proof_bytes })
-}
-
-// ---------------------------------------------------------------------------
 // Entry-point
 // ---------------------------------------------------------------------------
 
@@ -548,14 +584,12 @@ async fn main() -> eyre::Result<()> {
     // SP1 initialisation
     //
     //   SP1_ELF_PATH            path to the compiled zkVM ELF (required to enable SP1)
-    //   SP1_PROVER              "cpu" (default) | "network"
-    //   SP1_PRIVATE_KEY         required when SP1_PROVER=network
-    //   SP1_PROVER_NETWORK_RPC  optional custom RPC
+    //   SP1_PRIVATE_KEY         required for network prover authentication
     // -----------------------------------------------------------------------
 
     let sp1 = match std::env::var("SP1_ELF_PATH") {
         Err(_) => {
-            info!("SP1_ELF_PATH not set — /sp1 endpoint disabled");
+            info!("SP1_ELF_PATH not set — /sp1 endpoints disabled");
             None
         }
         Ok(elf_path) => {
@@ -564,7 +598,10 @@ async fn main() -> eyre::Result<()> {
                     .map_err(|e| eyre::eyre!("Failed to read SP1 ELF {elf_path}: {e}"))?,
             );
 
-            let client = ProverClient::from_env().await;
+            let client = ProverClient::builder()
+                .network_for(NetworkMode::Mainnet)
+                .build()
+                .await;
             let pk = client.setup(elf).await.unwrap();
             let vk = pk.verifying_key();
 
@@ -578,13 +615,21 @@ async fn main() -> eyre::Result<()> {
         eyre::bail!("No backends configured: provide --eif_path and/or SP1_ELF_PATH");
     }
 
-    let state =
-        AppState { api_key, nitro, block_execution_strategy_factory, genesis, chain_spec, sp1 };
+    let state = AppState {
+        api_key,
+        nitro,
+        block_execution_strategy_factory,
+        genesis,
+        chain_spec,
+        sp1,
+    };
 
     let app = Router::new()
         .route("/nitro", post(block))
-        .route("/sp1", post(block_sp1_proof))
-        .route("/sp1-mock", post(block_sp1_proof_mock))
+        .route("/sp1/request", post(block_sp1_request))
+        .route("/sp1/status", post(block_sp1_status))
+        .route("/sp1/mock/request", post(block_sp1_mock_request))
+        .route("/sp1/mock/status", post(block_sp1_mock_status))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .with_state(state);
 

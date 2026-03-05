@@ -4,8 +4,11 @@ An HTTP proxy that exposes two Ethereum block execution backends behind a single
 
 | Endpoint | Backend | Output |
 |---|---|---|
-| `POST /block` | AWS Nitro Enclave | Signed execution result |
-| `POST /block/sp1-proof` | SP1 zkVM (local or network) | Groth16 proof for on-chain verification |
+| `POST /nitro` | AWS Nitro Enclave | Signed execution result |
+| `POST /sp1/request` | SP1 zkVM (network) | `request_id` for async Groth16 proof |
+| `POST /sp1/status` | SP1 zkVM (network) | Proof result by `request_id` |
+| `POST /sp1/mock/request` | — | Random `request_id` (testing) |
+| `POST /sp1/mock/status` | — | Hardcoded proof (testing) |
 
 ---
 
@@ -15,12 +18,13 @@ Caller ──► proxy ──► host-executor (fetch block + witnesses from RPC
                       │
                       ├──► Nitro enclave  (VSOCK)  ──► signed EthExecutionResponse
                       │
-                      └──► SP1 prover              ──► Groth16 Sp1ProofResponse
+                      └──► SP1 network prover      ──► async Groth16 Sp1ProofResponse
 ```
 
-1. Both endpoints call the same `build_client_input` helper which fetches the block from the provided RPC URL and runs the host-side execution phase.
+1. Both backends call the same `build_client_input` helper which fetches the block from the provided RPC URL and runs the host-side execution phase.
 2. The resulting `ClientExecutorInput` is forwarded to the selected backend.
-3. The response is validated (block hash check) before being returned to the caller.
+3. For Nitro — the response is validated (block/parent hash check) and returned immediately.
+4. For SP1 — proof generation is **asynchronous**: the caller receives a `request_id` and polls `/sp1/status` until the proof is ready.
 
 ---
 
@@ -46,10 +50,8 @@ proxy --eif_path /path/to/enclave.eif
 | `DATA_KEY_STORAGE` | `./data_key.enc` | Path to the KMS-encrypted data key |
 | `ATTESTATION_STORAGE` | `./attestation.bin` | Path to the NSM attestation document |
 | `PUBLIC_KEY_STORAGE` | `./public_key.hex` | Path to the enclave's hex-encoded ECDSA public key |
-| `SP1_ELF_PATH` | *(unset — endpoint disabled)* | Path to compiled SP1 zkVM ELF |
-| `SP1_PROVER` | `cpu` | `cpu` or `network` |
-| `SP1_PRIVATE_KEY` | — | Required when `SP1_PROVER=network` |
-| `SP1_PROVER_NETWORK_RPC` | `https://rpc.production.succinct.xyz` | Custom prover network RPC |
+| `SP1_ELF_PATH` | *(unset — SP1 endpoints disabled)* | Path to compiled SP1 zkVM ELF |
+| `SP1_PRIVATE_KEY` | — | Required for Succinct network prover authentication |
 
 ---
 
@@ -60,7 +62,7 @@ All requests must include the header:
 x-api-key: <API_KEY>
 ```
 
-### Request fields
+### Request fields (block selection)
 
 Exactly one of `block_number` or `block_hash` must be provided. Passing both fields simultaneously is not allowed.
 
@@ -74,19 +76,12 @@ Exactly one of `block_number` or `block_hash` must be provided. Passing both fie
 
 ### POST /nitro
 
-Executes a block inside the AWS Nitro Enclave and returns a signed result.
+Executes a block inside the AWS Nitro Enclave and returns a signed result. Requires `--eif_path` at startup.
 
 **Request**
 ```json
 {
   "block_number": 1234567,
-  "rpc_url": "https://your-rpc-endpoint"
-}
-```
-or
-```json
-{
-  "block_hash": "0x…",
   "rpc_url": "https://your-rpc-endpoint"
 }
 ```
@@ -107,9 +102,9 @@ or
 
 ---
 
-### POST /sp1
+### POST /sp1/request
 
-Generates a Groth16 SP1 proof for a block. Returns HTTP 500 if `SP1_ELF_PATH` is not set.
+Submits a block for asynchronous Groth16 proof generation on the Succinct prover network. Returns a `request_id` for polling. Requires `SP1_ELF_PATH` to be set.
 
 **Request**
 ```json
@@ -118,22 +113,41 @@ Generates a Groth16 SP1 proof for a block. Returns HTTP 500 if `SP1_ELF_PATH` is
   "rpc_url": "https://your-rpc-endpoint"
 }
 ```
-or
-```json
-{
-  "block_hash": "0x…",
-  "rpc_url": "https://your-rpc-endpoint"
-}
-```
 
 **Response**
 ```json
 {
-  "block_number": 1234567,
-  "block_hash":  "0x…",
-  "vk_hash":     "0x…",
-  "public_values": "0x…",
-  "proof_bytes": "0x…"
+  "request_id": "0x…"
+}
+```
+
+---
+
+### POST /sp1/status
+
+Polls the status of a previously submitted proof request.
+
+**Request**
+```json
+{
+  "request_id": "0x…"
+}
+```
+
+**Response codes**
+
+| Status | Meaning | Body |
+|---|---|---|
+| `200 OK` | Proof is ready | `Sp1ProofResponse` (see below) |
+| `202 Accepted` | Proof is still being generated | *(empty)* |
+| `404 Not Found` | `request_id` not found on the SP1 network | `{ "error": "..." }` |
+
+**200 response**
+```json
+{
+  "vk_hash":        "0x…",
+  "public_values":  "0x…",
+  "proof_bytes":    "0x…"
 }
 ```
 
@@ -148,9 +162,9 @@ ISP1Verifier(verifier).verifyProof(
 
 ---
 
-### POST /sp1-mock
+### POST /sp1/mock/request
 
-Returns a hardcoded Groth16 SP1 proof for block **316** on Fluent Devnet. Does not require `SP1_ELF_PATH` to be set. Useful for integration testing without a live prover.
+Generates a random `request_id` without submitting anything to the SP1 network. Does not require `SP1_ELF_PATH`. Useful for integration testing.
 
 **Request**
 ```json
@@ -159,29 +173,39 @@ Returns a hardcoded Groth16 SP1 proof for block **316** on Fluent Devnet. Does n
   "rpc_url": "https://your-rpc-endpoint"
 }
 ```
-> The request body is accepted but ignored — the response is always the same hardcoded proof.
+> The request body is accepted but ignored.
 
 **Response**
 ```json
 {
-  "block_number": 316,
-  "block_hash":   "0x07d2de84641375cc25710327abfa4ed7a86a7cfeb560619d08ca4842e0cdd3d5",
-  "vk_hash":      "0x282233864d7d8e6f6c3a096b5dcc088d76367e553118e432197d3eb215a2023d",
+  "request_id": "0x…"
+}
+```
+
+---
+
+### POST /sp1/mock/status
+
+Returns a hardcoded `Sp1ProofResponse` regardless of the `request_id` provided. Does not require `SP1_ELF_PATH`. The hardcoded proof was generated for block 316 on Fluent Devnet.
+
+**Request**
+```json
+{
+  "request_id": "0x…"
+}
+```
+> The `request_id` is accepted but ignored — the response is always the same hardcoded proof.
+
+**Response**
+```json
+{
+  "vk_hash":       "0x282233864d7d8e6f6c3a096b5dcc088d76367e553118e432197d3eb215a2023d",
   "public_values": "0x…",
   "proof_bytes":   "0x…"
 }
 ```
 
-The response fields are identical in shape to `POST /block/sp1-proof` and can be passed directly to any `ISP1Verifier`-compatible contract:
-```solidity
-ISP1Verifier(verifier).verifyProof(
-    bytes32(response.vk_hash),
-    response.public_values,
-    response.proof_bytes
-);
-```
-
-> ⚠️ **Mock only.** This proof is real and was generated on Fluent Devnet, but it always corresponds to block 316 regardless of the requested `block_number`. Do not use in production.
+> ⚠️ **Mock only.** This proof is real and was generated on Fluent Devnet, but it always corresponds to block 316. Do not use in production.
 
 ---
 
@@ -262,23 +286,21 @@ src/
 
 ---
 
-## SP1 prover backends
+## SP1 prover network
 
-### Local (default)
+The SP1 backend uses the [Succinct prover network](https://docs.succinct.xyz/generating-proofs/prover-network) for async Groth16 proof generation. Proving time depends on network queue depth (typically 5–30 minutes).
 
-Runs Groth16 proving on the host machine. Suitable for development and testing. Proving time depends on available hardware (minutes on a modern CPU, seconds on a GPU with CUDA support).
 ```bash
 SP1_ELF_PATH=./guest.elf \
-SP1_PROVER=cpu \
+SP1_PRIVATE_KEY=0x… \
   proxy --eif_path enclave.eif
 ```
 
-### Succinct prover network
+### Typical flow
 
-Delegates proving to the [Succinct prover network](https://docs.succinct.xyz/generating-proofs/prover-network). Proving time depends on network queue depth (typically 5–30 minutes).
-```bash
-SP1_ELF_PATH=./guest.elf \
-SP1_PROVER=network \
-SP1_PRIVATE_KEY=0x… \
-  proxy --eif_path enclave.eif
+```
+1. POST /sp1/request  →  { "request_id": "0xabc..." }
+2. POST /sp1/status   →  202 Accepted        (pending)
+3. POST /sp1/status   →  202 Accepted        (still pending)
+4. POST /sp1/status   →  200 OK + proof      (done)
 ```
