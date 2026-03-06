@@ -8,7 +8,7 @@ use prepare::{prepare_guest_input};
 const ELF: &[u8] = include_elf!("nitro-validator");
 
 const EXPECTED_PUBKEY: [u8; 65] = hex!(
-    "0431f26074907216725a3a7630488ba898bb32a29fee2b04f144878b162dea172262b1bcd836f08f2d3c766ecb01fd6fa2ce2c4b5dcc636eb2f7c6321cee18496b"
+    "045716cab03a4ffe03ec68236c716f62b84fd69a9d77f736bd8414755012ac78b14ac0bb5ec44962985ce96439f8ebbcf7e9e75fc05eef27d9a249672dcf2635b8"
 );
 
 const ROOT_CERT_DER: &[u8] = include_bytes!("../../root.der");
@@ -52,12 +52,6 @@ fn main() {
         &EXPECTED_PUBKEY,
         "Pubkey mismatch! Expected specific enclave key"
     );
-
-    // Save the proof
-    proof_groth16
-        .save("proof-with-pis.bin")
-        .expect("Failed to save proof");
-    println!("✅ Proof saved to proof-with-pis.bin");
 
     // Verify Groth16 proof
     client

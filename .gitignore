@@ -48,5 +48,3 @@ bin/client/elf/
 *.elf
 
 attestation.bin
-data_key.enc
-public_key.hex
