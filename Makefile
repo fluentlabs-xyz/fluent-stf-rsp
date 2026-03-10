@@ -17,7 +17,7 @@ ELF_PATH     ?= $(ELF)
 API_KEY      ?= secret
 LISTEN_ADDR  ?= 0.0.0.0:8080
 SP1_PROVER   ?= network          # cpu | network
-TAG          ?= v0.5.3
+TAG          ?= v0.5.7
 RUST_LOG 	 ?= info
 
 # ─── SP1 ELF ──────────────────────────────────────────────────────────────────

@@ -1,10 +1,11 @@
 // @generated — do not edit manually
 #![allow(clippy::all)]
-use alloy_primitives::{address, b256, U256, Bytes, Address};
+use alloy_primitives::{address, b256, U256, Bytes, Address, Bloom};
 use alloy_genesis::{Genesis, GenesisAccount, ChainConfig};
+use reth_primitives_traits::Header;
 use std::collections::BTreeMap;
 
-pub const ALLOC_LEN: usize = 28;
+pub const ALLOC_LEN: usize = 30;
 
 pub fn genesis_alloc() -> [(Address, GenesisAccount); ALLOC_LEN] {
     [
@@ -179,6 +180,16 @@ pub fn genesis_alloc() -> [(Address, GenesisAccount); ALLOC_LEN] {
             }
         ),
         (
+            address!("0000000000000000000000000000000000000100"),
+            GenesisAccount {
+                balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]),
+                code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000100.bin")))),
+                nonce: None,
+                storage: None,
+                private_key: None,
+            }
+        ),
+        (
             address!("0000000000000000000000000000000000520001"),
             GenesisAccount {
                 balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]),
@@ -243,6 +254,16 @@ pub fn genesis_alloc() -> [(Address, GenesisAccount); ALLOC_LEN] {
             GenesisAccount {
                 balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]),
                 code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520010.bin")))),
+                nonce: None,
+                storage: None,
+                private_key: None,
+            }
+        ),
+        (
+            address!("0000000000000000000000000000000000520fee"),
+            GenesisAccount {
+                balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]),
+                code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520fee.bin")))),
                 nonce: None,
                 storage: None,
                 private_key: None,
@@ -324,14 +345,40 @@ pub fn genesis() -> Genesis {
     Genesis {
         config,
         nonce: 0u64,
-        timestamp: 1772049597u64,
+        timestamp: 1773063302u64,
         gas_limit: 100000000u64,
         number: Some(0u64),
-        difficulty: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]),
+        difficulty: U256::ZERO,
         mix_hash: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
         coinbase: address!("0000000000000000000000000000000000000000"),
-        extra_data: Bytes::from_static(&[]),
+        extra_data: Bytes::default(),
         alloc,
         ..Default::default()
+    }
+}
+
+pub fn genesis_header() -> Header {
+    Header {
+        parent_hash: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
+        ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
+        beneficiary: address!("0000000000000000000000000000000000000000"),
+        state_root: b256!("aa8839f82fc8bbab1aa68fa09a6c95469f0ef36488d2edb0e4d1abf849873903"),
+        transactions_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+        receipts_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+        logs_bloom: Bloom::ZERO,
+        difficulty: U256::ZERO,
+        number: 0u64,
+        gas_limit: 100000000u64,
+        gas_used: 0u64,
+        timestamp: 1773063302u64,
+        extra_data: Bytes::default(),
+        mix_hash: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
+        nonce: 0x0000000000000000u64.into(),
+        base_fee_per_gas: Some(1000000000u64),
+        withdrawals_root: Some(b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")),
+        blob_gas_used: Some(0u64),
+        excess_blob_gas: Some(0u64),
+        parent_beacon_block_root: Some(b256!("0000000000000000000000000000000000000000000000000000000000000000")),
+        requests_hash: Some(b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")),
     }
 }

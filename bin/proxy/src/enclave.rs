@@ -7,13 +7,15 @@ use std::{
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::ProvideCredentials;
 use eyre::WrapErr;
+use reth_ethereum_primitives::EthPrimitives;
 use revm_primitives::hex;
 use tokio::{process::Command as TokioCommand, task};
 use tracing::info;
 
 use vsock::{VsockAddr, VsockStream};
 
-use nitro_types::{AwsCredentials, EnclaveRequest, EnclaveResponse};
+use nitro_types::{AwsCredentials, EnclaveRequest, EnclaveResponse, EthExecutionResponse};
+use rsp_client_executor::io::ClientExecutorInput;
 
 use crate::types::NitroConfig;
 
@@ -148,6 +150,66 @@ pub(crate) async fn maybe_restart_enclave(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Block execution — called from axum handlers
+// ---------------------------------------------------------------------------
+
+/// Sends a block to the Nitro enclave for execution and verifies the result.
+///
+/// Each call opens a **new** VSOCK connection, so concurrent calls from
+/// multiple axum handlers are safe — the enclave handles them in parallel
+/// via `thread::spawn` on its side.
+pub(crate) async fn execute_block(
+    client_input: ClientExecutorInput<EthPrimitives>,
+    config: NitroConfig,
+) -> eyre::Result<EthExecutionResponse> {
+    let cid = config.enclave_cid;
+    let port = config.enclave_port;
+
+    let payload = bincode::serialize(&client_input)
+        .map_err(|e| eyre::eyre!("Failed to serialize client input: {e}"))?;
+
+    info!("Sending block request to enclave: {} bytes", payload.len());
+
+    let response: EthExecutionResponse = task::spawn_blocking(move || {
+        let mut stream = VsockStream::connect(&VsockAddr::new(cid, port))
+            .map_err(|e| eyre::eyre!("VSOCK connect {cid}:{port} failed: {e}"))?;
+
+        write_frame(&mut stream, &payload)?;
+        info!("Sent {} bytes to enclave", payload.len());
+
+        let resp_bytes = read_frame(&mut stream)?;
+        info!("Received {} bytes from enclave", resp_bytes.len());
+
+        bincode::deserialize(&resp_bytes)
+            .map_err(|e| eyre::eyre!("Failed to deserialize enclave response: {e}"))
+    })
+    .await
+    .map_err(|e| eyre::eyre!("Blocking task panicked: {e}"))??;
+
+    // Verify hashes
+    let input_block_hash = client_input.current_block.header.hash_slow();
+    if input_block_hash != response.block_hash {
+        return Err(eyre::eyre!(
+            "Block hash mismatch: expected {}, got {}",
+            hex::encode(AsRef::<[u8]>::as_ref(&input_block_hash)),
+            hex::encode(AsRef::<[u8]>::as_ref(&response.block_hash))
+        ));
+    }
+    if client_input.current_block.header.parent_hash != response.parent_hash {
+        return Err(eyre::eyre!(
+            "Parent hash mismatch: expected {}, got {}",
+            hex::encode(AsRef::<[u8]>::as_ref(
+                &client_input.current_block.header.parent_hash
+            )),
+            hex::encode(AsRef::<[u8]>::as_ref(&response.parent_hash))
+        ));
+    }
+
+    info!("Nitro enclave execution successful");
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------

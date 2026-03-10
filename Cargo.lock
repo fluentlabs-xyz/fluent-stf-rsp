@@ -58,9 +58,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "alloy-chains"
-version = "0.2.30"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90f374d3c6d729268bbe2d0e0ff992bb97898b2df756691a62ee1d5f0506bc39"
+checksum = "6d9d22005bf31b018f31ef9ecadb5d2c39cf4f6acc8db0456f72c815f3d7f757"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -650,7 +650,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6df77fea9d6a2a75c0ef8d2acbdfd92286cc599983d3175ccdc170d3433d249"
 dependencies = [
  "serde",
- "winnow 0.7.14",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -723,13 +723,12 @@ dependencies = [
 
 [[package]]
 name = "alloy-trie"
-version = "0.9.4"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d7fd448ab0a017de542de1dcca7a58e7019fe0e7a34ed3f9543ebddf6aceffa"
+checksum = "3f14b5d9b2c2173980202c6ff470d96e7c5e202c65a9f67884ad565226df7fbb"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
- "arrayvec",
  "derive_more 2.1.1",
  "nybbles",
  "serde",
@@ -1131,9 +1130,6 @@ name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "asn1-rs"
@@ -3667,6 +3663,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86ed19add84e8cb9e8cc5f7074de0324247149ffef0b851e215fb0edc50c229b"
 dependencies = [
  "fixed-map-derive",
+ "serde",
 ]
 
 [[package]]
@@ -3704,8 +3701,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-codec"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "alloy-primitives",
  "byteorder",
@@ -3717,8 +3714,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-codec-derive"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "convert_case 0.6.0",
  "crypto-hashes",
@@ -3730,8 +3727,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-crypto"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -3743,8 +3740,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-evm"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "bincode 2.0.1",
  "bitvec",
@@ -3760,14 +3757,13 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-revm"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "alloy-primitives",
  "fluentbase-evm",
  "fluentbase-runtime",
  "fluentbase-sdk",
- "fluentbase-universal-token",
  "once_cell",
  "revm",
  "rwasm",
@@ -3777,8 +3773,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-runtime"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -3796,8 +3792,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-sdk"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "alloy-rlp",
  "auto_impl",
@@ -3813,8 +3809,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-sdk-derive"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "alloy-sol-macro-input",
  "crypto-hashes",
@@ -3827,8 +3823,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-sdk-derive-core"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "alloy-sol-macro-input",
  "anyhow",
@@ -3850,8 +3846,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-types"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
+version = "0.5.6"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v0.5.7#4ed1133c05b57a041c17ea10a79f6e8f437012e2"
 dependencies = [
  "alloy-primitives",
  "bincode 2.0.1",
@@ -3865,14 +3861,6 @@ dependencies = [
  "rwasm",
  "serde",
  "strum_macros 0.27.2",
-]
-
-[[package]]
-name = "fluentbase-universal-token"
-version = "0.5.5"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#4aa8d285007382e806172ddb26975665e185315b"
-dependencies = [
- "fluentbase-sdk",
 ]
 
 [[package]]
@@ -4605,7 +4593,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.2",
+ "socket2 0.6.3",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -5028,9 +5016,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.182"
+version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
+checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libloading"
@@ -6995,7 +6983,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.37",
- "socket2 0.6.2",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7004,9 +6992,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.13"
+version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
@@ -7032,7 +7020,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.2",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -7428,7 +7416,7 @@ dependencies = [
 [[package]]
 name = "reth-chainspec"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -7448,7 +7436,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7466,7 +7454,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs-derive"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7476,7 +7464,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -7489,7 +7477,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus-common"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7501,7 +7489,7 @@ dependencies = [
 [[package]]
 name = "reth-db-models"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -7511,7 +7499,7 @@ dependencies = [
 [[package]]
 name = "reth-errors"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "reth-consensus",
  "reth-execution-errors",
@@ -7522,7 +7510,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-consensus"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7538,7 +7526,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-forks"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-eip2124",
  "alloy-hardforks",
@@ -7551,7 +7539,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-primitives"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7561,6 +7549,7 @@ dependencies = [
  "alloy-serde",
  "reth-codecs",
  "reth-primitives-traits",
+ "reth-zstd-compressors",
  "serde",
  "serde_with",
 ]
@@ -7568,7 +7557,7 @@ dependencies = [
 [[package]]
 name = "reth-evm"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7589,7 +7578,7 @@ dependencies = [
 [[package]]
 name = "reth-evm-ethereum"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7609,7 +7598,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-errors"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -7622,7 +7611,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-types"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7638,7 +7627,7 @@ dependencies = [
 [[package]]
 name = "reth-network-peers"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -7649,9 +7638,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-primitives"
+version = "1.11.1"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rlp",
+ "once_cell",
+ "reth-ethereum-forks",
+ "reth-ethereum-primitives",
+ "reth-primitives-traits",
+ "reth-static-file-types",
+]
+
+[[package]]
 name = "reth-primitives-traits"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7679,7 +7685,7 @@ dependencies = [
 [[package]]
 name = "reth-prune-types"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-primitives",
  "derive_more 2.1.1",
@@ -7691,16 +7697,18 @@ dependencies = [
 [[package]]
 name = "reth-stages-types"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-primitives",
+ "bytes",
  "reth-trie-common",
+ "serde",
 ]
 
 [[package]]
 name = "reth-static-file-types"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-primitives",
  "derive_more 2.1.1",
@@ -7708,12 +7716,13 @@ dependencies = [
  "reth-stages-types",
  "serde",
  "strum 0.27.2",
+ "tracing",
 ]
 
 [[package]]
 name = "reth-storage-api"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7735,7 +7744,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-errors"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -7752,7 +7761,7 @@ dependencies = [
 [[package]]
 name = "reth-trie"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7774,24 +7783,30 @@ dependencies = [
 [[package]]
 name = "reth-trie-common"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "alloy-serde",
  "alloy-trie",
+ "arrayvec",
+ "bytes",
  "derive_more 2.1.1",
  "itertools 0.14.0",
  "nybbles",
  "rayon",
  "reth-primitives-traits",
  "revm-database",
+ "serde",
+ "serde_with",
 ]
 
 [[package]]
 name = "reth-trie-sparse"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -7807,7 +7822,7 @@ dependencies = [
 [[package]]
 name = "reth-zstd-compressors"
 version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#7cdfec15cdd86bf486a4437d97e4e39337e94f68"
+source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#e5fc0e0395cece52f0a3476b30f583dced26994c"
 dependencies = [
  "zstd",
 ]
@@ -8233,6 +8248,7 @@ dependencies = [
  "bincode 1.3.3",
  "hex",
  "reth-chainspec",
+ "reth-primitives",
  "reth-primitives-traits",
  "reth-trie",
  "serde",
@@ -9576,12 +9592,12 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86f4aa3ad99f2088c990dfa82d367e19cb29268ed67c574d10d0a4bfe71f07e0"
+checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11315,7 +11331,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2 0.6.2",
+ "socket2 0.6.3",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
@@ -11426,7 +11442,7 @@ dependencies = [
  "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "toml_writer",
- "winnow 0.7.14",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -11478,7 +11494,7 @@ dependencies = [
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
  "toml_write",
- "winnow 0.7.14",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -11490,7 +11506,7 @@ dependencies = [
  "indexmap 2.13.0",
  "toml_datetime 1.0.0+spec-1.1.0",
  "toml_parser",
- "winnow 0.7.14",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -11499,7 +11515,7 @@ version = "1.0.9+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "702d4415e08923e7e1ef96cd5727c0dfed80b4d2fa25db9647fe5eb6f7c5a4c4"
 dependencies = [
- "winnow 0.7.14",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -11934,9 +11950,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.21.0"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
+checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
 dependencies = [
  "atomic",
  "getrandom 0.4.2",
@@ -12971,9 +12987,9 @@ dependencies = [
 
 [[package]]
 name = "winnow"
-version = "0.7.14"
+version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
 ]
@@ -13185,18 +13201,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.40"
+version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a789c6e490b576db9f7e6b6d661bcc9799f7c0ac8352f56ea20193b2681532e5"
+checksum = "f2578b716f8a7a858b7f02d5bd870c14bf4ddbbcf3a4c05414ba6503640505e3"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.40"
+version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65c489a7071a749c849713807783f70672b28094011623e200cb86dcb835953"
+checksum = "7e6cc098ea4d3bd6246687de65af3f920c430e236bee1e3bf2e441463f08a02f"
 dependencies = [
  "proc-macro2",
  "quote",

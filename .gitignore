@@ -37,8 +37,9 @@ bin/aws-nitro-validator/sp1-verifier/.env
 bin/aws-nitro-validator/sp1-verifier/lcov.info
 bin/aws-nitro-validator/sp1-verifier/.gas-snapshot
 
-bin/host/genesis/genesis-v0.5.3.json
+bin/host/genesis/genesis-*.json
 crates/primitives/src/fluent_genesis_bin
+crates/primitives/src/fluent_genesis.rs
 
 # SP1 ELF
 bin/client/elf/

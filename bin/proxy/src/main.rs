@@ -23,15 +23,12 @@ mod enclave;
 mod types;
 
 use crate::{
-    enclave::maybe_restart_enclave, types::{NitroConfig, Sp1ProofResponse},
+    enclave::maybe_restart_enclave,
+    types::{NitroConfig, Sp1ProofResponse},
 };
-use nitro_types::{EthExecutionResponse};
+use nitro_types::EthExecutionResponse;
 
-use std::{
-    io::{Read, Write},
-    path::Path,
-    sync::Arc,
-};
+use std::{env, path::Path, sync::Arc};
 
 use axum::{
     extract::{Request, State},
@@ -41,7 +38,10 @@ use axum::{
     routing::post,
     Router,
 };
-use revm_primitives::{B256, FixedBytes, hex::{self, FromHex}};
+use revm_primitives::{
+    hex::{self, FromHex},
+    FixedBytes, B256,
+};
 use rsp_primitives::genesis::Genesis;
 use url::Url;
 
@@ -61,16 +61,24 @@ use sp1_sdk::{
 };
 
 use sp1_sdk::ProveRequest;
-use tokio::task;
 use tracing::info;
-use vsock::{VsockAddr, VsockStream};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+pub fn rpc_url() -> String {
+    // Env var always wins if set
+    if let Ok(url) = env::var("RPC_URL") {
+        return url;
+    }
 
-/// Maximum allowed VSOCK frame size (64 MiB).
-const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+    #[cfg(feature = "testnet")]
+    return "https://rpc.testnet.fluent.xyz".to_string();
+
+    #[cfg(feature = "devnet")]
+    return "https://rpc.devnet.fluent.xyz".to_string();
+
+    #[allow(unreachable_code)]
+    "http://localhost:8545".to_string()
+}
+
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -111,7 +119,6 @@ struct Sp1State {
 struct BlockRequest {
     block_number: Option<u64>,
     block_hash: Option<B256>,
-    rpc_url: String,
 }
 
 #[derive(Deserialize)]
@@ -166,7 +173,7 @@ async fn require_api_key(
 // Shared helper: fetch block + build ClientExecutorInput
 // ---------------------------------------------------------------------------
 
-/// Fetches `block_number` from `rpc_url` and runs the host-side execution
+/// Fetches `block_number` and runs the host-side execution
 /// phase to produce a [`ClientExecutorInput`] ready for either backend.
 ///
 /// This is intentionally shared between [`block`] and [`block_sp1_request`] so
@@ -175,7 +182,7 @@ async fn build_client_input(
     req: BlockRequest,
     state: &AppState,
 ) -> Result<ClientExecutorInput<EthPrimitives>, HandlerError> {
-    let url = Url::parse(&req.rpc_url).map_err(|e| bad_request(format!("Invalid rpc_url: {e}")))?;
+    let url = Url::parse(&rpc_url()).map_err(|e| bad_request(format!("Invalid rpc_url: {e}")))?;
     let provider: RootProvider = create_provider(url);
 
     let block_number = match (req.block_number, req.block_hash) {
@@ -190,7 +197,9 @@ async fn build_client_input(
         }
         (Some(number), _) => number,
         (None, None) => {
-            return Err(bad_request("Either block_number or block_hash must be provided".to_string()))
+            return Err(bad_request(
+                "Either block_number or block_hash must be provided".to_string(),
+            ))
         }
     };
 
@@ -222,7 +231,7 @@ async fn block(
 
     let client_input = build_client_input(req, &state).await?;
 
-    let response = process_nitro_client(client_input, nitro.config)
+    let response = enclave::execute_block(client_input, nitro.config)
         .await
         .map_err(|e| internal(format!("Enclave processing failed: {e}")))?;
 
@@ -325,7 +334,7 @@ async fn block_sp1_status(
 }
 
 // ---------------------------------------------------------------------------
-// Handler: POST /sp1/mock/request  —  mock request_id generation
+// Handler: POST /sp1/mock/request
 // ---------------------------------------------------------------------------
 
 /// Generates a random `request_id` and returns it as if an SP1 proof request
@@ -335,7 +344,7 @@ async fn block_sp1_mock_request(
     Json(_): Json<BlockRequest>,
 ) -> Result<Json<Sp1RequestResponse>, HandlerError> {
     let request_id = B256::from_hex("0x137").unwrap_or_default();
-
+    
     Ok(Json(Sp1RequestResponse { request_id }))
 }
 
@@ -453,93 +462,6 @@ async fn block_sp1_mock_status(
 }
 
 // ---------------------------------------------------------------------------
-// Nitro enclave execution
-// ---------------------------------------------------------------------------
-
-/// Serialises `client_input`, sends it to the Nitro enclave over VSOCK, reads
-/// the response, and verifies that the returned hashes match the input block.
-///
-/// All socket I/O is offloaded to a blocking thread because `VsockStream` does
-/// not implement async I/O.
-async fn process_nitro_client(
-    client_input: ClientExecutorInput<EthPrimitives>,
-    config: NitroConfig,
-) -> eyre::Result<EthExecutionResponse> {
-    info!("Connecting to Nitro enclave CID={} PORT={}", config.enclave_cid, config.enclave_port);
-
-    let payload = bincode::serialize(&client_input)
-        .map_err(|e| eyre::eyre!("Failed to serialize client input: {}", e))?;
-    info!("Serialized input: {} bytes", payload.len());
-
-    let response = task::spawn_blocking(move || -> eyre::Result<EthExecutionResponse> {
-        let addr = VsockAddr::new(config.enclave_cid, config.enclave_port);
-        let mut stream = VsockStream::connect(&addr).map_err(|e| {
-            eyre::eyre!(
-                "VSOCK connect {}:{} failed: {}",
-                config.enclave_cid,
-                config.enclave_port,
-                e
-            )
-        })?;
-
-        // Length-prefixed framing: [ u32 big-endian length ][ payload ]
-        let req_len: u32 = payload
-            .len()
-            .try_into()
-            .map_err(|_| eyre::eyre!("Payload too large: {} bytes", payload.len()))?;
-        stream
-            .write_all(&req_len.to_be_bytes())
-            .map_err(|e| eyre::eyre!("Failed to write request length: {}", e))?;
-        stream.write_all(&payload).map_err(|e| eyre::eyre!("Failed to write payload: {}", e))?;
-        stream.flush().map_err(|e| eyre::eyre!("Failed to flush stream: {}", e))?;
-        info!("Sent {} bytes to enclave", payload.len());
-
-        let mut resp_len_buf = [0u8; 4];
-        stream
-            .read_exact(&mut resp_len_buf)
-            .map_err(|e| eyre::eyre!("Failed to read response length: {}", e))?;
-        let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
-        if resp_len > MAX_FRAME_SIZE {
-            return Err(eyre::eyre!(
-                "Response frame too large: {} bytes (max {})",
-                resp_len,
-                MAX_FRAME_SIZE
-            ));
-        }
-
-        let mut resp_buf = vec![0u8; resp_len];
-        stream
-            .read_exact(&mut resp_buf)
-            .map_err(|e| eyre::eyre!("Failed to read response body: {}", e))?;
-        info!("Received {} bytes from enclave", resp_buf.len());
-
-        bincode::deserialize(&resp_buf)
-            .map_err(|e| eyre::eyre!("Failed to deserialize enclave response: {}", e))
-    })
-    .await
-    .map_err(|e| eyre::eyre!("Blocking task panicked: {}", e))??;
-
-    let input_block_hash = client_input.current_block.header.hash_slow();
-    if input_block_hash != response.block_hash {
-        return Err(eyre::eyre!(
-            "Block hash mismatch: expected {}, got {}",
-            hex::encode(AsRef::<[u8]>::as_ref(&input_block_hash)),
-            hex::encode(AsRef::<[u8]>::as_ref(&response.block_hash))
-        ));
-    }
-    if client_input.current_block.header.parent_hash != response.parent_hash {
-        return Err(eyre::eyre!(
-            "Parent hash mismatch: expected {}, got {}",
-            hex::encode(AsRef::<[u8]>::as_ref(&client_input.current_block.header.parent_hash)),
-            hex::encode(AsRef::<[u8]>::as_ref(&response.parent_hash))
-        ));
-    }
-
-    info!("Nitro enclave execution successful");
-    Ok(response)
-}
-
-// ---------------------------------------------------------------------------
 // Entry-point
 // ---------------------------------------------------------------------------
 
@@ -580,7 +502,7 @@ async fn main() -> eyre::Result<()> {
             .map_err(|e| eyre::eyre!("Failed to build chain spec: {e}"))?,
     );
 
-    // -----------------------------------------------------------------------
+     // -----------------------------------------------------------------------
     // SP1 initialisation
     //
     //   SP1_ELF_PATH            path to the compiled zkVM ELF (required to enable SP1)

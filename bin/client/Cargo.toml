@@ -56,7 +56,7 @@ tracing = { version = "0.1", features = ["max_level_off", "release_max_level_off
 rsp-client-executor = { path = "../../crates/executor/client", features = [] }
 nitro-types = { path = "../../crates/nitro-types", optional = true }
 # sp1
-sp1-zkvm = { version = "5", optional = true }
+sp1-zkvm = { version = "6.0.1", optional = true }
 
 # nitro
 vsock = { version = "0.5.2", optional = true }

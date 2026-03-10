@@ -14,17 +14,14 @@ use aws_nitro_enclaves_nsm_api::{
 use k256::ecdsa::{signature::Signer, Signature, SigningKey};
 use k256::SecretKey;
 
-use rsp_client_executor::{
-    executor::EthClientExecutor,
-    io::EthClientExecutorInput,
-    
-};
+use rsp_client_executor::{executor::EthClientExecutor, io::EthClientExecutorInput};
 use nitro_types::{EnclaveRequest, EnclaveResponse, EthExecutionResponse};
 
 use ::vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::thread;
 
 use crate::nitro::{kms::KmsClient, vsock::VsockChannel};
 
@@ -32,7 +29,7 @@ use crate::nitro::{kms::KmsClient, vsock::VsockChannel};
 /// bind → handshake → process blocks.
 struct Enclave {
     listener: VsockListener,
-    signing_key: SigningKey,
+    signing_key: Arc<SigningKey>,
 }
 
 impl Enclave {
@@ -42,7 +39,10 @@ impl Enclave {
 
         let signing_key = Self::handshake(&listener)?;
 
-        Ok(Self { listener, signing_key })
+        Ok(Self {
+            listener,
+            signing_key: Arc::new(signing_key),
+        })
     }
 
     fn handshake(listener: &VsockListener) -> anyhow::Result<SigningKey> {
@@ -71,7 +71,9 @@ impl Enclave {
             None => Self::generate_key(&kms)?,
         };
 
-        channel.send_bincode(&resp).context("Failed to send handshake response")?;
+        channel
+            .send_bincode(&resp)
+            .context("Failed to send handshake response")?;
         Ok(signing_key)
     }
 
@@ -92,7 +94,9 @@ impl Enclave {
     /// Generates a fresh signing key, encrypts it via KMS,
     /// and produces an attestation document.
     fn generate_key(kms: &KmsClient) -> anyhow::Result<(SigningKey, EnclaveResponse)> {
-        let (data_key, _) = kms.generate_data_key().context("KMS GenerateDataKey failed")?;
+        let (data_key, _) = kms
+            .generate_data_key()
+            .context("KMS GenerateDataKey failed")?;
         let r_local = get_nsm_entropy().context("Failed to get NSM entropy")?;
 
         let key_bytes = derive_valid_ecdsa_key(&data_key, &r_local)?;
@@ -111,39 +115,60 @@ impl Enclave {
         Ok((signing_key, resp))
     }
 
-    /// Main loop: accept connections, execute blocks, always reply.
+    /// Main loop: accept connections and spawn a thread per block request.
     fn run(&self) -> ! {
         println!("Enclave ready to process block requests");
 
         loop {
-            if let Err(e) = self.handle_one_block() {
-                eprintln!("Block session error: {e:#}");
-            }
+            let channel = match VsockChannel::accept(&self.listener) {
+                Ok(ch) => ch,
+                Err(e) => {
+                    eprintln!("Failed to accept connection: {e:#}");
+                    continue;
+                }
+            };
+
+            let key = Arc::clone(&self.signing_key);
+
+            thread::spawn(move || {
+                if let Err(e) = handle_block_session(channel, &key) {
+                    eprintln!("Block session error: {e:#}");
+                }
+            });
         }
     }
+}
 
-    fn handle_one_block(&self) -> anyhow::Result<()> {
-        let mut channel =
-            VsockChannel::accept(&self.listener).context("Failed to accept block connection")?;
+// ---------------------------------------------------------------------------
+// Block handling (runs inside spawned threads)
+// ---------------------------------------------------------------------------
 
-        let result = self.try_execute_block(&mut channel);
+fn handle_block_session(
+    mut channel: VsockChannel,
+    signing_key: &SigningKey,
+) -> anyhow::Result<()> {
+    let result = try_execute_block(&mut channel, signing_key);
 
-        if let Err(ref e) = result {
-            let err_resp = EnclaveResponse::Error(format!("{e:#}"));
-            let _ = channel.send_bincode(&err_resp);
-        }
-
-        result
+    if let Err(ref e) = result {
+        let err_resp = EnclaveResponse::Error(format!("{e:#}"));
+        let _ = channel.send_bincode(&err_resp);
     }
 
-    fn try_execute_block(&self, channel: &mut VsockChannel) -> anyhow::Result<()> {
-        let raw = channel.receive().context("Failed to receive block input")?;
-        let input: EthClientExecutorInput =
-            bincode::deserialize(&raw).context("Failed to deserialize block input")?;
+    result
+}
 
-        let output = execute_block(input, &self.signing_key)?;
-        channel.send_bincode(&output).context("Failed to send execution result")
-    }
+fn try_execute_block(
+    channel: &mut VsockChannel,
+    signing_key: &SigningKey,
+) -> anyhow::Result<()> {
+    let raw = channel.receive().context("Failed to receive block input")?;
+    let input: EthClientExecutorInput =
+        bincode::deserialize(&raw).context("Failed to deserialize block input")?;
+
+    let output = execute_block(input, signing_key)?;
+    channel
+        .send_bincode(&output)
+        .context("Failed to send execution result")
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +221,10 @@ fn signing_key_from_bytes(bytes: &[u8]) -> anyhow::Result<SigningKey> {
 }
 
 fn encode_public_key(key: &SigningKey) -> Vec<u8> {
-    key.verifying_key().to_encoded_point(false).as_bytes().to_vec()
+    key.verifying_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec()
 }
 
 fn get_nsm_entropy() -> anyhow::Result<Vec<u8>> {
@@ -206,7 +234,9 @@ fn get_nsm_entropy() -> anyhow::Result<Vec<u8>> {
 
     match response {
         Response::GetRandom { random } => Ok(random),
-        _ => Err(anyhow::anyhow!("NSM GetRandom returned unexpected response")),
+        _ => Err(anyhow::anyhow!(
+            "NSM GetRandom returned unexpected response"
+        )),
     }
 }
 
@@ -243,7 +273,9 @@ fn derive_valid_ecdsa_key(data_key: &[u8], r_local: &[u8]) -> anyhow::Result<[u8
         }
     }
 
-    Err(anyhow::anyhow!("Failed to derive valid key after 100 iterations"))
+    Err(anyhow::anyhow!(
+        "Failed to derive valid key after 100 iterations"
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ vsock.workspace = true
 # workspace crates
 rsp-provider.workspace = true
 rsp-host-executor = { workspace = true, features = ["sp1"] }
-rsp-primitives = { workspace = true, default-features = false }
+rsp-primitives = { workspace = true, default-features = false, features=["devnet"] }
 rsp-client-executor.workspace = true
 nitro-types.workspace = true
 
@@ -46,3 +46,8 @@ sp1-sdk = {workspace = true, features =["network"]}
 
 aws-config = { version = "1"}
 aws-credential-types = "1"
+
+[features]
+default=["devnet"]
+devnet  = ["rsp-primitives/devnet"]
+testnet = ["rsp-primitives/testnet"]

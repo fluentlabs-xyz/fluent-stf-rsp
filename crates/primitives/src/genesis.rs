@@ -5,11 +5,11 @@ use std::{
 
 use crate::{error::ChainSpecError, fluent_genesis};
 use alloy_genesis::ChainConfig;
-use alloy_primitives::{b256, Bloom, Bytes, B256, U256};
-use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, EthereumHardfork,
-    DEV_HARDFORKS,
+use alloy_primitives::U256;
+use reth_chainspec::{
+    BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, EthereumHardfork, DEV_HARDFORKS,
 };
-use reth_primitives_traits::{Header, SealedHeader};
+use reth_primitives_traits::SealedHeader;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -18,7 +18,7 @@ pub const OP_SEPOLIA_GENESIS_JSON: &str = include_str!("../../../bin/host/genesi
 
 // If this fails to compile, run: make download-genesis
 pub const FLUENT_DEVNET_GENESIS_JSON: &str =
-    include_str!("../../../bin/host/genesis/genesis-v0.5.3.json");
+    include_str!("../../../bin/host/genesis/genesis-v0.5.7.json");
 
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,41 +117,7 @@ impl TryFrom<&Genesis> for ChainSpec {
                 let genesis = fluent_genesis::genesis();
                 let hardforks = DEV_HARDFORKS.clone();
 
-                let header = Header {
-                    parent_hash: B256::ZERO,
-                    ommers_hash: b256!(
-                        "1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
-                    ),
-                    beneficiary: Default::default(),
-                    state_root: b256!(
-                        "46469066cad3f4124bf849eba31776f3160d6a546f674f14238917b66c1b3afe"
-                    ),
-                    transactions_root: b256!(
-                        "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-                    ),
-                    receipts_root: b256!(
-                        "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-                    ),
-                    logs_bloom: Bloom::ZERO,
-                    difficulty: U256::ZERO,
-                    number: 0,
-                    gas_limit: 100_000_000,
-                    gas_used: 0,
-                    timestamp: 1_772_049_597,
-                    extra_data: Bytes::default(),
-                    mix_hash: B256::ZERO,
-                    nonce: 0x0000000000000000u64.into(),
-                    base_fee_per_gas: Some(1_000_000_000),
-                    withdrawals_root: Some(b256!(
-                        "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-                    )),
-                    blob_gas_used: Some(0),
-                    excess_blob_gas: Some(0),
-                    parent_beacon_block_root: Some(B256::ZERO),
-                    requests_hash: Some(b256!(
-                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                    )),
-                };
+                let header = fluent_genesis::genesis_header();
 
                 let chain_spec = ChainSpec {
                     chain: Chain::from(0x5201),

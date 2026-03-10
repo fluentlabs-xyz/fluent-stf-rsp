@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::HostError;
-use alloy_consensus::{BlockHeader, Header, Transaction, TxReceipt};
+use alloy_consensus::{BlockHeader, Header, TxReceipt};
 use alloy_network::BlockResponse;
 use alloy_primitives::{Bloom, Sealable};
 use alloy_provider::{Network, Provider};
