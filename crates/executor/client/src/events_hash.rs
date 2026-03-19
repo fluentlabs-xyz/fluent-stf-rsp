@@ -106,8 +106,18 @@ pub(crate) trait CalculateEventsHash {
     fn find_receipt_log(&self, bridge_address: &Address, send_topic: &B256) -> Vec<&LogData>;
 }
 
+// see bridge contract for details: https://github.com/fluentlabs-xyz/solidity-contracts/blob/devel/contracts/interfaces/IFluentBridge.sol#L48
+// cast sig-event "ReceivedMessage(bytes32,bool,bytes)"
 const RECEIVE_EVENT_MESSAGE_HASH_OFFSET: usize = 0;
+
+// cast sig-event "SentMessage(address,address,uint256,uint256,uint256,uint256,bytes32,bytes)"
+// indexed: sender=topic[1], to=topic[2] → not in data
+// data: value(0) | chainId(32) | blockNumber(64) | nonce(96) | messageHash(128)
 const SEND_EVENT_MESSAGE_HASH_OFFSET: usize = 128;
+
+// cast sig-event "RollbackMessage(bytes32,uint256)"
+// data: messageHash(0) | blockNumber(32)
+const ROLLBACK_EVENT_MESSAGE_HASH_OFFSET: usize = 0;
 
 impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for ExecutionOutcome<T> {
     fn calculate_deposit_hash(
@@ -143,18 +153,36 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
         send_topic: &B256,
         rollback_topic: &B256,
     ) -> Result<B256, Error> {
-        let withdrawal_logs = self.find_receipt_log(bridge_address, send_topic);
-        let rollback_logs = self.find_receipt_log(bridge_address, rollback_topic);
-        let message_hashes = withdrawal_logs
-            .into_iter()
-            .chain(rollback_logs)
-            .filter(|log_data| log_data.data.len() >= SEND_EVENT_MESSAGE_HASH_OFFSET + 32)
-            .map(|log_data| {
-                let message_hash: [u8; 32] = log_data.data
-                    [SEND_EVENT_MESSAGE_HASH_OFFSET..SEND_EVENT_MESSAGE_HASH_OFFSET + 32]
-                    .try_into()
-                    .unwrap();
-                B256::from(message_hash)
+        let message_hashes = self
+            .receipts
+            .iter()
+            .flat_map(|receipt| receipt.iter().filter(TxReceipt::status).flat_map(TxReceipt::logs))
+            .filter(|log| &log.address == bridge_address)
+            .filter_map(|log| {
+                let topic = log.data.topics().first()?;
+                if topic == send_topic {
+                    if log.data.data.len() >= SEND_EVENT_MESSAGE_HASH_OFFSET + 32 {
+                        let hash: [u8; 32] = log.data.data
+                            [SEND_EVENT_MESSAGE_HASH_OFFSET..SEND_EVENT_MESSAGE_HASH_OFFSET + 32]
+                            .try_into()
+                            .unwrap();
+                        Some(B256::from(hash))
+                    } else {
+                        None
+                    }
+                } else if topic == rollback_topic {
+                    if log.data.data.len() >= ROLLBACK_EVENT_MESSAGE_HASH_OFFSET + 32 {
+                        let hash: [u8; 32] = log.data.data[ROLLBACK_EVENT_MESSAGE_HASH_OFFSET..
+                            ROLLBACK_EVENT_MESSAGE_HASH_OFFSET + 32]
+                            .try_into()
+                            .unwrap();
+                        Some(B256::from(hash))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             })
             .collect();
 
