@@ -49,3 +49,6 @@ bin/client/elf/
 *.elf
 
 attestation.bin
+
+# Claude Code
+.claude/

@@ -1,0 +1,45 @@
+[package]
+name = "e2e-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+exclude.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fake-beacon"
+path = "src/bin/fake_beacon.rs"
+
+[[bin]]
+name = "deploy-mock-rollup"
+path = "src/bin/deploy_mock_rollup.rs"
+
+[dependencies]
+# workspace
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types.workspace = true
+alloy-sol-types.workspace = true
+alloy-rpc-client.workspace = true
+url.workspace = true
+
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+eyre.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest = { version = "0.13", features = ["json"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hex.workspace = true
+
+# direct deps
+rsp-blob-builder = { path = "../blob-builder" }
+axum.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{evm::FluentEvmFactory, io::ClientExecutorInput};
+use crate::{evm::FluentEvmConfig, io::ClientExecutorInput};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{address, b256};
 use itertools::Itertools;
@@ -10,7 +10,6 @@ use reth_evm::{
     execute::{BasicBlockExecutor, Executor},
     ConfigureEvm, OnStateHook,
 };
-use reth_evm_ethereum::EthEvmConfig;
 use reth_execution_types::ExecutionOutcome;
 use reth_primitives_traits::Block;
 use reth_trie::KeccakKeyHasher;
@@ -34,13 +33,9 @@ pub const VALIDATE_HEADER: &str = "validate header";
 pub const VALIDATE_EXECUTION: &str = "validate block post-execution";
 pub const COMPUTE_STATE_ROOT: &str = "compute state root";
 
-pub type EthClientExecutor = ClientExecutor<EthEvmConfig<ChainSpec, FluentEvmFactory>, ChainSpec>;
+pub type EthClientExecutor = ClientExecutor<FluentEvmConfig, ChainSpec>;
 
-// #[cfg(feature = "optimism")]
-// pub type OpClientExecutor =
-//     ClientExecutor<reth_optimism_evm::OpEvmConfig, reth_optimism_chainspec::OpChainSpec>;
-
-/// An executor that executes a block inside a zkVM.
+/// An executor that fetches data from a [Provider] to execute blocks in the [ClientExecutor].
 #[derive(Debug, Clone)]
 pub struct ClientExecutor<C: ConfigureEvm, CS> {
     evm_config: C,
@@ -48,7 +43,7 @@ pub struct ClientExecutor<C: ConfigureEvm, CS> {
 }
 
 static BRIDGE_INFO: BridgeInfo = BridgeInfo {
-    bridge_address: address!("0x00961Ef480Eb55e80D19ad83579A64c007002123"),
+    bridge_address: address!("0x9CAcf613fC29015893728563f423fD26dCdB8Ddc"),
     withdrawal_topic: b256!("0x7b397c6ce16a73396390bf270a2021417ca4d97f44e82cdce3f5eb750fd34134"),
     rollback_topic: b256!("0xdf7aa00ff05158efbc91b05d801c14d80f3d08daf5b13c7f066030c864be3d65"),
     deposit_topic: b256!("0xc5797c3a3c0e6c245576d05b8c3929881b44e1a21fdb4f1b118ede3c009683c5"),
@@ -160,21 +155,11 @@ where
 impl EthClientExecutor {
     pub fn eth(chain_spec: Arc<ChainSpec>, _custom_beneficiary: Option<Address>) -> Self {
         Self {
-            evm_config: EthEvmConfig::new_with_evm_factory(chain_spec.clone(), FluentEvmFactory::default()),
+            evm_config: FluentEvmConfig::new_with_default_factory(chain_spec.clone()),
             chain_spec,
         }
     }
 }
-
-// #[cfg(feature = "optimism")]
-// impl OpClientExecutor {
-//     pub fn optimism(chain_spec: Arc<reth_optimism_chainspec::OpChainSpec>) -> Self {
-//         Self {
-//             evm_config: reth_optimism_evm::OpEvmConfig::optimism(chain_spec.clone()),
-//             chain_spec,
-//         }
-//     }
-// }
 
 enum BlockExecutor<'a, C> {
     Basic(BasicBlockExecutor<C, WrapDatabaseRef<TrieDB<'a>>>),

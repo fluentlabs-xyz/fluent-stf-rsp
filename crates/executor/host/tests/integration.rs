@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alloy_provider::{network::Ethereum, Network, RootProvider};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
-use revm_primitives::{address, Address};
+use revm_primitives::Address;
 use rsp_client_executor::{
     executor::{ClientExecutor, EthClientExecutor},
     io::ClientExecutorInput,
@@ -23,68 +23,9 @@ async fn test_e2e_ethereum() {
     run_eth_e2e(&Genesis::Mainnet, "RPC_1", 18884864, None).await;
 }
 
-// #[ignore]
-// #[tokio::test(flavor = "multi_thread")]
-// async fn test_e2e_optimism() {
-//     let chain_spec: Arc<OpChainSpec> = Arc::new((&Genesis::OpMainnet).try_into().unwrap());
-//
-//     // Setup the host executor.
-//     let host_executor = rsp_host_executor::OpHostExecutor::optimism(chain_spec.clone());
-//
-//     // Setup the client executor.
-//     let client_executor = rsp_client_executor::executor::OpClientExecutor::optimism(chain_spec);
-//
-//     run_e2e::<_, OpChainSpec, op_alloy_network::Optimism>(
-//         host_executor,
-//         client_executor,
-//         "RPC_10",
-//         122853660,
-//         &Genesis::OpMainnet,
-//         None,
-//     )
-//     .await;
-// }
-
-// #[ignore]
-// #[tokio::test(flavor = "multi_thread")]
-// async fn test_e2e_optimism_sepolia() {
-//     let alloy_genesis = genesis_from_json(OP_SEPOLIA_GENESIS_JSON).unwrap();
-//     let genesis = Genesis::Custom(alloy_genesis.config);
-//     let chain_spec: Arc<OpChainSpec> = Arc::new((&genesis).try_into().unwrap());
-//
-//     // Setup the host executor.
-//     let host_executor = rsp_host_executor::OpHostExecutor::optimism(chain_spec.clone());
-//
-//     // Setup the client executor.
-//     let client_executor = rsp_client_executor::executor::OpClientExecutor::optimism(chain_spec);
-//
-//     run_e2e::<_, OpChainSpec, op_alloy_network::Optimism>(
-//         host_executor,
-//         client_executor,
-//         "RPC_11155420",
-//         24000000,
-//         &genesis,
-//         None,
-//     )
-//     .await;
-// }
-
-#[ignore]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_linea() {
-    run_eth_e2e(
-        &Genesis::Linea,
-        "RPC_59144",
-        5600000,
-        Some(address!("8f81e2e3f8b46467523463835f965ffe476e1c9e")),
-    )
-    .await;
-}
-
-#[ignore]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_sepolia() {
-    run_eth_e2e(&Genesis::Sepolia, "RPC_11155111", 6804324, None).await;
+async fn test_e2e_fluent() {
+    run_eth_e2e(&Genesis::Fluent, "http://207.154.218.23:8545", 21846700, None).await;
 }
 
 async fn run_eth_e2e(
@@ -115,7 +56,7 @@ async fn run_eth_e2e(
 async fn run_e2e<C, CS, N>(
     host_executor: HostExecutor<C, CS>,
     client_executor: ClientExecutor<C, CS>,
-    env_var_key: &str,
+    _env_var_key: &str,
     block_number: u64,
     genesis: &Genesis,
     custom_beneficiary: Option<Address>,
@@ -139,8 +80,7 @@ async fn run_e2e<C, CS, N>(
         .try_init();
 
     // Setup the provider.
-    let rpc_url =
-        Url::parse(std::env::var(env_var_key).unwrap().as_str()).expect("invalid rpc url");
+    let rpc_url = Url::parse("http://207.154.218.23:8545").expect("invalid rpc url");
     let provider = RootProvider::<N>::new_http(rpc_url);
 
     // Execute the host.
@@ -149,12 +89,12 @@ async fn run_e2e<C, CS, N>(
         .await
         .expect("failed to execute host");
 
-    // Execute the client.
-    client_executor.execute(client_input.clone()).expect("failed to execute client");
-
     // Save the client input to a buffer.
     let buffer = bincode::serialize(&client_input).unwrap();
 
     // Load the client input from a buffer.
-    let _: ClientExecutorInput<C::Primitives> = bincode::deserialize(&buffer).unwrap();
+    let client_input: ClientExecutorInput<C::Primitives> = bincode::deserialize(&buffer).unwrap();
+
+    // Execute the client.
+    client_executor.execute(client_input.clone()).expect("failed to execute client");
 }

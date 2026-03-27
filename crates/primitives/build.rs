@@ -1,14 +1,127 @@
 use alloy_genesis::{ChainConfig, Genesis, GenesisAccount};
 use alloy_primitives::{Address, Bytes, U256};
-use reth_chainspec::{make_genesis_header, DEV_HARDFORKS};
+use reth_chainspec::{
+    make_genesis_header, ChainHardforks, EthereumHardfork, ForkCondition, Hardfork,
+};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
-// ─── helpers (unchanged) ─────────────────────────────────────────────────────
+pub const FLUENT_DEVNET_CHAIN_ID: u64 = 0x5201;
+pub const FLUENT_TESTNET_CHAIN_ID: u64 = 0x5202;
+pub const FLUENT_MAINNET_CHAIN_ID: u64 = 25363;
+
+// ─── network definitions ────────────────────────────────────────────────────
+
+struct NetworkDef {
+    /// Cargo feature name (e.g. "testnet"). None = default (no feature guard).
+    feature: Option<&'static str>,
+    /// GitHub release tag
+    tag: &'static str,
+    /// Optional channel for the download URL
+    channel: Option<&'static str>,
+    /// Osaka hardfork condition
+    osaka_fork: ForkCondition,
+    /// Override the chain ID for this network
+    chain_id: u64,
+}
+
+/// All supported networks.
+fn network_defs() -> Vec<NetworkDef> {
+    vec![
+        NetworkDef {
+            feature: None, // default = mainnet
+            tag: "v0.6.0", // FLUENT_MAINNET_GENESIS_TAG
+            channel: Some("mainnet"),
+            osaka_fork: ForkCondition::Block(0),
+            chain_id: FLUENT_MAINNET_CHAIN_ID,
+        },
+        NetworkDef {
+            feature: Some("testnet"),
+            tag: "v0.3.4-dev", // FLUENT_TESTNET_GENESIS_TAG
+            channel: None,
+            osaka_fork: ForkCondition::Block(21_300_000),
+            chain_id: FLUENT_TESTNET_CHAIN_ID,
+        },
+        NetworkDef {
+            feature: Some("devnet"),
+            tag: "v0.6.0", // FLUENT_DEVNET_GENESIS_TAG
+            channel: None,
+            osaka_fork: ForkCondition::Block(0),
+            chain_id: FLUENT_DEVNET_CHAIN_ID,
+        },
+    ]
+}
+
+// ─── genesis download & cache ───────────────────────────────────────────────
+
+fn genesis_cache_dir() -> PathBuf {
+    if let Some(proj) = directories::ProjectDirs::from("xyz", "fluentlabs", "fluent") {
+        proj.cache_dir().join("genesis")
+    } else {
+        PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("genesis_cache")
+    }
+}
+
+pub fn genesis_urls(tag: &str, channel: Option<&str>) -> (String, String) {
+    let base = format!("https://github.com/fluentlabs-xyz/fluentbase/releases/download/{tag}");
+    let gz_name = if let Some(channel) = channel {
+        format!("genesis-{channel}-{tag}.json.gz")
+    } else {
+        format!("genesis-{tag}.json.gz")
+    };
+    let gz_url = format!("{base}/{gz_name}");
+    (gz_url, gz_name)
+}
+
+fn download_to(url: &str, path: &Path) {
+    let tmp = path.with_extension("tmp");
+    let resp = reqwest::blocking::Client::builder()
+        .user_agent("fluent-chainspec-build/1.0")
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap()
+        .get(url)
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let bytes = resp.bytes().unwrap();
+    let mut f = fs::File::create(&tmp).unwrap();
+    f.write_all(&bytes).unwrap();
+    f.sync_all().unwrap();
+    fs::rename(&tmp, path).unwrap();
+}
+
+fn download_and_cache_genesis(tag: &str, channel: Option<&str>) -> (Value, PathBuf) {
+    let (gz_url, gz_name) = genesis_urls(tag, channel);
+    let cache_dir = genesis_cache_dir();
+    fs::create_dir_all(&cache_dir).unwrap();
+    let gz_path = cache_dir.join(&gz_name);
+
+    if !gz_path.exists() {
+        println!("cargo:warning=Downloading genesis from {gz_url}...");
+        download_to(&gz_url, &gz_path);
+    } else {
+        println!("cargo:warning=Using cached genesis from {}", gz_path.display());
+    }
+
+    let gz_bytes = fs::read(&gz_path).unwrap();
+    let mut decoder = flate2::read::GzDecoder::new(&gz_bytes[..]);
+    let mut json_str = String::new();
+    decoder.read_to_string(&mut json_str).unwrap();
+    let val = serde_json::from_str(&json_str).unwrap();
+
+    (val, gz_path)
+}
+
+// ─── formatting helpers ─────────────────────────────────────────────────────
 
 fn write_if_changed(path: &Path, content: &[u8]) {
     if let Ok(existing) = fs::read(path) {
@@ -31,21 +144,18 @@ fn write_bin_if_changed(path: &Path, bytes: &[u8]) {
 fn fmt_b256(val: &alloy_primitives::B256) -> String {
     format!("b256!(\"{}\")", hex::encode(val.as_slice()))
 }
-
 fn fmt_opt_b256(val: &Option<alloy_primitives::B256>) -> String {
     match val {
         Some(v) => format!("Some({})", fmt_b256(v)),
         None => "None".to_string(),
     }
 }
-
 fn fmt_opt_u64(val: Option<u64>) -> String {
     match val {
         Some(v) => format!("Some({v}u64)"),
         None => "None".to_string(),
     }
 }
-
 fn fmt_u256(val: &U256) -> String {
     if val.is_zero() {
         return "U256::ZERO".to_string();
@@ -56,19 +166,16 @@ fn fmt_u256(val: &U256) -> String {
         bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
     )
 }
-
 fn fmt_bloom(bloom: &alloy_primitives::Bloom) -> String {
     if bloom.is_zero() {
         "Bloom::ZERO".to_string()
     } else {
-        let bytes = bloom.as_slice();
         format!(
             "Bloom::new([{}])",
-            bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+            bloom.as_slice().iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
         )
     }
 }
-
 fn fmt_bytes(bytes: &Bytes) -> String {
     if bytes.is_empty() {
         "Bytes::default()".to_string()
@@ -79,95 +186,35 @@ fn fmt_bytes(bytes: &Bytes) -> String {
         )
     }
 }
-
-// ─── genesis file resolution ─────────────────────────────────────────────────
-
-/// Describes one genesis source: the file path and its cargo feature gate (if any).
-struct GenesisSource {
-    path: PathBuf,
-    /// `None` means "always included" (base).
-    feature: Option<&'static str>,
-}
-
-/// Returns the ordered list of genesis sources.
-/// The first entry is the **base** (always active) — it supplies `config`,
-/// top-level fields, and a default alloc.
-/// Subsequent entries are feature-gated overlays whose alloc is merged on top,
-/// with later entries winning on duplicate addresses.
-fn genesis_sources(manifest_dir: &Path) -> Vec<GenesisSource> {
-    let genesis_dir = manifest_dir.join("../../bin/host/genesis");
-
-    vec![
-        GenesisSource {
-            path: genesis_dir.join("genesis-v0.5.7.json"),
-            feature: None,
-        },
-        GenesisSource {
-            path: genesis_dir.join("genesis-v0.3.4-dev.json"),
-            feature: Some("testnet"),
-        },
-        GenesisSource {
-            path: genesis_dir.join("genesis-v0.5.7.json"),
-            feature: Some("devnet"),
-        },
-    ]
-}
-
-fn is_active(source: &GenesisSource) -> bool {
-    match source.feature {
-        None => true,
-        Some(feat) => std::env::var(format!("CARGO_FEATURE_{}", feat.to_uppercase()))
-            .is_ok(),
+fn parse_json_u64(val: &Value) -> u64 {
+    if let Some(num) = val.as_u64() {
+        return num;
     }
+    if let Some(s) = val.as_str() {
+        return u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0);
+    }
+    0
 }
-
-// ─── merged alloc helpers ────────────────────────────────────────────────────
-
-/// Canonical address key (lowercase, no 0x, zero-padded to 40 chars).
 fn canonical_addr(raw: &str) -> String {
     format!("{:0>40}", raw.trim_start_matches("0x").to_lowercase())
 }
 
-/// Merge `alloc` objects from multiple JSON values.
-/// Later entries override earlier ones for the same address.
-fn merge_allocs(jsons: &[Value]) -> BTreeMap<String, Value> {
-    let mut merged: BTreeMap<String, Value> = BTreeMap::new();
-    for json in jsons {
-        if let Some(alloc) = json["alloc"].as_object() {
-            for (addr, account) in alloc {
-                merged.insert(canonical_addr(addr), account.clone());
-            }
-        }
-    }
-    merged
-}
-
-// ─── account codegen ─────────────────────────────────────────────────────────
+// ─── account codegen ────────────────────────────────────────────────────────
 
 fn emit_account(addr_clean: &str, account: &Value, bin_dir: &Path) -> String {
     let balance_hex = account["balance"].as_str().unwrap_or("0x0");
-    let balance_u256 = U256::from_str_radix(balance_hex.trim_start_matches("0x"), 16).unwrap();
-    let balance_bytes = balance_u256.to_be_bytes::<32>();
-    let balance_lit = format!(
-        "U256::from_be_bytes([{}])",
-        balance_bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
-    );
-
-    let nonce_lit = match account["nonce"].as_str() {
-        Some(n) => {
-            format!("Some({}u64)", u64::from_str_radix(n.trim_start_matches("0x"), 16).unwrap())
-        }
-        None => "None".to_string(),
-    };
+    let balance_lit = fmt_u256(&U256::from_str(balance_hex).unwrap_or_default());
+    let nonce_val = parse_json_u64(&account["nonce"]);
+    let nonce_lit =
+        if nonce_val > 0 { format!("Some({nonce_val}u64)") } else { "None".to_string() };
 
     let fname = format!("code_{addr_clean}.bin");
     let code_lit = match account["code"].as_str() {
         Some(code_hex) => {
-            let code_hex = code_hex.trim_start_matches("0x");
-            if code_hex.is_empty() {
+            let bytes = Bytes::from_str(code_hex).unwrap_or_default();
+            if bytes.is_empty() {
                 "None".to_string()
             } else {
-                let bytes = hex::decode(code_hex).unwrap();
                 write_bin_if_changed(&bin_dir.join(&fname), &bytes);
                 format!(
                     r#"Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/{fname}"))))"#
@@ -178,338 +225,408 @@ fn emit_account(addr_clean: &str, account: &Value, bin_dir: &Path) -> String {
     };
 
     format!(
-        r#"(
-            address!("{addr_clean}"),
-            GenesisAccount {{
-                balance: {balance_lit},
-                code: {code_lit},
-                nonce: {nonce_lit},
-                storage: None,
-                private_key: None,
-            }}
-        )"#
+        r#"(address!("{addr_clean}"), GenesisAccount {{ balance: {balance_lit}, code: {code_lit}, nonce: {nonce_lit}, storage: None, private_key: None }})"#
     )
 }
 
-// ─── build Genesis object (from base JSON + merged alloc) ────────────────────
+// ─── build Genesis object from JSON ─────────────────────────────────────────
 
-fn build_genesis_object(base_json: &Value, merged_alloc: &BTreeMap<String, Value>) -> Genesis {
+fn build_genesis_object(json: &Value, chain_id: u64) -> Genesis {
     let mut alloc = BTreeMap::new();
-    for (addr_clean, account) in merged_alloc {
-        let address: Address = addr_clean.parse().unwrap();
-
-        let balance_hex = account["balance"].as_str().unwrap_or("0x0");
-        let balance = U256::from_str_radix(balance_hex.trim_start_matches("0x"), 16).unwrap();
-
-        let nonce = account["nonce"]
-            .as_str()
-            .map(|n| u64::from_str_radix(n.trim_start_matches("0x"), 16).unwrap());
-
-        let code = account["code"].as_str().and_then(|c| {
-            let c = c.trim_start_matches("0x");
-            if c.is_empty() { None } else { Some(Bytes::from(hex::decode(c).unwrap())) }
-        });
-
-        alloc.insert(
-            address,
-            GenesisAccount { balance, code, nonce, storage: None, private_key: None },
-        );
+    if let Some(alloc_obj) = json["alloc"].as_object() {
+        for (addr, account) in alloc_obj {
+            let addr_clean = canonical_addr(addr);
+            let address: Address = addr_clean.parse().unwrap();
+            let balance =
+                U256::from_str(account["balance"].as_str().unwrap_or("0x0")).unwrap_or_default();
+            let nonce_val = parse_json_u64(&account["nonce"]);
+            let nonce = if nonce_val > 0 { Some(nonce_val) } else { None };
+            let code = account["code"].as_str().and_then(|c| {
+                let b = Bytes::from_str(c).unwrap_or_default();
+                if b.is_empty() {
+                    None
+                } else {
+                    Some(b)
+                }
+            });
+            alloc.insert(
+                address,
+                GenesisAccount { balance, code, nonce, storage: None, private_key: None },
+            );
+        }
     }
 
-    let cfg = &base_json["config"];
+    let cfg = &json["config"];
     let config = ChainConfig {
-        chain_id: cfg["chainId"].as_u64().unwrap_or(1337),
-        homestead_block: Some(cfg["homesteadBlock"].as_u64().unwrap_or(0)),
-        dao_fork_block: Some(cfg["daoForkBlock"].as_u64().unwrap_or(0)),
+        chain_id,
+        homestead_block: cfg["homesteadBlock"].as_u64(),
+        dao_fork_block: cfg["daoForkBlock"].as_u64(),
         dao_fork_support: cfg["daoForkSupport"].as_bool().unwrap_or(false),
-        eip150_block: Some(cfg["eip150Block"].as_u64().unwrap_or(0)),
-        eip155_block: Some(cfg["eip155Block"].as_u64().unwrap_or(0)),
-        eip158_block: Some(cfg["eip158Block"].as_u64().unwrap_or(0)),
-        byzantium_block: Some(cfg["byzantiumBlock"].as_u64().unwrap_or(0)),
-        constantinople_block: Some(cfg["constantinopleBlock"].as_u64().unwrap_or(0)),
-        petersburg_block: Some(cfg["petersburgBlock"].as_u64().unwrap_or(0)),
-        istanbul_block: Some(cfg["istanbulBlock"].as_u64().unwrap_or(0)),
-        muir_glacier_block: Some(cfg["muirGlacierBlock"].as_u64().unwrap_or(0)),
-        berlin_block: Some(cfg["berlinBlock"].as_u64().unwrap_or(0)),
-        london_block: Some(cfg["londonBlock"].as_u64().unwrap_or(0)),
-        arrow_glacier_block: Some(cfg["arrowGlacierBlock"].as_u64().unwrap_or(0)),
-        gray_glacier_block: Some(cfg["grayGlacierBlock"].as_u64().unwrap_or(0)),
-        merge_netsplit_block: Some(cfg["mergeNetsplitBlock"].as_u64().unwrap_or(0)),
-        shanghai_time: Some(cfg["shanghaiTime"].as_u64().unwrap_or(0)),
-        cancun_time: Some(cfg["cancunTime"].as_u64().unwrap_or(0)),
-        prague_time: Some(cfg["pragueTime"].as_u64().unwrap_or(0)),
-        osaka_time: Some(cfg["osakaTime"].as_u64().unwrap_or(999999999999)),
+        eip150_block: cfg["eip150Block"].as_u64(),
+        eip155_block: cfg["eip155Block"].as_u64(),
+        eip158_block: cfg["eip158Block"].as_u64(),
+        byzantium_block: cfg["byzantiumBlock"].as_u64(),
+        constantinople_block: cfg["constantinopleBlock"].as_u64(),
+        petersburg_block: cfg["petersburgBlock"].as_u64(),
+        istanbul_block: cfg["istanbulBlock"].as_u64(),
+        muir_glacier_block: cfg["muirGlacierBlock"].as_u64(),
+        berlin_block: cfg["berlinBlock"].as_u64(),
+        london_block: cfg["londonBlock"].as_u64(),
+        arrow_glacier_block: cfg["arrowGlacierBlock"].as_u64(),
+        gray_glacier_block: cfg["grayGlacierBlock"].as_u64(),
+        merge_netsplit_block: cfg["mergeNetsplitBlock"].as_u64(),
+        shanghai_time: cfg["shanghaiTime"].as_u64(),
+        cancun_time: cfg["cancunTime"].as_u64(),
+        prague_time: cfg["pragueTime"].as_u64(),
+        osaka_time: cfg["osakaTime"].as_u64().or(Some(999999999999)),
         terminal_total_difficulty_passed: cfg["terminalTotalDifficultyPassed"]
             .as_bool()
             .unwrap_or(false),
         ..Default::default()
     };
 
-    let parse_hex_u64 = |v: &Value| -> u64 {
-        u64::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap()
-    };
-
-    let difficulty = U256::from_str_radix(
-        base_json["difficulty"].as_str().unwrap_or("0x0").trim_start_matches("0x"),
-        16,
-    )
-    .unwrap();
-
-    let mix_hash_str = format!(
-        "{:0>64}",
-        base_json["mixHash"].as_str().unwrap_or("0x0").trim_start_matches("0x")
-    );
-    let coinbase_str = format!(
-        "{:0>40}",
-        base_json["coinbase"].as_str().unwrap_or("0x0").trim_start_matches("0x")
-    );
-
-    let extra_data = Bytes::from(
-        hex::decode(base_json["extraData"].as_str().unwrap_or("0x").trim_start_matches("0x"))
-            .unwrap(),
-    );
+    let difficulty =
+        U256::from_str(json["difficulty"].as_str().unwrap_or("0x0")).unwrap_or_default();
+    let mix_hash_str =
+        format!("{:0>64}", json["mixHash"].as_str().unwrap_or("0x0").trim_start_matches("0x"));
+    let coinbase_str =
+        format!("{:0>40}", json["coinbase"].as_str().unwrap_or("0x0").trim_start_matches("0x"));
+    let extra_data =
+        Bytes::from_str(json["extraData"].as_str().unwrap_or("0x")).unwrap_or_default();
 
     Genesis {
         config,
-        nonce: parse_hex_u64(&base_json["nonce"]),
-        timestamp: parse_hex_u64(&base_json["timestamp"]),
-        gas_limit: parse_hex_u64(&base_json["gasLimit"]),
-        number: Some(parse_hex_u64(&base_json["number"])),
+        nonce: parse_json_u64(&json["nonce"]),
+        timestamp: parse_json_u64(&json["timestamp"]),
+        gas_limit: parse_json_u64(&json["gasLimit"]),
+        number: Some(parse_json_u64(&json["number"])),
         difficulty,
-        mix_hash: mix_hash_str.parse().unwrap(),
-        coinbase: coinbase_str.parse().unwrap(),
+        mix_hash: mix_hash_str.parse().unwrap_or_default(),
+        coinbase: coinbase_str.parse().unwrap_or_default(),
         extra_data,
         alloc,
         ..Default::default()
     }
 }
 
-// ─── main ────────────────────────────────────────────────────────────────────
+// ─── codegen: emit one network block ────────────────────────────────────────
+
+fn emit_network(
+    out: &mut String,
+    bin_dir: &Path,
+    json: &Value,
+    genesis_obj: &Genesis,
+    hardforks: &ChainHardforks,
+    net_def: &NetworkDef,
+    all_features: &[&str],
+    prior_features: &[&str],
+) {
+    let header = make_genesis_header(genesis_obj, hardforks);
+    let alloc_map: BTreeMap<String, Value> = json["alloc"]
+        .as_object()
+        .map(|obj| obj.iter().map(|(a, v)| (canonical_addr(a), v.clone())).collect())
+        .unwrap_or_default();
+    let count = alloc_map.len();
+
+    let cfg_attr = match net_def.feature {
+        Some(feat) => {
+            if prior_features.is_empty() {
+                format!("#[cfg(feature = \"{feat}\")]")
+            } else {
+                format!(
+                    "#[cfg(all(feature = \"{feat}\", not(any({}))))]",
+                    prior_features
+                        .iter()
+                        .map(|f| format!("feature = \"{f}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        None => format!(
+            "#[cfg(not(any({})))]",
+            all_features
+                .iter()
+                .map(|f| format!("feature = \"{f}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+
+    let mod_name = net_def.feature.unwrap_or("default");
+
+    out.push_str(&format!("{cfg_attr}\n"));
+    out.push_str(&format!("mod {mod_name}_genesis {{\n    use super::*;\n\n"));
+
+    out.push_str(&format!("    pub const ALLOC_LEN: usize = {count};\n\n"));
+    out.push_str(
+        "    pub fn genesis_alloc() -> [(Address, GenesisAccount); ALLOC_LEN] {\n        [\n",
+    );
+    for (addr_clean, account) in &alloc_map {
+        out.push_str(&format!("            {},\n", emit_account(addr_clean, account, bin_dir)));
+    }
+    out.push_str("        ]\n    }\n\n");
+
+    out.push_str("    pub fn genesis() -> Genesis {\n");
+    out.push_str("        let alloc: BTreeMap<Address, GenesisAccount> = genesis_alloc().into_iter().collect();\n\n");
+    emit_chain_config(out, &genesis_obj.config);
+    emit_genesis_struct(out, genesis_obj);
+    out.push_str("    }\n\n");
+
+    out.push_str("    pub fn genesis_header() -> Header {\n        Header {\n");
+    emit_header_fields(out, &header);
+    out.push_str("        }\n    }\n\n");
+
+    // ─── chainspec() ────────────────────────────────────────────────────────
+
+    let osaka_fmt = match &net_def.osaka_fork {
+        ForkCondition::Block(b) => format!("ForkCondition::Block({b})"),
+        ForkCondition::Timestamp(t) => format!("ForkCondition::Timestamp({t})"),
+        _ => "ForkCondition::Block(0)".to_string(),
+    };
+
+    out.push_str("    pub fn chainspec() -> ChainSpec {\n");
+    out.push_str("        let gen = genesis();\n");
+    out.push_str(&format!(
+        "        let hardforks = fluent_default_chain_hardforks({});\n",
+        osaka_fmt
+    ));
+    out.push_str("        ChainSpec {\n");
+    out.push_str(&format!(
+        "            chain: reth_chainspec::Chain::from({}u64),\n",
+        genesis_obj.config.chain_id
+    ));
+    out.push_str("            genesis_header: SealedHeader::new_unhashed(genesis_header()),\n");
+    out.push_str("            genesis: gen,\n");
+    out.push_str("            paris_block_and_final_difficulty: Some((0, U256::ZERO)),\n");
+    out.push_str("            hardforks,\n");
+    out.push_str(
+        "            base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::ethereum()),\n",
+    );
+    out.push_str("            deposit_contract: None,\n");
+    out.push_str("            ..Default::default()\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+
+    out.push_str(&format!("}} // mod {mod_name}_genesis\n\n"));
+    out.push_str(&format!("{cfg_attr}\n"));
+    out.push_str(&format!("pub use {mod_name}_genesis::*;\n\n"));
+}
+
+fn emit_chain_config(out: &mut String, cfg: &ChainConfig) {
+    out.push_str("        let config = ChainConfig {\n");
+    out.push_str(&format!("            chain_id: {}u64,\n", cfg.chain_id));
+    out.push_str(&format!("            homestead_block: {},\n", fmt_opt_u64(cfg.homestead_block)));
+    out.push_str(&format!("            dao_fork_block: {},\n", fmt_opt_u64(cfg.dao_fork_block)));
+    out.push_str(&format!("            dao_fork_support: {},\n", cfg.dao_fork_support));
+    out.push_str(&format!("            eip150_block: {},\n", fmt_opt_u64(cfg.eip150_block)));
+    out.push_str(&format!("            eip155_block: {},\n", fmt_opt_u64(cfg.eip155_block)));
+    out.push_str(&format!("            eip158_block: {},\n", fmt_opt_u64(cfg.eip158_block)));
+    out.push_str(&format!("            byzantium_block: {},\n", fmt_opt_u64(cfg.byzantium_block)));
+    out.push_str(&format!(
+        "            constantinople_block: {},\n",
+        fmt_opt_u64(cfg.constantinople_block)
+    ));
+    out.push_str(&format!(
+        "            petersburg_block: {},\n",
+        fmt_opt_u64(cfg.petersburg_block)
+    ));
+    out.push_str(&format!("            istanbul_block: {},\n", fmt_opt_u64(cfg.istanbul_block)));
+    out.push_str(&format!(
+        "            muir_glacier_block: {},\n",
+        fmt_opt_u64(cfg.muir_glacier_block)
+    ));
+    out.push_str(&format!("            berlin_block: {},\n", fmt_opt_u64(cfg.berlin_block)));
+    out.push_str(&format!("            london_block: {},\n", fmt_opt_u64(cfg.london_block)));
+    out.push_str(&format!(
+        "            arrow_glacier_block: {},\n",
+        fmt_opt_u64(cfg.arrow_glacier_block)
+    ));
+    out.push_str(&format!(
+        "            gray_glacier_block: {},\n",
+        fmt_opt_u64(cfg.gray_glacier_block)
+    ));
+    out.push_str(&format!(
+        "            merge_netsplit_block: {},\n",
+        fmt_opt_u64(cfg.merge_netsplit_block)
+    ));
+    out.push_str(&format!("            shanghai_time: {},\n", fmt_opt_u64(cfg.shanghai_time)));
+    out.push_str(&format!("            cancun_time: {},\n", fmt_opt_u64(cfg.cancun_time)));
+    out.push_str(&format!("            prague_time: {},\n", fmt_opt_u64(cfg.prague_time)));
+    out.push_str(&format!("            osaka_time: {},\n", fmt_opt_u64(cfg.osaka_time)));
+    out.push_str(&format!(
+        "            terminal_total_difficulty_passed: {},\n",
+        cfg.terminal_total_difficulty_passed
+    ));
+    out.push_str("            ..Default::default()\n");
+    out.push_str("        };\n\n");
+}
+
+fn emit_genesis_struct(out: &mut String, g: &Genesis) {
+    out.push_str("        Genesis {\n            config,\n");
+    out.push_str(&format!("            nonce: {}u64,\n", g.nonce));
+    out.push_str(&format!("            timestamp: {}u64,\n", g.timestamp));
+    out.push_str(&format!("            gas_limit: {}u64,\n", g.gas_limit));
+    out.push_str(&format!("            number: {},\n", fmt_opt_u64(g.number)));
+    out.push_str(&format!("            difficulty: {},\n", fmt_u256(&g.difficulty)));
+    out.push_str(&format!("            mix_hash: {},\n", fmt_b256(&g.mix_hash)));
+    out.push_str(&format!(
+        "            coinbase: address!(\"{}\"),\n",
+        hex::encode(g.coinbase.as_slice())
+    ));
+    out.push_str(&format!("            extra_data: {},\n", fmt_bytes(&g.extra_data)));
+    out.push_str("            alloc,\n            ..Default::default()\n        }\n");
+}
+
+fn emit_header_fields(out: &mut String, h: &reth_primitives::Header) {
+    out.push_str(&format!("            parent_hash: {},\n", fmt_b256(&h.parent_hash)));
+    out.push_str(&format!("            ommers_hash: {},\n", fmt_b256(&h.ommers_hash)));
+    out.push_str(&format!(
+        "            beneficiary: address!(\"{}\"),\n",
+        hex::encode(h.beneficiary.as_slice())
+    ));
+    out.push_str(&format!("            state_root: {},\n", fmt_b256(&h.state_root)));
+    out.push_str(&format!("            transactions_root: {},\n", fmt_b256(&h.transactions_root)));
+    out.push_str(&format!("            receipts_root: {},\n", fmt_b256(&h.receipts_root)));
+    out.push_str(&format!("            logs_bloom: {},\n", fmt_bloom(&h.logs_bloom)));
+    out.push_str(&format!("            difficulty: {},\n", fmt_u256(&h.difficulty)));
+    out.push_str(&format!("            number: {}u64,\n", h.number));
+    out.push_str(&format!("            gas_limit: {}u64,\n", h.gas_limit));
+    out.push_str(&format!("            gas_used: {}u64,\n", h.gas_used));
+    out.push_str(&format!("            timestamp: {}u64,\n", h.timestamp));
+    out.push_str(&format!("            extra_data: {},\n", fmt_bytes(&h.extra_data)));
+    out.push_str(&format!("            mix_hash: {},\n", fmt_b256(&h.mix_hash)));
+    out.push_str(&format!(
+        "            nonce: 0x{:016x}u64.into(),\n",
+        u64::from_be_bytes(h.nonce.0)
+    ));
+    out.push_str(&format!("            base_fee_per_gas: {},\n", fmt_opt_u64(h.base_fee_per_gas)));
+    out.push_str(&format!(
+        "            withdrawals_root: {},\n",
+        fmt_opt_b256(&h.withdrawals_root)
+    ));
+    out.push_str(&format!("            blob_gas_used: {},\n", fmt_opt_u64(h.blob_gas_used)));
+    out.push_str(&format!("            excess_blob_gas: {},\n", fmt_opt_u64(h.excess_blob_gas)));
+    out.push_str(&format!(
+        "            parent_beacon_block_root: {},\n",
+        fmt_opt_b256(&h.parent_beacon_block_root)
+    ));
+    out.push_str(&format!("            requests_hash: {},\n", fmt_opt_b256(&h.requests_hash)));
+}
+
+// ─── hardforks helper for build step ─────────────────────────────────────────
+
+fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardforks {
+    ChainHardforks::new(vec![
+        (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Dao.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::SpuriousDragon.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Constantinople.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Petersburg.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
+        (
+            EthereumHardfork::Paris.boxed(),
+            ForkCondition::TTD {
+                activation_block_number: 0,
+                fork_block: None,
+                total_difficulty: U256::ZERO,
+            },
+        ),
+        (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(0)),
+        (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(0)),
+        (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(0)),
+        (EthereumHardfork::Osaka.boxed(), osaka_fork),
+    ])
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let src_dir = manifest_dir.join("src");
     let bin_dir = src_dir.join("fluent_genesis_bin");
     fs::create_dir_all(&bin_dir).unwrap();
 
-    // ── collect active genesis sources ───────────────────────────────────────
-
-    let sources = genesis_sources(&manifest_dir);
-    let active: Vec<&GenesisSource> = sources.iter().filter(|s| is_active(s)).collect();
-
-    // register rerun-if-changed for ALL sources (so toggling a feature rebuilds)
-    for s in &sources {
-        println!("cargo:rerun-if-changed={}", s.path.display());
-    }
-
-    // ── load JSONs ───────────────────────────────────────────────────────────
-
-    let jsons: Vec<Value> = active
-        .iter()
-        .map(|s| {
-            let raw = fs::read_to_string(&s.path)
-                .unwrap_or_else(|_| panic!("genesis file not found: {}", s.path.display()));
-            serde_json::from_str(&raw)
-                .unwrap_or_else(|_| panic!("failed to parse: {}", s.path.display()))
-        })
-        .collect();
-
-    // base JSON is always the first one (feature: None)
-    let base_json = &jsons[0];
-
-    // ── merge allocs (later wins on duplicate address) ───────────────────────
-
-    let merged_alloc = merge_allocs(&jsons);
-    let count = merged_alloc.len();
-
-    // ── compute header ───────────────────────────────────────────────────────
-
-    let genesis_obj = build_genesis_object(base_json, &merged_alloc);
-    let hardforks = DEV_HARDFORKS.clone();
-    let header = make_genesis_header(&genesis_obj, &hardforks);
-
-    // ── codegen ──────────────────────────────────────────────────────────────
+    let networks = network_defs();
+    let all_features: Vec<&str> = networks.iter().filter_map(|n| n.feature).collect();
 
     let mut out = String::new();
-
     out.push_str("// @generated — do not edit manually\n");
     out.push_str("#![allow(clippy::all)]\n");
+
     out.push_str("use alloy_primitives::{address, b256, U256, Bytes, Address, Bloom};\n");
     out.push_str("use alloy_genesis::{Genesis, GenesisAccount, ChainConfig};\n");
     out.push_str("use reth_primitives_traits::Header;\n");
+    out.push_str("use reth_chainspec::{ChainSpec, ChainHardforks, EthereumHardfork, ForkCondition, BaseFeeParamsKind, BaseFeeParams, Hardfork};\n");
+    out.push_str("use reth_primitives_traits::SealedHeader;\n");
     out.push_str("use std::collections::BTreeMap;\n\n");
 
-    // ── alloc ────────────────────────────────────────────────────────────────
+    out.push_str(
+        r#"
+pub fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardforks {
+    ChainHardforks::new(vec![
+        (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Dao.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::SpuriousDragon.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Constantinople.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Petersburg.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
+        (
+            EthereumHardfork::Paris.boxed(),
+            ForkCondition::TTD {
+                activation_block_number: 0,
+                fork_block: None,
+                total_difficulty: U256::ZERO,
+            },
+        ),
+        (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(0)),
+        (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(0)),
+        (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(0)),
+        (EthereumHardfork::Osaka.boxed(), osaka_fork),
+    ])
+}
+"#,
+    );
 
-    out.push_str(&format!("pub const ALLOC_LEN: usize = {count};\n\n"));
-    out.push_str("pub fn genesis_alloc() -> [(Address, GenesisAccount); ALLOC_LEN] {\n");
-    out.push_str("    [\n");
+    let mut prior_features = Vec::new();
 
-    for (addr_clean, account) in &merged_alloc {
-        let entry = emit_account(addr_clean, account, &bin_dir);
-        out.push_str(&format!("        {entry},\n"));
+    for net in &networks {
+        let label = net.feature.unwrap_or("default");
+        println!("cargo:warning=Processing genesis for network: {label}");
+
+        let (json, gz_path) = download_and_cache_genesis(net.tag, net.channel);
+        println!("cargo:rerun-if-changed={}", gz_path.display());
+
+        let genesis_obj = build_genesis_object(&json, net.chain_id);
+        let hardforks = fluent_default_chain_hardforks(net.osaka_fork.clone());
+
+        emit_network(
+            &mut out,
+            &bin_dir,
+            &json,
+            &genesis_obj,
+            &hardforks,
+            net,
+            &all_features,
+            &prior_features,
+        );
+
+        if let Some(f) = net.feature {
+            prior_features.push(f);
+        }
     }
-
-    out.push_str("    ]\n}\n\n");
-
-    // ── genesis() ────────────────────────────────────────────────────────────
-
-    let cfg = &base_json["config"];
-
-    let chain_id = cfg["chainId"].as_u64().unwrap_or(1337);
-    let homestead = cfg["homesteadBlock"].as_u64().unwrap_or(0);
-    let dao_fork_blk = cfg["daoForkBlock"].as_u64().unwrap_or(0);
-    let dao_fork_sup = cfg["daoForkSupport"].as_bool().unwrap_or(false);
-    let eip150 = cfg["eip150Block"].as_u64().unwrap_or(0);
-    let eip155 = cfg["eip155Block"].as_u64().unwrap_or(0);
-    let eip158 = cfg["eip158Block"].as_u64().unwrap_or(0);
-    let byzantium = cfg["byzantiumBlock"].as_u64().unwrap_or(0);
-    let constantinople = cfg["constantinopleBlock"].as_u64().unwrap_or(0);
-    let petersburg = cfg["petersburgBlock"].as_u64().unwrap_or(0);
-    let istanbul = cfg["istanbulBlock"].as_u64().unwrap_or(0);
-    let muir_glacier = cfg["muirGlacierBlock"].as_u64().unwrap_or(0);
-    let berlin = cfg["berlinBlock"].as_u64().unwrap_or(0);
-    let london = cfg["londonBlock"].as_u64().unwrap_or(0);
-    let arrow_glacier = cfg["arrowGlacierBlock"].as_u64().unwrap_or(0);
-    let gray_glacier = cfg["grayGlacierBlock"].as_u64().unwrap_or(0);
-    let merge_netsplit = cfg["mergeNetsplitBlock"].as_u64().unwrap_or(0);
-    let shanghai_time = cfg["shanghaiTime"].as_u64().unwrap_or(0);
-    let cancun_time = cfg["cancunTime"].as_u64().unwrap_or(0);
-    let prague_time = cfg["pragueTime"].as_u64().unwrap_or(0);
-    let osaka_time = cfg["osakaTime"].as_u64().unwrap_or(999999999999);
-    let ttd_passed = cfg["terminalTotalDifficultyPassed"].as_bool().unwrap_or(false);
-
-    let parse_hex_u64 = |v: &Value| -> u64 {
-        u64::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap()
-    };
-
-    let timestamp = parse_hex_u64(&base_json["timestamp"]);
-    let gas_limit = parse_hex_u64(&base_json["gasLimit"]);
-    let nonce = parse_hex_u64(&base_json["nonce"]);
-    let number = parse_hex_u64(&base_json["number"]);
-
-    let difficulty_lit = fmt_u256(
-        &U256::from_str_radix(
-            base_json["difficulty"].as_str().unwrap_or("0x0").trim_start_matches("0x"),
-            16,
-        )
-        .unwrap(),
-    );
-
-    let mix_hash = format!(
-        "{:0>64}",
-        base_json["mixHash"].as_str().unwrap_or("0x0").trim_start_matches("0x")
-    );
-    let coinbase = format!(
-        "{:0>40}",
-        base_json["coinbase"].as_str().unwrap_or("0x0").trim_start_matches("0x")
-    );
-
-    let extra_data_bytes = hex::decode(
-        base_json["extraData"].as_str().unwrap_or("0x").trim_start_matches("0x"),
-    )
-    .unwrap();
-    let extra_data_lit = if extra_data_bytes.is_empty() {
-        "Bytes::default()".to_string()
-    } else {
-        format!(
-            "Bytes::from_static(&[{}])",
-            extra_data_bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
-        )
-    };
-
-    out.push_str("pub fn genesis() -> Genesis {\n");
-    out.push_str("    let alloc: BTreeMap<Address, GenesisAccount> =\n");
-    out.push_str("        genesis_alloc().into_iter().collect();\n\n");
-    out.push_str("    let config = ChainConfig {\n");
-    out.push_str(&format!("        chain_id: {chain_id}u64,\n"));
-    out.push_str(&format!("        homestead_block: Some({homestead}u64),\n"));
-    out.push_str(&format!("        dao_fork_block: Some({dao_fork_blk}u64),\n"));
-    out.push_str(&format!("        dao_fork_support: {dao_fork_sup},\n"));
-    out.push_str(&format!("        eip150_block: Some({eip150}u64),\n"));
-    out.push_str(&format!("        eip155_block: Some({eip155}u64),\n"));
-    out.push_str(&format!("        eip158_block: Some({eip158}u64),\n"));
-    out.push_str(&format!("        byzantium_block: Some({byzantium}u64),\n"));
-    out.push_str(&format!("        constantinople_block: Some({constantinople}u64),\n"));
-    out.push_str(&format!("        petersburg_block: Some({petersburg}u64),\n"));
-    out.push_str(&format!("        istanbul_block: Some({istanbul}u64),\n"));
-    out.push_str(&format!("        muir_glacier_block: Some({muir_glacier}u64),\n"));
-    out.push_str(&format!("        berlin_block: Some({berlin}u64),\n"));
-    out.push_str(&format!("        london_block: Some({london}u64),\n"));
-    out.push_str(&format!("        arrow_glacier_block: Some({arrow_glacier}u64),\n"));
-    out.push_str(&format!("        gray_glacier_block: Some({gray_glacier}u64),\n"));
-    out.push_str(&format!("        merge_netsplit_block: Some({merge_netsplit}u64),\n"));
-    out.push_str(&format!("        shanghai_time: Some({shanghai_time}u64),\n"));
-    out.push_str(&format!("        cancun_time: Some({cancun_time}u64),\n"));
-    out.push_str(&format!("        prague_time: Some({prague_time}u64),\n"));
-    out.push_str(&format!("        osaka_time: Some({osaka_time}u64),\n"));
-    out.push_str(&format!("        terminal_total_difficulty_passed: {ttd_passed},\n"));
-    out.push_str("        ..Default::default()\n");
-    out.push_str("    };\n\n");
-    out.push_str("    Genesis {\n");
-    out.push_str("        config,\n");
-    out.push_str(&format!("        nonce: {nonce}u64,\n"));
-    out.push_str(&format!("        timestamp: {timestamp}u64,\n"));
-    out.push_str(&format!("        gas_limit: {gas_limit}u64,\n"));
-    out.push_str(&format!("        number: Some({number}u64),\n"));
-    out.push_str(&format!("        difficulty: {difficulty_lit},\n"));
-    out.push_str(&format!("        mix_hash: b256!(\"{mix_hash}\"),\n"));
-    out.push_str(&format!("        coinbase: address!(\"{coinbase}\"),\n"));
-    out.push_str(&format!("        extra_data: {extra_data_lit},\n"));
-    out.push_str("        alloc,\n");
-    out.push_str("        ..Default::default()\n");
-    out.push_str("    }\n");
-    out.push_str("}\n\n");
-
-    // ── genesis_header() ─────────────────────────────────────────────────────
-
-    let h_parent_hash = fmt_b256(&header.parent_hash);
-    let h_ommers_hash = fmt_b256(&header.ommers_hash);
-    let h_beneficiary = format!("address!(\"{}\")", hex::encode(header.beneficiary.as_slice()));
-    let h_state_root = fmt_b256(&header.state_root);
-    let h_transactions_root = fmt_b256(&header.transactions_root);
-    let h_receipts_root = fmt_b256(&header.receipts_root);
-    let h_logs_bloom = fmt_bloom(&header.logs_bloom);
-    let h_difficulty = fmt_u256(&header.difficulty);
-    let h_number = header.number;
-    let h_gas_limit = header.gas_limit;
-    let h_gas_used = header.gas_used;
-    let h_timestamp = header.timestamp;
-    let h_extra_data = fmt_bytes(&header.extra_data);
-    let h_mix_hash = fmt_b256(&header.mix_hash);
-    let h_nonce = format!("0x{:016x}u64.into()", u64::from_be_bytes(header.nonce.0));
-    let h_base_fee = fmt_opt_u64(header.base_fee_per_gas);
-    let h_withdrawals_root = fmt_opt_b256(&header.withdrawals_root);
-    let h_blob_gas_used = fmt_opt_u64(header.blob_gas_used);
-    let h_excess_blob_gas = fmt_opt_u64(header.excess_blob_gas);
-    let h_parent_beacon = fmt_opt_b256(&header.parent_beacon_block_root);
-    let h_requests_hash = fmt_opt_b256(&header.requests_hash);
-
-    out.push_str("pub fn genesis_header() -> Header {\n");
-    out.push_str("    Header {\n");
-    out.push_str(&format!("        parent_hash: {h_parent_hash},\n"));
-    out.push_str(&format!("        ommers_hash: {h_ommers_hash},\n"));
-    out.push_str(&format!("        beneficiary: {h_beneficiary},\n"));
-    out.push_str(&format!("        state_root: {h_state_root},\n"));
-    out.push_str(&format!("        transactions_root: {h_transactions_root},\n"));
-    out.push_str(&format!("        receipts_root: {h_receipts_root},\n"));
-    out.push_str(&format!("        logs_bloom: {h_logs_bloom},\n"));
-    out.push_str(&format!("        difficulty: {h_difficulty},\n"));
-    out.push_str(&format!("        number: {h_number}u64,\n"));
-    out.push_str(&format!("        gas_limit: {h_gas_limit}u64,\n"));
-    out.push_str(&format!("        gas_used: {h_gas_used}u64,\n"));
-    out.push_str(&format!("        timestamp: {h_timestamp}u64,\n"));
-    out.push_str(&format!("        extra_data: {h_extra_data},\n"));
-    out.push_str(&format!("        mix_hash: {h_mix_hash},\n"));
-    out.push_str(&format!("        nonce: {h_nonce},\n"));
-    out.push_str(&format!("        base_fee_per_gas: {h_base_fee},\n"));
-    out.push_str(&format!("        withdrawals_root: {h_withdrawals_root},\n"));
-    out.push_str(&format!("        blob_gas_used: {h_blob_gas_used},\n"));
-    out.push_str(&format!("        excess_blob_gas: {h_excess_blob_gas},\n"));
-    out.push_str(&format!("        parent_beacon_block_root: {h_parent_beacon},\n"));
-    out.push_str(&format!("        requests_hash: {h_requests_hash},\n"));
-    out.push_str("    }\n");
-    out.push_str("}\n");
 
     write_if_changed(&src_dir.join("fluent_genesis.rs"), out.as_bytes());
 }

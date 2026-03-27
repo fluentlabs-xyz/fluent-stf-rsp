@@ -1,36 +1,41 @@
 //! # proxy
 //!
-//! HTTP proxy that sits between callers and two execution backends:
+//! HTTP proxy that sits between callers and execution backends.
 //!
-//! 1. **Nitro enclave** (`POST /nitro`) — executes an Ethereum block inside an AWS Nitro Enclave
-//!    and returns a signed execution result.
+//! ## Signing endpoints (Nitro TEE, caller provides `EthClientExecutorInput`)
 //!
-//! 2. **SP1 prover** — executes the same block inside the SP1 zkVM and
-//!    returns a Groth16 proof that can be verified on-chain by any `ISP1Verifier`-compatible
-//!    contract.
-//!    - `POST /sp1/request` — submits a block for async proof generation, returns a `request_id`.
-//!    - `POST /sp1/status`  — polls by `request_id`, returns the proof when ready.
+//! - `POST /sign-block-execution`           — execute block, return signed result (bincode+zstd)
+//! - `POST /sign-batch-root`                — sign batch Merkle root from in-memory store
+//! - `POST /sign-batch-root-from-responses` — sign batch root from pre-signed responses (blobs from beacon)
 //!
-//! Both endpoints share the same block-fetching and host-execution pipeline
-//! ([`build_client_input`]) and are protected by an API key middleware.
+//! ## Challenge endpoints (proxy builds `ClientInput` from RPC)
 //!
-//! ## Optional backends
+//! - `POST /challenge/nitro`          — TEE challenge execution (blobs from beacon)
+//! - `POST /challenge/sp1/request`    — submit async SP1 zkVM proof request (blobs from beacon)
+//! - `POST /challenge/sp1/status`     — poll for SP1 proof result
 //!
-//! - Nitro enclave is enabled by passing `--eif_path <path>` at startup.
-//! - SP1 prover is enabled by setting the `SP1_ELF_PATH` environment variable.
+//! ## Mock endpoints (testing, no SP1 network calls)
+//!
+//! - `POST /mock/sp1/request`         — returns a fake request_id
+//! - `POST /mock/sp1/status`          — returns a hardcoded proof
+//!
+//! All endpoints are protected by `x-api-key` header.
 
+mod blob;
 mod enclave;
 mod types;
 
 use crate::{
-    enclave::maybe_restart_enclave,
+    enclave::ensure_initialized,
     types::{NitroConfig, Sp1ProofResponse},
 };
-use nitro_types::EthExecutionResponse;
+use nitro_types::{EthExecutionResponse, SubmitBatchResponse};
 
-use std::{env, path::Path, sync::Arc};
+use std::{env, sync::Arc};
 
+use alloy_primitives::Address;
 use axum::{
+    body::Bytes,
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
@@ -49,22 +54,19 @@ use serde::{Deserialize, Serialize};
 
 use alloy_provider::{Provider, RootProvider};
 use reth_chainspec::ChainSpec;
-use reth_ethereum_primitives::EthPrimitives;
-use reth_evm_ethereum::EthEvmConfig;
-use rsp_client_executor::{evm::FluentEvmFactory, io::ClientExecutorInput};
+use rsp_client_executor::{evm::FluentEvmConfig, io::EthClientExecutorInput};
 use rsp_host_executor::{create_eth_block_execution_strategy_factory, HostExecutor};
 use rsp_provider::create_provider;
 
 use sp1_sdk::{
     network::{prover::NetworkProver, NetworkMode},
-    Elf, HashableKey, Prover, ProverClient, ProvingKey, SP1ProvingKey, SP1Stdin,
+    Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey, SP1ProvingKey, SP1Stdin,
 };
 
-use sp1_sdk::ProveRequest;
+use c_kzg::{Blob as CKzgBlob, KzgSettings};
 use tracing::info;
 
 pub fn rpc_url() -> String {
-    // Env var always wins if set
     if let Ok(url) = env::var("RPC_URL") {
         return url;
     }
@@ -79,46 +81,88 @@ pub fn rpc_url() -> String {
     "http://localhost:8545".to_string()
 }
 
-
 // ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
 
-/// Shared state cloned into every request handler via Axum's `State` extractor.
 #[derive(Clone)]
 struct AppState {
     api_key: String,
-    /// Nitro enclave state. `None` when `--eif_path` is not provided.
     nitro: Option<NitroState>,
-    block_execution_strategy_factory: EthEvmConfig<ChainSpec, FluentEvmFactory>,
-    genesis: Genesis,
-    chain_spec: Arc<ChainSpec>,
-    /// SP1 prover state. `None` when `SP1_ELF_PATH` is not set.
     sp1: Option<Sp1State>,
+    /// RPC / chain context — used by challenge endpoints to build ClientInput.
+    chain: ChainContext,
+    /// L1 context — used by `/sign-batch-root` for blob fetching.
+    l1: Option<L1State>,
 }
 
-/// Nitro-specific state initialised once at startup and shared across requests.
+#[derive(Clone)]
+struct L1State {
+    provider: RootProvider,
+    contract_addr: Address,
+    beacon_url: String,
+    beacon_genesis_timestamp: u64,
+    http_client: reqwest::Client,
+}
+
 #[derive(Clone)]
 struct NitroState {
     config: NitroConfig,
 }
 
-/// SP1-specific state initialised once at startup and shared across requests.
 #[derive(Clone)]
 struct Sp1State {
     client: Arc<NetworkProver>,
-    /// Proving key derived from the compiled zkVM ELF.
     pk: Arc<SP1ProvingKey>,
 }
 
+#[derive(Clone)]
+struct ChainContext {
+    block_execution_strategy_factory: FluentEvmConfig,
+    genesis: Genesis,
+    chain_spec: Arc<ChainSpec>,
+}
+
 // ---------------------------------------------------------------------------
-// HTTP request / response types
+// Request / response types
 // ---------------------------------------------------------------------------
 
+#[derive(Serialize, Debug)]
+pub struct BlobVerificationInput {
+    pub blobs: Vec<Vec<u8>>,
+    pub commitments: Vec<Vec<u8>>,
+    pub proofs: Vec<Vec<u8>>,
+}
+
+/// `POST /challenge/nitro` — block ref + batch index for blob fetching.
 #[derive(Deserialize)]
-struct BlockRequest {
+struct ChallengeNitroRequest {
     block_number: Option<u64>,
     block_hash: Option<B256>,
+    batch_index: u64,
+}
+
+/// `POST /challenge/sp1/request` — block ref + batch index for blob fetching.
+#[derive(Deserialize)]
+struct ChallengeSp1Request {
+    block_number: Option<u64>,
+    block_hash: Option<B256>,
+    batch_index: u64,
+}
+
+/// `POST /sign-batch-root`
+#[derive(Deserialize)]
+struct SignBatchRootRequest {
+    from_block: u64,
+    to_block: u64,
+    batch_index: u64,
+}
+
+/// `POST /sign-batch-root-from-responses`
+#[derive(Deserialize)]
+struct SignBatchRootFromResponsesRequest {
+    responses: Vec<EthExecutionResponse>,
+    batch_index: u64,
 }
 
 #[derive(Deserialize)]
@@ -170,22 +214,87 @@ async fn require_api_key(
 }
 
 // ---------------------------------------------------------------------------
-// Shared helper: fetch block + build ClientExecutorInput
+// Helpers
 // ---------------------------------------------------------------------------
 
-/// Fetches `block_number` and runs the host-side execution
-/// phase to produce a [`ClientExecutorInput`] ready for either backend.
-///
-/// This is intentionally shared between [`block`] and [`block_sp1_request`] so
-/// the two endpoints always use identical witness data.
+fn require_nitro(state: &AppState) -> Result<&NitroState, HandlerError> {
+    state
+        .nitro
+        .as_ref()
+        .ok_or_else(|| internal("Nitro enclave not configured (pass --eif_path at startup)"))
+}
+
+fn require_sp1(state: &AppState) -> Result<&Sp1State, HandlerError> {
+    state.sp1.as_ref().ok_or_else(|| internal("SP1 prover not configured (set SP1_ELF_PATH)"))
+}
+
+fn require_l1(state: &AppState) -> Result<&L1State, HandlerError> {
+    state.l1.as_ref().ok_or_else(|| {
+        internal("L1 not configured (set L1_RPC_URL, L1_CONTRACT_ADDR, L1_BEACON_URL)")
+    })
+}
+
+/// Generates KZG commitments and proofs on the host using Fiat-Shamir.
+/// This witness is sent to SP1 to avoid heavy MSMs inside the zkVM.
+fn prepare_blob_input(raw_blobs: &[Vec<u8>]) -> Result<BlobVerificationInput, HandlerError> {
+    let setup_str = std::str::from_utf8(include_bytes!("../../client/trusted_setup.txt"))
+        .map_err(|_| internal("Invalid trusted setup UTF-8"))?;
+    let settings = KzgSettings::parse_kzg_trusted_setup(setup_str, 0)
+        .map_err(|e| internal(format!("Failed to parse KZG settings: {e}")))?;
+
+    let mut commitments = Vec::with_capacity(raw_blobs.len());
+    let mut proofs = Vec::with_capacity(raw_blobs.len());
+
+    for raw in raw_blobs {
+        let blob = CKzgBlob::from_bytes(raw)
+            .map_err(|e| bad_request(format!("Invalid blob bytes: {e}")))?;
+
+        let commitment = settings
+            .blob_to_kzg_commitment(&blob)
+            .map_err(|e| internal(format!("KZG commitment failed: {e}")))?;
+
+        let commitment_bytes = commitment.to_bytes();
+
+        let proof = settings
+            .compute_blob_kzg_proof(&blob, &commitment_bytes)
+            .map_err(|e| internal(format!("KZG proof generation failed: {e}")))?;
+
+        commitments.push(commitment_bytes.to_vec());
+        proofs.push(proof.to_bytes().to_vec());
+    }
+
+    Ok(BlobVerificationInput { blobs: raw_blobs.to_vec(), commitments, proofs })
+}
+
+/// Fetch blobs for a challenge endpoint using L1 + Beacon API.
+async fn fetch_challenge_blobs(
+    l1: &L1State,
+    batch_index: u64,
+) -> Result<Vec<Vec<u8>>, HandlerError> {
+    blob::fetch_blobs_for_batch(
+        &l1.provider,
+        &l1.beacon_url,
+        &l1.http_client,
+        l1.contract_addr,
+        batch_index,
+        l1.beacon_genesis_timestamp,
+    )
+    .await
+    .map_err(|e| internal(format!("Blob fetching failed: {e}")))
+}
+
+/// Resolves a block number from either `block_number` or `block_hash`,
+/// fetches the block from RPC and runs host-side execution to produce
+/// an `EthClientExecutorInput`.
 async fn build_client_input(
-    req: BlockRequest,
-    state: &AppState,
-) -> Result<ClientExecutorInput<EthPrimitives>, HandlerError> {
+    block_number: Option<u64>,
+    block_hash: Option<B256>,
+    chain: &ChainContext,
+) -> Result<EthClientExecutorInput, HandlerError> {
     let url = Url::parse(&rpc_url()).map_err(|e| bad_request(format!("Invalid rpc_url: {e}")))?;
     let provider: RootProvider = create_provider(url);
 
-    let block_number = match (req.block_number, req.block_hash) {
+    let block_number = match (block_number, block_hash) {
         (_, Some(hash)) => {
             provider
                 .get_block_by_hash(hash)
@@ -197,70 +306,181 @@ async fn build_client_input(
         }
         (Some(number), _) => number,
         (None, None) => {
-            return Err(bad_request(
-                "Either block_number or block_hash must be provided".to_string(),
-            ))
+            return Err(bad_request("Either block_number or block_hash must be provided"))
         }
     };
 
     let host_executor =
-        HostExecutor::new(state.block_execution_strategy_factory.clone(), state.chain_spec.clone());
+        HostExecutor::new(chain.block_execution_strategy_factory.clone(), chain.chain_spec.clone());
 
     host_executor
-        .execute(block_number, &provider, state.genesis.clone(), None, false)
+        .execute(block_number, &provider, chain.genesis.clone(), None, false)
         .await
         .map_err(|e| internal(format!("Block execution failed: {e}")))
 }
 
-// ---------------------------------------------------------------------------
-// Handler: POST /nitro  —  Nitro enclave execution
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Signing endpoints — caller provides EthClientExecutorInput
+// ===========================================================================
 
-/// Executes `block_number` inside the AWS Nitro Enclave and returns a signed
-/// [`EthExecutionResponse`].
+/// `POST /sign-block-execution`
 ///
-/// Returns HTTP 500 if the server was started without `--eif_path`.
-async fn block(
+/// Body: zstd-compressed bincode `EthClientExecutorInput`.
+/// Headers: `Content-Type: application/octet-stream`, `Content-Encoding: zstd`.
+async fn sign_block_execution(
     State(state): State<AppState>,
-    Json(req): Json<BlockRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<EthExecutionResponse>, HandlerError> {
-    let nitro = state
-        .nitro
-        .as_ref()
-        .ok_or_else(|| internal("Nitro enclave not configured (pass --eif_path at startup)"))?;
+    let nitro = require_nitro(&state)?;
 
-    let client_input = build_client_input(req, &state).await?;
+    let input = decode_zstd_bincode::<EthClientExecutorInput>(&headers, &body)?;
 
-    let response = enclave::execute_block(client_input, nitro.config)
+    let response = enclave::execute_block(input, nitro.config)
         .await
-        .map_err(|e| internal(format!("Enclave processing failed: {e}")))?;
+        .map_err(|e| internal(format!("Enclave execution failed: {e}")))?;
 
     Ok(Json(response))
 }
 
-// ---------------------------------------------------------------------------
-// Handler: POST /sp1/request  —  submit async SP1 proof request
-// ---------------------------------------------------------------------------
+/// Decode a zstd-compressed bincode payload.
+///
+/// If `Content-Encoding: zstd` is present, decompresses first.
+/// Otherwise treats the body as raw bincode.
+fn decode_zstd_bincode<T: serde::de::DeserializeOwned>(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<T, HandlerError> {
+    let is_zstd =
+        headers.get("content-encoding").and_then(|v| v.to_str().ok()).is_some_and(|v| v == "zstd");
 
-/// Builds client input for the given block, submits it to the SP1 prover
-/// asynchronously, and returns the `request_id` for later polling.
-async fn block_sp1_request(
+    let raw = if is_zstd {
+        zstd::decode_all(body)
+            .map_err(|e| bad_request(format!("Zstd decompression failed: {e}")))?
+    } else {
+        body.to_vec()
+    };
+
+    bincode::deserialize(&raw)
+        .map_err(|e| bad_request(format!("Bincode deserialization failed: {e}")))
+}
+
+/// `POST /sign-batch-root`
+///
+/// Fetches blobs from L1 + Beacon API using `batch_index`, then sends them
+/// to the enclave for batch root signing.
+async fn sign_batch_root(
     State(state): State<AppState>,
-    Json(req): Json<BlockRequest>,
-) -> Result<Json<Sp1RequestResponse>, HandlerError> {
-    let sp1 = state
-        .sp1
-        .as_ref()
-        .ok_or_else(|| internal("SP1 prover not configured (set SP1_ELF_PATH)"))?;
+    Json(req): Json<SignBatchRootRequest>,
+) -> Result<Json<SubmitBatchResponse>, HandlerError> {
+    let nitro = require_nitro(&state)?;
+    let l1 = require_l1(&state)?;
 
-    let client_input = build_client_input(req, &state).await?;
-    let block_number = client_input.current_block.number;
+    if req.from_block > req.to_block {
+        return Err(bad_request(format!(
+            "invalid range: from_block ({}) > to_block ({})",
+            req.from_block, req.to_block
+        )));
+    }
+
+    let blobs = blob::fetch_blobs_for_batch(
+        &l1.provider,
+        &l1.beacon_url,
+        &l1.http_client,
+        l1.contract_addr,
+        req.batch_index,
+        l1.beacon_genesis_timestamp,
+    )
+    .await
+    .map_err(|e| internal(format!("Blob fetching failed: {e}")))?;
+
+    let response = enclave::submit_batch(req.from_block, req.to_block, blobs, nitro.config)
+        .await
+        .map_err(|e| internal(format!("Batch submission failed: {e}")))?;
+
+    Ok(Json(response))
+}
+
+/// `POST /sign-batch-root-from-responses`
+///
+/// Fetches blobs from L1 + Beacon API using `batch_index`, then sends them
+/// to the enclave alongside the pre-signed responses for batch root signing.
+async fn sign_batch_root_from_responses(
+    State(state): State<AppState>,
+    Json(req): Json<SignBatchRootFromResponsesRequest>,
+) -> Result<Json<SubmitBatchResponse>, HandlerError> {
+    let nitro = require_nitro(&state)?;
+    let l1 = require_l1(&state)?;
+
+    if req.responses.is_empty() {
+        return Err(bad_request("responses must not be empty"));
+    }
+
+    let blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
+
+    if blobs.is_empty() {
+        return Err(bad_request("no blobs found for batch_index"));
+    }
+
+    let response = enclave::submit_batch_from_responses(req.responses, blobs, nitro.config)
+        .await
+        .map_err(|e| internal(format!("Batch-from-responses failed: {e}")))?;
+
+    Ok(Json(response))
+}
+
+// ===========================================================================
+// Challenge endpoints — proxy builds ClientInput from RPC
+// ===========================================================================
+
+/// `POST /challenge/nitro`
+/// Body: `{ block_number?, block_hash?, batch_index }`
+///
+/// Fetches blobs from L1 + Beacon API using `batch_index`.
+async fn challenge_nitro(
+    State(state): State<AppState>,
+    Json(req): Json<ChallengeNitroRequest>,
+) -> Result<Json<EthExecutionResponse>, HandlerError> {
+    let nitro = require_nitro(&state)?;
+    let l1 = require_l1(&state)?;
+
+    let raw_blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
+
+    let client_input = build_client_input(req.block_number, req.block_hash, &state.chain).await?;
+
+    let response = enclave::execute_block_challenge(client_input, raw_blobs, nitro.config)
+        .await
+        .map_err(|e| internal(format!("Challenge execution failed: {e}")))?;
+
+    Ok(Json(response))
+}
+
+/// `POST /challenge/sp1/request`
+/// Body: `{ block_number?, block_hash?, batch_index }`
+///
+/// Fetches blobs from L1 + Beacon API using `batch_index`.
+async fn challenge_sp1_request(
+    State(state): State<AppState>,
+    Json(req): Json<ChallengeSp1Request>,
+) -> Result<Json<Sp1RequestResponse>, HandlerError> {
+    let sp1 = require_sp1(&state)?;
+    let l1 = require_l1(&state)?;
+
+    let raw_blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
+
+    let client_input = build_client_input(req.block_number, req.block_hash, &state.chain).await?;
+    let block_number = client_input.current_block.header.number;
+
+    let blob_input = prepare_blob_input(&raw_blobs)?;
 
     let mut stdin = SP1Stdin::new();
-    stdin.write_vec(
-        bincode::serialize(&client_input)
-            .map_err(|e| internal(format!("Failed to serialize client input: {e}")))?,
-    );
+    let serialized_input = bincode::serialize(&client_input)
+        .map_err(|e| internal(format!("Failed to serialize client input: {e}")))?;
+    stdin.write_slice(&serialized_input);
+
+    let serialized_blobs = bincode::serialize(&blob_input)
+        .map_err(|e| internal(format!("Failed to serialize blob input: {e}")))?;
+    stdin.write_slice(&serialized_blobs);
 
     info!(block_number, "Submitting async SP1 Groth16 proof request");
 
@@ -268,6 +488,7 @@ async fn block_sp1_request(
         .client
         .prove(sp1.pk.as_ref(), stdin)
         .groth16()
+        .max_price_per_pgu(500_000_000u64)
         .request()
         .await
         .map_err(|e| internal(format!("Failed to submit proof request: {e}")))?;
@@ -277,22 +498,16 @@ async fn block_sp1_request(
     Ok(Json(Sp1RequestResponse { request_id }))
 }
 
-// ---------------------------------------------------------------------------
-// Handler: POST /sp1/status  —  poll for SP1 proof result
-// ---------------------------------------------------------------------------
-
-/// Checks the status of a previously submitted SP1 proof request.
-///
-/// - **200** — proof is ready, body contains [`Sp1ProofResponse`].
-/// - **202** — proof is still being generated (empty body).
-/// - **404** — `request_id` not found on the SP1 network.
-async fn block_sp1_status(
+/// `POST /challenge/sp1/status`
+/// Body: `{ request_id }`
+/// Returns: `Sp1ProofResponse` (200) | 202 Accepted (pending) | 404 (not found)
+async fn challenge_sp1_status(
     State(state): State<AppState>,
     Json(req): Json<Sp1StatusRequest>,
 ) -> impl IntoResponse {
-    let sp1 = match state.sp1.as_ref() {
-        Some(s) => s,
-        None => return internal("SP1 prover not configured (set SP1_ELF_PATH)").into_response(),
+    let sp1 = match require_sp1(&state) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
 
     let (status, maybe_proof) = match sp1.client.get_proof_status(req.request_id).await {
@@ -333,31 +548,35 @@ async fn block_sp1_status(
     (StatusCode::OK, Json(Sp1ProofResponse { vk_hash, public_values, proof_bytes })).into_response()
 }
 
-// ---------------------------------------------------------------------------
-// Handler: POST /sp1/mock/request
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Mock endpoints
+// ===========================================================================
 
-/// Generates a random `request_id` and returns it as if an SP1 proof request
-/// had been submitted.  Does not require `SP1_ELF_PATH`.
-async fn block_sp1_mock_request(
+/// `POST /mock/sp1/request` — returns a fake request_id, no SP1 network call.
+/// Unified API: Takes exactly the same input as the real `/challenge/sp1/request`
+async fn mock_sp1_request(
     State(_): State<AppState>,
-    Json(_): Json<BlockRequest>,
+    Json(req): Json<ChallengeSp1Request>,
 ) -> Result<Json<Sp1RequestResponse>, HandlerError> {
+    tracing::info!(
+        block_number = ?req.block_number,
+        block_hash = ?req.block_hash,
+        batch_index = req.batch_index,
+        "Submitting MOCK async SP1 request"
+    );
+
     let request_id = B256::from_hex("0x137").unwrap_or_default();
-    
     Ok(Json(Sp1RequestResponse { request_id }))
 }
 
-// ---------------------------------------------------------------------------
-// Handler: POST /sp1/mock/status  —  hardcoded SP1 proof response
-// ---------------------------------------------------------------------------
-
-/// Returns a hardcoded [`Sp1ProofResponse`] for testing purposes, regardless
-/// of the `request_id` provided.  Does not require `SP1_ELF_PATH`.
-async fn block_sp1_mock_status(
+/// `POST /mock/sp1/status` — returns hardcoded proof, no SP1 network call.
+/// Unified API: Exact same return schema as `/challenge/sp1/status`
+async fn mock_sp1_status(
     State(_): State<AppState>,
-    Json(_): Json<Sp1StatusRequest>,
+    Json(req): Json<Sp1StatusRequest>,
 ) -> Result<Json<Sp1ProofResponse>, HandlerError> {
+    tracing::info!(request_id = %hex::encode(req.request_id), "MOCK SP1 proof ready");
+
     let vk_hash = FixedBytes::from([
         0x28, 0x22, 0x33, 0x86, 0x4d, 0x7d, 0x8e, 0x6f, 0x6c, 0x3a, 0x09, 0x6b, 0x5d, 0xcc, 0x08,
         0x8d, 0x76, 0x36, 0x7e, 0x55, 0x31, 0x18, 0xe4, 0x32, 0x19, 0x7d, 0x3e, 0xb2, 0x15, 0xa2,
@@ -375,90 +594,9 @@ async fn block_sp1_mock_status(
         39, 59, 123, 250, 216, 4, 93, 133, 164, 112,
     ];
 
-    let proof_bytes: Vec<u8> = vec![
-        3, 0, 0, 0, 75, 0, 0, 0, 0, 0, 0, 0, 49, 52, 49, 56, 49, 57, 56, 54, 50, 49, 57, 57, 54,
-        49, 55, 54, 49, 55, 53, 52, 50, 50, 49, 57, 51, 48, 57, 50, 51, 49, 48, 49, 57, 49, 50, 48,
-        55, 51, 55, 49, 54, 55, 50, 50, 48, 50, 56, 55, 57, 49, 54, 53, 56, 48, 53, 51, 52, 49, 50,
-        50, 52, 56, 57, 56, 52, 48, 51, 49, 52, 52, 56, 51, 50, 54, 49, 77, 0, 0, 0, 0, 0, 0, 0,
-        49, 48, 56, 52, 52, 56, 57, 49, 53, 54, 48, 55, 56, 55, 53, 57, 56, 55, 54, 48, 54, 49, 51,
-        50, 55, 56, 54, 54, 57, 48, 56, 56, 50, 57, 50, 48, 54, 57, 53, 54, 55, 51, 52, 55, 55, 54,
-        52, 48, 55, 55, 51, 53, 49, 51, 51, 55, 54, 56, 48, 48, 48, 48, 53, 55, 55, 51, 52, 52, 48,
-        54, 48, 53, 57, 48, 53, 53, 52, 1, 0, 0, 0, 0, 0, 0, 0, 48, 75, 0, 0, 0, 0, 0, 0, 0, 50,
-        52, 56, 56, 51, 49, 54, 50, 56, 52, 48, 48, 49, 56, 53, 54, 49, 49, 55, 52, 48, 52, 55, 57,
-        48, 55, 49, 52, 53, 48, 53, 54, 52, 50, 53, 48, 49, 57, 51, 57, 49, 50, 48, 55, 48, 54, 57,
-        51, 57, 50, 53, 48, 49, 51, 49, 56, 50, 50, 52, 51, 49, 50, 55, 50, 56, 50, 51, 52, 50, 50,
-        48, 48, 57, 52, 52, 1, 0, 0, 0, 0, 0, 0, 0, 48, 192, 2, 0, 0, 0, 0, 0, 0, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 56, 99, 100, 53, 54, 101,
-        49, 48, 99, 50, 102, 101, 50, 52, 55, 57, 53, 99, 102, 102, 49, 101, 49, 100, 49, 102, 52,
-        48, 100, 51, 97, 51, 50, 52, 53, 50, 56, 100, 51, 49, 53, 54, 55, 52, 100, 97, 52, 53, 100,
-        50, 54, 97, 102, 98, 51, 55, 54, 101, 56, 54, 55, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 102, 97, 55, 99, 48, 52, 98, 54, 52, 52, 51, 51,
-        100, 97, 101, 50, 54, 53, 97, 98, 97, 55, 97, 53, 52, 54, 57, 55, 102, 53, 98, 51, 101, 56,
-        101, 54, 54, 49, 99, 98, 48, 53, 54, 49, 57, 97, 52, 98, 48, 54, 55, 56, 52, 98, 49, 50,
-        55, 49, 98, 57, 53, 49, 51, 50, 54, 48, 99, 54, 48, 101, 53, 49, 49, 56, 51, 50, 54, 100,
-        99, 56, 52, 50, 48, 50, 57, 97, 54, 53, 49, 56, 100, 101, 100, 98, 50, 98, 98, 48, 55, 100,
-        50, 52, 51, 98, 51, 52, 52, 101, 54, 49, 56, 100, 102, 98, 55, 53, 101, 97, 51, 49, 51, 51,
-        54, 100, 55, 50, 53, 48, 97, 52, 98, 52, 99, 52, 51, 102, 100, 55, 102, 57, 50, 53, 51, 52,
-        52, 101, 102, 100, 54, 98, 51, 54, 102, 51, 49, 52, 57, 56, 100, 101, 48, 99, 97, 55, 50,
-        49, 56, 98, 52, 56, 54, 50, 52, 55, 48, 100, 55, 57, 52, 48, 98, 53, 52, 99, 97, 49, 101,
-        101, 53, 98, 102, 50, 54, 55, 98, 51, 50, 99, 102, 52, 52, 49, 52, 100, 53, 49, 48, 53, 53,
-        48, 101, 55, 100, 52, 48, 48, 57, 55, 57, 99, 51, 99, 101, 50, 100, 99, 49, 48, 99, 48,
-        100, 57, 52, 102, 49, 54, 55, 54, 53, 102, 102, 98, 56, 57, 56, 51, 99, 98, 49, 50, 52, 55,
-        51, 100, 99, 49, 52, 97, 53, 50, 100, 102, 97, 52, 50, 51, 53, 99, 53, 48, 98, 48, 98, 99,
-        52, 51, 56, 51, 100, 97, 52, 102, 102, 56, 102, 56, 102, 100, 51, 57, 51, 53, 51, 102, 48,
-        52, 53, 48, 99, 51, 102, 49, 54, 51, 49, 54, 98, 100, 100, 53, 102, 51, 101, 97, 52, 102,
-        100, 50, 51, 49, 102, 54, 54, 55, 50, 49, 102, 97, 53, 48, 57, 98, 99, 98, 102, 100, 52,
-        53, 51, 51, 53, 50, 99, 56, 51, 97, 54, 99, 51, 54, 49, 48, 50, 57, 54, 97, 97, 57, 48, 97,
-        54, 51, 56, 52, 101, 99, 98, 55, 50, 98, 98, 99, 57, 53, 102, 48, 54, 54, 51, 101, 49, 50,
-        99, 50, 100, 101, 48, 100, 55, 52, 53, 48, 49, 100, 53, 56, 101, 54, 56, 100, 53, 56, 102,
-        52, 52, 57, 54, 102, 52, 49, 55, 51, 55, 101, 49, 102, 52, 54, 102, 57, 48, 48, 101, 54,
-        57, 97, 53, 99, 102, 99, 57, 99, 100, 97, 52, 51, 56, 102, 49, 55, 55, 100, 56, 54, 52, 49,
-        48, 49, 100, 101, 101, 49, 50, 101, 57, 97, 101, 55, 49, 49, 53, 102, 98, 55, 53, 55, 56,
-        51, 48, 98, 54, 49, 99, 53, 55, 101, 100, 102, 98, 52, 97, 52, 99, 49, 99, 51, 53, 50, 99,
-        102, 49, 99, 100, 54, 99, 51, 53, 56, 102, 100, 51, 54, 57, 97, 55, 51, 49, 53, 56, 51, 50,
-        136, 2, 0, 0, 0, 0, 0, 0, 49, 102, 97, 55, 99, 48, 52, 98, 54, 52, 52, 51, 51, 100, 97,
-        101, 50, 54, 53, 97, 98, 97, 55, 97, 53, 52, 54, 57, 55, 102, 53, 98, 51, 101, 56, 101, 54,
-        54, 49, 99, 98, 48, 53, 54, 49, 57, 97, 52, 98, 48, 54, 55, 56, 52, 98, 49, 50, 55, 49, 98,
-        57, 53, 49, 51, 50, 54, 48, 99, 54, 48, 101, 53, 49, 49, 56, 51, 50, 54, 100, 99, 56, 52,
-        50, 48, 50, 57, 97, 54, 53, 49, 56, 100, 101, 100, 98, 50, 98, 98, 48, 55, 100, 50, 52, 51,
-        98, 51, 52, 52, 101, 54, 49, 56, 100, 102, 98, 55, 53, 101, 97, 51, 49, 51, 51, 54, 100,
-        55, 50, 53, 48, 97, 52, 98, 52, 99, 52, 51, 102, 100, 55, 102, 57, 50, 53, 51, 52, 52, 101,
-        102, 100, 54, 98, 51, 54, 102, 51, 49, 52, 57, 56, 100, 101, 48, 99, 97, 55, 50, 49, 56,
-        98, 52, 56, 54, 50, 52, 55, 48, 100, 55, 57, 52, 48, 98, 53, 52, 99, 97, 49, 101, 101, 53,
-        98, 102, 50, 54, 55, 98, 51, 50, 99, 102, 52, 52, 49, 52, 100, 53, 49, 48, 53, 53, 48, 101,
-        55, 100, 52, 48, 48, 57, 55, 57, 99, 51, 99, 101, 50, 100, 99, 49, 48, 99, 48, 100, 57, 52,
-        102, 49, 54, 55, 54, 53, 102, 102, 98, 56, 57, 56, 51, 99, 98, 49, 50, 52, 55, 51, 100, 99,
-        49, 52, 97, 53, 50, 100, 102, 97, 52, 50, 51, 53, 99, 53, 48, 98, 48, 98, 99, 52, 51, 56,
-        51, 100, 97, 52, 102, 102, 56, 102, 56, 102, 100, 51, 57, 51, 53, 51, 102, 48, 52, 53, 48,
-        99, 51, 102, 49, 54, 51, 49, 54, 98, 100, 100, 53, 102, 51, 101, 97, 52, 102, 100, 50, 51,
-        49, 102, 54, 54, 55, 50, 49, 102, 97, 53, 48, 57, 98, 99, 98, 102, 100, 52, 53, 51, 51, 53,
-        50, 99, 56, 51, 97, 54, 99, 51, 54, 49, 48, 50, 57, 54, 97, 97, 57, 48, 97, 54, 51, 56, 52,
-        101, 99, 98, 55, 50, 98, 98, 99, 57, 53, 102, 48, 54, 54, 51, 101, 49, 50, 99, 50, 100,
-        101, 48, 100, 55, 52, 53, 48, 49, 100, 53, 56, 101, 54, 56, 100, 53, 56, 102, 52, 52, 57,
-        54, 102, 52, 49, 55, 51, 55, 101, 49, 102, 52, 54, 102, 57, 48, 48, 101, 54, 57, 97, 53,
-        99, 102, 99, 57, 99, 100, 97, 52, 51, 56, 102, 49, 55, 55, 100, 56, 54, 52, 49, 48, 49,
-        100, 101, 101, 49, 50, 101, 57, 97, 101, 55, 49, 49, 53, 102, 98, 55, 53, 55, 56, 51, 48,
-        98, 54, 49, 99, 53, 55, 101, 100, 102, 98, 52, 97, 52, 99, 49, 99, 51, 53, 50, 99, 102, 49,
-        99, 100, 54, 99, 51, 53, 56, 102, 100, 51, 54, 57, 97, 55, 51, 49, 53, 56, 51, 50, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 14, 120, 244,
-        219, 122, 103, 113, 163, 166, 167, 217, 195, 176, 222, 111, 231, 61, 88, 120, 19, 104, 150,
-        122, 127, 232, 77, 135, 174, 255, 254, 200, 150,
-    ];
+    let proof_bytes: Vec<u8> = vec![3, 0, 0, 0];
 
-    Ok(Json(Sp1ProofResponse {
-        vk_hash,
-        public_values,
-        proof_bytes,
-    }))
+    Ok(Json(Sp1ProofResponse { vk_hash, public_values, proof_bytes }))
 }
 
 // ---------------------------------------------------------------------------
@@ -469,49 +607,26 @@ async fn block_sp1_mock_status(
 async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
 
-    // -----------------------------------------------------------------------
-    // Nitro enclave initialisation
-    //
-    //   --eif_path <path>   path to the compiled EIF (required to enable Nitro)
-    // -----------------------------------------------------------------------
-
+    // ── Nitro enclave ────────────────────────────────────────────────────
     let eif_path = std::env::args().skip_while(|a| a != "--eif_path").nth(1);
 
     let nitro = match eif_path {
         None => {
-            info!("--eif_path not provided — /nitro endpoint disabled");
+            info!("--eif_path not provided — signing & challenge/nitro endpoints disabled");
             None
         }
         Some(ref path) => {
             let nitro_config = NitroConfig::default();
-            maybe_restart_enclave(Path::new(path), nitro_config).await?;
+            ensure_initialized(&nitro_config).await?;
             info!("Nitro enclave initialised from {path}");
             Some(NitroState { config: nitro_config })
         }
     };
 
-    let api_key = std::env::var("API_KEY")?;
-    let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
-
-    let genesis = Genesis::FluentDevnet;
-    let block_execution_strategy_factory =
-        create_eth_block_execution_strategy_factory(&genesis, None);
-
-    let chain_spec: Arc<ChainSpec> = Arc::new(
-        ChainSpec::try_from(&genesis)
-            .map_err(|e| eyre::eyre!("Failed to build chain spec: {e}"))?,
-    );
-
-     // -----------------------------------------------------------------------
-    // SP1 initialisation
-    //
-    //   SP1_ELF_PATH            path to the compiled zkVM ELF (required to enable SP1)
-    //   SP1_PRIVATE_KEY         required for network prover authentication
-    // -----------------------------------------------------------------------
-
+    // ── SP1 prover ───────────────────────────────────────────────────────
     let sp1 = match std::env::var("SP1_ELF_PATH") {
         Err(_) => {
-            info!("SP1_ELF_PATH not set — /sp1 endpoints disabled");
+            info!("SP1_ELF_PATH not set — /challenge/sp1 endpoints disabled");
             None
         }
         Ok(elf_path) => {
@@ -520,10 +635,7 @@ async fn main() -> eyre::Result<()> {
                     .map_err(|e| eyre::eyre!("Failed to read SP1 ELF {elf_path}: {e}"))?,
             );
 
-            let client = ProverClient::builder()
-                .network_for(NetworkMode::Mainnet)
-                .build()
-                .await;
+            let client = ProverClient::builder().network_for(NetworkMode::Mainnet).build().await;
             let pk = client.setup(elf).await.unwrap();
             let vk = pk.verifying_key();
 
@@ -537,21 +649,70 @@ async fn main() -> eyre::Result<()> {
         eyre::bail!("No backends configured: provide --eif_path and/or SP1_ELF_PATH");
     }
 
-    let state = AppState {
-        api_key,
-        nitro,
-        block_execution_strategy_factory,
-        genesis,
-        chain_spec,
-        sp1,
+    // ── Chain context (for challenge endpoints) ──────────────────────────
+    let genesis = Genesis::Fluent;
+    let block_execution_strategy_factory =
+        create_eth_block_execution_strategy_factory(&genesis, None);
+    let chain_spec: Arc<ChainSpec> = Arc::new(
+        ChainSpec::try_from(&genesis)
+            .map_err(|e| eyre::eyre!("Failed to build chain spec: {e}"))?,
+    );
+
+    let chain = ChainContext { block_execution_strategy_factory, genesis, chain_spec };
+
+    // ── L1 context (for blob fetching in /sign-batch-root) ────────────
+    let l1 = match (env::var("L1_RPC_URL"), env::var("L1_CONTRACT_ADDR"), env::var("L1_BEACON_URL"))
+    {
+        (Ok(l1_rpc), Ok(l1_addr), Ok(beacon)) => {
+            let l1_url = Url::parse(&l1_rpc).map_err(|e| eyre::eyre!("Invalid L1_RPC_URL: {e}"))?;
+            let l1_provider: RootProvider = create_provider(l1_url);
+            let contract_addr: Address =
+                l1_addr.parse().map_err(|e| eyre::eyre!("Invalid L1_CONTRACT_ADDR: {e}"))?;
+            let beacon_genesis_timestamp: u64 = env::var("BEACON_GENESIS_TIMESTAMP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1606824023); // Mainnet beacon genesis
+            let http_client = reqwest::Client::new();
+
+            info!(
+                l1_rpc = %l1_rpc,
+                contract_addr = %l1_addr,
+                beacon = %beacon,
+                "L1 context initialized for blob fetching"
+            );
+
+            Some(L1State {
+                provider: l1_provider,
+                contract_addr,
+                beacon_url: beacon,
+                beacon_genesis_timestamp,
+                http_client,
+            })
+        }
+        _ => {
+            info!("L1_RPC_URL/L1_CONTRACT_ADDR/L1_BEACON_URL not all set — blob fetching disabled");
+            None
+        }
     };
 
+    let api_key = std::env::var("API_KEY")?;
+    let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+
+    let state = AppState { api_key, nitro, sp1, chain, l1 };
+
     let app = Router::new()
-        .route("/nitro", post(block))
-        .route("/sp1/request", post(block_sp1_request))
-        .route("/sp1/status", post(block_sp1_status))
-        .route("/sp1/mock/request", post(block_sp1_mock_request))
-        .route("/sp1/mock/status", post(block_sp1_mock_status))
+        // ── Signing (TEE, input from caller) ─────────────
+        .route("/sign-block-execution", post(sign_block_execution))
+        .route("/sign-batch-root", post(sign_batch_root))
+        .route("/sign-batch-root-from-responses", post(sign_batch_root_from_responses))
+        // ── Challenge (proxy builds input from RPC) ──────
+        .route("/challenge/nitro", post(challenge_nitro))
+        .route("/challenge/sp1/request", post(challenge_sp1_request))
+        .route("/challenge/sp1/status", post(challenge_sp1_status))
+        // ── Mock (testing) ───────────────────────────────
+        .route("/mock/sp1/request", post(mock_sp1_request))
+        .route("/mock/sp1/status", post(mock_sp1_status))
+        // ── Auth ─────────────────────────────────────────
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .with_state(state);
 

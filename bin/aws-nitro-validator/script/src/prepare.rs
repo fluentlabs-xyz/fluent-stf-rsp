@@ -74,11 +74,7 @@ pub fn prepare_guest_input(
     // 7. Extract COSE signature (raw 96 bytes for P-384)
     let mut cose_signature = [0u8; 96];
     if cose.3.len() != 96 {
-        return Err(format!(
-            "expected 96-byte COSE signature, got {}",
-            cose.3.len()
-        )
-        .into());
+        return Err(format!("expected 96-byte COSE signature, got {}", cose.3.len()).into());
     }
     cose_signature.copy_from_slice(&cose.3);
 
@@ -97,8 +93,8 @@ pub fn prepare_guest_input(
         root_pubkey: root_pubkey.into(),
         chain,
         sig_structure,
-        cose_signature: cose_signature .into(),
-        pcr0: pcr0.into(), 
+        cose_signature: cose_signature.into(),
+        pcr0: pcr0.into(),
         user_data,
     })
 }
@@ -125,13 +121,13 @@ fn extract_sec1(raw: &[u8]) -> Result<[u8; 97], Box<dyn std::error::Error>> {
 }
 
 /// Convert an X509Certificate into CertData (TBS + signature + pubkey).
-fn cert_to_data(
-    cert: &X509Certificate,
-) -> Result<CertData, Box<dyn std::error::Error>> {
+fn cert_to_data(cert: &X509Certificate) -> Result<CertData, Box<dyn std::error::Error>> {
     Ok(CertData {
         tbs: cert.tbs_certificate.as_ref().to_vec(),
         signature: cert.signature_value.data.to_vec(),
-        pubkey: extract_sec1(&cert.public_key().subject_public_key.data).expect("correct sec1").to_vec(),
+        pubkey: extract_sec1(&cert.public_key().subject_public_key.data)
+            .expect("correct sec1")
+            .to_vec(),
     })
 }
 
@@ -178,9 +174,7 @@ mod pcrs_de {
 
 mod cabundle_de {
     use super::*;
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> Result<Vec<Vec<u8>>, D::Error> {
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
         let v: Vec<ByteBuf> = Vec::deserialize(d)?;
         Ok(v.into_iter().map(|b| b.into_vec()).collect())
     }

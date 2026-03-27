@@ -4,9 +4,9 @@
 pub mod io;
 #[macro_use]
 pub mod utils;
-pub mod evm;
 pub mod error;
 mod events_hash;
+pub mod evm;
 pub mod executor;
 pub mod tracking;
 

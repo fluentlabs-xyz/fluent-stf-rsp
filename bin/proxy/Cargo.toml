@@ -22,6 +22,7 @@ url.workspace = true
 bincode.workspace = true
 sha2 = "0.10.9"  # direct dep, not going through workspace patch
 axum.workspace = true
+zstd.workspace = true
 vsock.workspace = true
 
 # workspace crates
@@ -32,8 +33,14 @@ rsp-client-executor.workspace = true
 nitro-types.workspace = true
 
 # alloy
+alloy-primitives.workspace = true
 alloy-provider.workspace = true
+alloy-rpc-types.workspace = true
+alloy-sol-types.workspace = true
 revm-primitives.workspace = true
+
+# http (for beacon API)
+reqwest.workspace = true
 
 # reth
 reth-chainspec.workspace = true
@@ -46,8 +53,9 @@ sp1-sdk = {workspace = true, features =["network"]}
 
 aws-config = { version = "1"}
 aws-credential-types = "1"
+c-kzg = "2.1.7"
 
 [features]
-default=["devnet"]
+default=["testnet"]
 devnet  = ["rsp-primitives/devnet"]
 testnet = ["rsp-primitives/testnet"]

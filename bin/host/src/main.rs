@@ -5,11 +5,11 @@ use std::sync::Arc;
 use clap::Parser;
 use execute::PersistExecutionReport;
 use rsp_host_executor::{
-    build_executor, create_eth_block_execution_strategy_factory,
-    BlockExecutor, EthExecutorComponents,
+    build_executor, create_eth_block_execution_strategy_factory, BlockExecutor,
+    EthExecutorComponents,
 };
 use rsp_provider::create_provider;
-use sp1_sdk::{env::EnvProver};
+use sp1_sdk::env::EnvProver;
 use tracing_subscriber::{
     filter::EnvFilter, fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
 };

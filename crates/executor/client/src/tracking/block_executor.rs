@@ -3,8 +3,10 @@ use reth_errors::BlockExecutionError;
 use reth_evm::{block::BlockExecutor, execute::Executor, ConfigureEvm, OnStateHook};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
-use revm::{database::{State, states::bundle_state::BundleRetention}, inspector::NoOpInspector};
-
+use revm::{
+    database::{states::bundle_state::BundleRetention, State},
+    inspector::NoOpInspector,
+};
 
 /// A generic block executor that uses a [`BlockExecutionStrategy`] to
 /// execute blocks.

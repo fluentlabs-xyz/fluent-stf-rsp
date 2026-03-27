@@ -12,7 +12,6 @@ nitro = ["rsp-host-executor/nitro", "rsp-client-executor/nitro"]
 tokio.workspace = true
 url.workspace = true
 tracing-subscriber.workspace = true
-serde_json.workspace = true
 eyre.workspace = true
 clap.workspace = true
 dotenv.workspace = true
@@ -21,12 +20,10 @@ csv.workspace = true
 # workspace
 rsp-client-executor.workspace = true
 rsp-host-executor = { workspace = true, default-features = false }
-rsp-primitives.workspace = true
 rsp-provider.workspace = true
 
 # alloy
 alloy-chains.workspace = true
-alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-provider.workspace = true
@@ -42,9 +39,14 @@ sp1-sdk.workspace = true
 sp1-core-executor.workspace = true
 strum = "0.27"
 
+
+
+
+
 [dev-dependencies]
 alloy-network.workspace = true
 rsp-client-executor.workspace = true
+rsp-primitives.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 thousands = "0.2.0"

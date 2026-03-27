@@ -8,7 +8,9 @@ use revm_state::Bytecode;
 use rsp_mpt::EthereumState;
 
 mod basic;
+mod exex;
 pub use basic::BasicRpcDb;
+pub use exex::ExExDb;
 
 #[cfg(feature = "execution-witness")]
 mod execution_witness;

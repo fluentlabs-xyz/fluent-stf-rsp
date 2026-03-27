@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [features]
-default = ["sp1"]
+default = ["sp1", "testnet"]
 sp1 = []
 alerting = ["dep:reqwest"]
 execution-witness = [
@@ -22,6 +22,8 @@ nitro = [
     "dep:vsock",
     "dep:anyhow",
 ]
+testnet = ["rsp-primitives/testnet"]
+devnet = ["rsp-primitives/devnet"]
 
 [dependencies]
 tokio = { workspace = true, features = ["time", "rt"] }
@@ -41,17 +43,15 @@ anyhow = { workspace = true, optional = true }
 
 # workspace crates
 rsp-rpc-db.workspace = true
-rsp-client-executor = {workspace = true}
+rsp-client-executor = {workspace = true, features =["wasmtime"]}
 rsp-mpt.workspace = true
 rsp-primitives = { workspace = true }
 
 # sp1
 sp1-sdk.workspace = true
-sp1-prover.workspace = true
 
 # reth
 reth-evm.workspace = true
-reth-evm-ethereum.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-primitives-traits = { workspace = true, features = ["secp256k1"] }
 reth-trie.workspace = true
@@ -70,6 +70,7 @@ alloy-network.workspace = true
 alloy-provider.workspace = true
 alloy-transport.workspace = true
 alloy-rpc-types.workspace = true
+reth-provider = { workspace = true, default-features = false }
 
 [dev-dependencies]
 alloy-primitives.workspace = true

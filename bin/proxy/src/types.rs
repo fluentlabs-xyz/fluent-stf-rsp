@@ -2,7 +2,7 @@
 // SP1 proof result
 // ---------------------------------------------------------------------------
 
-use {revm_primitives::FixedBytes};
+use revm_primitives::FixedBytes;
 
 /// Everything a Solidity contract needs to call `ISP1Verifier.verifyProof()`.
 ///

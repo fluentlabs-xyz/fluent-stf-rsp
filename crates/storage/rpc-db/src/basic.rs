@@ -10,11 +10,12 @@ use alloy_provider::{
     network::{primitives::HeaderResponse, BlockResponse},
     Network, Provider,
 };
+use alloy_rpc_types::BlockNumberOrTag;
 use async_trait::async_trait;
 use reth_storage_errors::{db::DatabaseError, provider::ProviderError};
 use revm_database::BundleState;
 use revm_database_interface::DatabaseRef;
-use revm_primitives::{Address, B256, KECCAK_EMPTY};
+use revm_primitives::{Address, Bytes, B256, KECCAK_EMPTY};
 use revm_state::{AccountInfo, Bytecode};
 use rsp_mpt::EthereumState;
 use rsp_primitives::account_proof::eip1186_proof_to_account_proof;
@@ -68,15 +69,17 @@ impl<P: Provider<N> + Clone, N: Network> BasicRpcDb<P, N> {
             .map_err(|e| RpcDbError::GetProofError(address, e.to_string()))?;
 
         // Fetch the code of the account.
-        let code = self
+        let code: Bytes = self
             .provider
-            .get_code_at(address)
-            .number(self.block_number)
+            .raw_request(
+                "eth_getRawCode".into(),
+                (address, BlockNumberOrTag::Number(self.block_number)),
+            )
             .await
             .map_err(|e| RpcDbError::GetCodeError(address, e.to_string()))?;
 
         // Construct the account info & write it to the log.
-        let bytecode = Bytecode::new_raw(code);
+        let bytecode = Bytecode::new_raw(code.clone());
 
         // Normalize code_hash for REVM compatibility:
         // RPC response for getProof method for non-existing (unused) EOAs may contain B256::ZERO
@@ -214,7 +217,6 @@ where
     async fn state(&self, bundle_state: &BundleState) -> Result<EthereumState, RpcDbError> {
         let state_requests = self.get_state_requests();
 
-        // For every account we touched, fetch the storage proofs for all the slots we touched.
         tracing::info!("fetching storage proofs");
         let mut before_storage_proofs = Vec::new();
         let mut after_storage_proofs = Vec::new();
@@ -233,7 +235,7 @@ where
             let keys = used_keys
                 .iter()
                 .map(|key| B256::from(*key))
-                .chain(modified_keys.clone().into_iter())
+                .chain(modified_keys.into_iter())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -242,11 +244,8 @@ where
                 self.provider.get_proof(*address, keys.clone()).number(self.block_number).await?;
             before_storage_proofs.push(eip1186_proof_to_account_proof(storage_proof));
 
-            let storage_proof = self
-                .provider
-                .get_proof(*address, modified_keys)
-                .number(self.block_number + 1)
-                .await?;
+            let storage_proof =
+                self.provider.get_proof(*address, keys).number(self.block_number + 1).await?;
             after_storage_proofs.push(eip1186_proof_to_account_proof(storage_proof));
         }
 

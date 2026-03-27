@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sp1_sdk::{include_elf, HashableKey, ProverClient, SP1Stdin};
 
 mod prepare;
-use prepare::{prepare_guest_input};
+use prepare::prepare_guest_input;
 
 const ELF: &[u8] = include_elf!("nitro-validator");
 
@@ -24,8 +24,8 @@ struct SP1EnclaveProofFixture {
 
 fn main() {
     // Prepare guest input: parse CBOR/X.509, validate cert chain on host
-    let guest_input = prepare_guest_input(ATTESTATION, ROOT_CERT_DER)
-        .expect("Failed to prepare guest input");
+    let guest_input =
+        prepare_guest_input(ATTESTATION, ROOT_CERT_DER).expect("Failed to prepare guest input");
 
     let client = ProverClient::from_env();
 
@@ -37,26 +37,17 @@ fn main() {
 
     // Generate Groth16 proof for on-chain verification
     println!("\n🔄 Generating Groth16 proof for Solidity...");
-    let proof_groth16 = client
-        .prove(&pk, &stdin)
-        .groth16()
-        .run()
-        .expect("Failed to generate Groth16 proof");
+    let proof_groth16 =
+        client.prove(&pk, &stdin).groth16().run().expect("Failed to generate Groth16 proof");
 
     println!("✅ Groth16 proof generated");
 
     // Guest uses commit_slice(&user_data), so read raw bytes
     let pubkey_bytes = proof_groth16.public_values.as_slice();
-    assert_eq!(
-        pubkey_bytes,
-        &EXPECTED_PUBKEY,
-        "Pubkey mismatch! Expected specific enclave key"
-    );
+    assert_eq!(pubkey_bytes, &EXPECTED_PUBKEY, "Pubkey mismatch! Expected specific enclave key");
 
     // Verify Groth16 proof
-    client
-        .verify(&proof_groth16, &vk)
-        .expect("Groth16 verification failed");
+    client.verify(&proof_groth16, &vk).expect("Groth16 verification failed");
     println!("✅ Groth16 proof verified");
 
     let fixture = SP1EnclaveProofFixture {
@@ -65,11 +56,8 @@ fn main() {
         proof: format!("0x{}", hex::encode(proof_groth16.bytes())),
     };
 
-    std::fs::write(
-        "proof-fixture.json",
-        serde_json::to_string_pretty(&fixture).unwrap(),
-    )
-    .expect("Failed to write proof fixture");
+    std::fs::write("proof-fixture.json", serde_json::to_string_pretty(&fixture).unwrap())
+        .expect("Failed to write proof fixture");
 
     println!("✅ Proof fixture saved to proof-fixture.json");
 }

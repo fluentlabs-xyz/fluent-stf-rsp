@@ -12,6 +12,7 @@ exclude.workspace = true
 revm-primitives.workspace = true
 serde = { workspace = true,  features = ["derive", "alloc"] }
 alloy-primitives = { version = "1.3.0", default-features = false, features = ["serde"] }
+rsp-client-executor.workspace = true
 
 [lints]
 workspace = true

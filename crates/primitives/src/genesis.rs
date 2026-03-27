@@ -5,20 +5,12 @@ use std::{
 
 use crate::{error::ChainSpecError, fluent_genesis};
 use alloy_genesis::ChainConfig;
-use alloy_primitives::U256;
-use reth_chainspec::{
-    BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, EthereumHardfork, DEV_HARDFORKS,
-};
-use reth_primitives_traits::SealedHeader;
+use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, EthereumHardfork};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 pub const LINEA_GENESIS_JSON: &str = include_str!("../../../bin/host/genesis/59144.json");
 pub const OP_SEPOLIA_GENESIS_JSON: &str = include_str!("../../../bin/host/genesis/11155420.json");
-
-// If this fails to compile, run: make download-genesis
-pub const FLUENT_DEVNET_GENESIS_JSON: &str =
-    include_str!("../../../bin/host/genesis/genesis-v0.5.7.json");
 
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,7 +20,7 @@ pub enum Genesis {
     OpMainnet,
     Sepolia,
     Linea,
-    FluentDevnet,
+    Fluent,
     Custom(#[serde_as(as = "serde_bincode_compat::ChainConfig")] ChainConfig),
 }
 
@@ -39,7 +31,7 @@ impl Hash for Genesis {
             Genesis::OpMainnet => 10u64.hash(state),
             Genesis::Sepolia => 11155111u64.hash(state),
             Genesis::Linea => 59144u64.hash(state),
-            Genesis::FluentDevnet => 0x5201u64.hash(state),
+            Genesis::Fluent => 0x5202u64.hash(state),
             Self::Custom(config) => {
                 let buf = serde_json::to_vec(config).unwrap();
                 buf.hash(state);
@@ -71,7 +63,7 @@ impl TryFrom<u64> for Genesis {
             10 => Ok(Genesis::OpMainnet),
             59144 => Ok(Genesis::Linea),
             11155111 => Ok(Genesis::Sepolia),
-            0x5201 => Ok(Genesis::FluentDevnet),
+            0x5202 => Ok(Genesis::Fluent),
             id => Err(ChainSpecError::ChainNotSupported(id)),
         }
     }
@@ -113,24 +105,7 @@ impl TryFrom<&Genesis> for ChainSpec {
             }
             Genesis::OpMainnet => Err(ChainSpecError::InvalidConversion),
             Genesis::Linea => Ok(ChainSpec::from_genesis(genesis_from_json(LINEA_GENESIS_JSON)?)),
-            Genesis::FluentDevnet => {
-                let genesis = fluent_genesis::genesis();
-                let hardforks = DEV_HARDFORKS.clone();
-
-                let header = fluent_genesis::genesis_header();
-
-                let chain_spec = ChainSpec {
-                    chain: Chain::from(0x5201),
-                    genesis_header: SealedHeader::new_unhashed(header),
-                    genesis,
-                    paris_block_and_final_difficulty: Some((0, U256::from(0))),
-                    hardforks,
-                    base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::ethereum()),
-                    deposit_contract: None,
-                    ..Default::default()
-                };
-                Ok(chain_spec)
-            }
+            Genesis::Fluent => Ok(fluent_genesis::chainspec()),
             Genesis::Custom(config) => {
                 let chain_spec = ChainSpec::from_genesis(alloy_genesis::Genesis {
                     config: config.clone(),
