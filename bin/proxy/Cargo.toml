@@ -22,7 +22,6 @@ url.workspace = true
 bincode.workspace = true
 sha2 = "0.10.9"  # direct dep, not going through workspace patch
 axum.workspace = true
-zstd.workspace = true
 vsock.workspace = true
 
 # workspace crates

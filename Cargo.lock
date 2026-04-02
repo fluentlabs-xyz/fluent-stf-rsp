@@ -7195,7 +7195,6 @@ dependencies = [
  "url",
  "vsock",
  "x509-parser",
- "zstd",
 ]
 
 [[package]]

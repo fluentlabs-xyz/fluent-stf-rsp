@@ -4,7 +4,7 @@
 //!
 //! ## Signing endpoints (Nitro TEE, caller provides `EthClientExecutorInput`)
 //!
-//! - `POST /sign-block-execution`           — execute block, return signed result (bincode+zstd)
+//! - `POST /sign-block-execution`           — execute block, return signed result (bincode)
 //! - `POST /sign-batch-root`                — sign batch Merkle root from in-memory store
 //!
 //! ## Challenge endpoints (proxy builds `ClientInput` from RPC)
@@ -324,16 +324,15 @@ async fn build_client_input(
 
 /// `POST /sign-block-execution`
 ///
-/// Body: zstd-compressed bincode `EthClientExecutorInput`.
-/// Headers: `Content-Type: application/octet-stream`, `Content-Encoding: zstd`.
+/// Body: bincode-serialized `EthClientExecutorInput`.
+/// Headers: `Content-Type: application/octet-stream`.
 async fn sign_block_execution(
     State(state): State<AppState>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<EthExecutionResponse>, HandlerError> {
     let nitro = require_nitro(&state)?;
 
-    let input = decode_zstd_bincode::<EthClientExecutorInput>(&headers, &body)?;
+    let input = decode_bincode::<EthClientExecutorInput>(&body)?;
 
     let response = enclave::execute_block(input, nitro.config)
         .await
@@ -342,25 +341,11 @@ async fn sign_block_execution(
     Ok(Json(response))
 }
 
-/// Decode a zstd-compressed bincode payload.
-///
-/// If `Content-Encoding: zstd` is present, decompresses first.
-/// Otherwise treats the body as raw bincode.
-fn decode_zstd_bincode<T: serde::de::DeserializeOwned>(
-    headers: &HeaderMap,
+/// Decode a bincode payload.
+fn decode_bincode<T: serde::de::DeserializeOwned>(
     body: &[u8],
 ) -> Result<T, HandlerError> {
-    let is_zstd =
-        headers.get("content-encoding").and_then(|v| v.to_str().ok()).is_some_and(|v| v == "zstd");
-
-    let raw = if is_zstd {
-        zstd::decode_all(body)
-            .map_err(|e| bad_request(format!("Zstd decompression failed: {e}")))?
-    } else {
-        body.to_vec()
-    };
-
-    bincode::deserialize(&raw)
+    bincode::deserialize(body)
         .map_err(|e| bad_request(format!("Bincode deserialization failed: {e}")))
 }
 
