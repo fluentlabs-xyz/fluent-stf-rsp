@@ -4,6 +4,7 @@ sp1_zkvm::entrypoint!(main);
 use common::{CertData, GuestInput};
 use p384::ecdsa::{signature::DigestVerifier, Signature, VerifyingKey};
 use sha2::{Digest as _, Sha384};
+use sha3::Keccak256;
 
 /// SHA-384 hash of the AWS Nitro root CA public key (97-byte SEC1 uncompressed).
 /// Computed once using `compute_root_pubkey_hash()` from the host crate.
@@ -72,6 +73,13 @@ pub fn main() {
     assert_eq!(input.user_data.len(), 65, "invalid pubkey length");
     assert_eq!(input.user_data[0], 0x04, "not uncompressed key");
 
-    // 6. Commit to proof public values
-    sp1_zkvm::io::commit_slice(&input.user_data);
+    // 6. Derive Ethereum address: keccak256(pubkey[1..])[12..]
+    let hash = Keccak256::digest(&input.user_data[1..]);
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&hash[12..]);
+
+    // 7. Commit abi.encode(address) — 32 bytes, left-padded with zeros
+    let mut abi_encoded = [0u8; 32];
+    abi_encoded[12..].copy_from_slice(&address);
+    sp1_zkvm::io::commit_slice(&abi_encoded);
 }

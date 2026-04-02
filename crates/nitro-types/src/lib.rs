@@ -12,12 +12,8 @@ pub struct AwsCredentials {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EthExecutionResponse {
     pub block_number: u64,
-    pub parent_hash: B256,
-    pub block_hash: B256,
-    pub withdrawal_hash: B256,
-    pub deposit_hash: B256,
+    pub leaf: [u8; 32],
     pub tx_data_hash: B256,
-    pub result_hash: Vec<u8>,
     pub signature: Vec<u8>,
 }
 
@@ -32,9 +28,12 @@ pub struct SubmitBatchResponse {
 pub enum EnclaveIncoming {
     Handshake { credentials: AwsCredentials },
     ExecuteBlock { input: EthClientExecutorInput },
-    ExecuteBlockChallenge { input: EthClientExecutorInput, raw_blobs: Vec<Vec<u8>> },
-    SubmitBatch { from: u64, to: u64, blobs: Vec<Vec<u8>> },
-    SubmitBatchFromResponses { responses: Vec<EthExecutionResponse>, blobs: Vec<Vec<u8>> },
+    SubmitBatch {
+        from: u64,
+        to: u64,
+        responses: Vec<EthExecutionResponse>,
+        blobs: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

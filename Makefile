@@ -1,5 +1,5 @@
-.PHONY: build-client build-client-docker build-enclave build-proxy \
-        run run-sp1-only run-enclave download-genesis clean help
+.PHONY: build-client build-client-docker build-nitro-validator build-nitro-validator-docker \
+        build-enclave build-proxy run run-sp1-only run-enclave download-genesis clean help
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 CLIENT_DIR   := bin/client
@@ -10,6 +10,10 @@ TARGET       := x86_64-unknown-linux-musl
 BINARY       := rsp-client
 EIF          := rsp-client-enclave.eif
 ELF          := rsp-client.elf
+
+# ─── Nitro validator (attestation proving) ────────────────────────────────────
+NITRO_VALIDATOR_DIR := bin/aws-nitro-validator/program
+NITRO_VALIDATOR_ELF := nitro-validator.elf
 
 # ─── Config (override via env or CLI) ─────────────────────────────────────────
 EIF_PATH     ?= $(EIF)
@@ -33,6 +37,21 @@ build-client-docker:
 	cd $(CLIENT_DIR) && cargo prove build \
 		--elf-name $(ELF) \
 		--output-directory ../../ \
+		--docker
+
+# ─── Nitro validator ELF (attestation proving) ───────────────────────────────
+
+## Build nitro-validator ELF (dev)
+build-nitro-validator:
+	cd $(NITRO_VALIDATOR_DIR) && cargo prove build \
+		--elf-name $(NITRO_VALIDATOR_ELF) \
+		--output-directory ../../../
+
+## Reproducible nitro-validator ELF build via Docker (prod)
+build-nitro-validator-docker:
+	cd $(NITRO_VALIDATOR_DIR) && cargo prove build \
+		--elf-name $(NITRO_VALIDATOR_ELF) \
+		--output-directory ../../../ \
 		--docker
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────
@@ -94,19 +113,21 @@ download-genesis:
 
 clean:
 	cargo clean
-	rm -f $(EIF) $(ELF)
+	rm -f $(EIF) $(ELF) $(NITRO_VALIDATOR_ELF)
 
 help:
 	@echo "Targets:"
-	@echo "  build-client         Build SP1 ELF (dev)"
-	@echo "  build-client-docker  Build SP1 ELF reproducible via Docker (prod)"
-	@echo "  build-enclave        Build AWS Nitro .eif"
-	@echo "  build-proxy          Build proxy binary"
-	@echo "  run                  Build and run with Nitro + SP1"
-	@echo "  run-sp1-only         Build and run with SP1 only (no Nitro)"
-	@echo "  run-enclave          Run enclave in debug mode"
-	@echo "  download-genesis     Download genesis file (TAG=$(TAG))"
-	@echo "  clean                Remove build artifacts"
+	@echo "  build-client                  Build SP1 ELF (dev)"
+	@echo "  build-client-docker           Build SP1 ELF reproducible via Docker (prod)"
+	@echo "  build-nitro-validator         Build nitro-validator ELF for attestation proving (dev)"
+	@echo "  build-nitro-validator-docker  Build nitro-validator ELF reproducible via Docker (prod)"
+	@echo "  build-enclave                 Build AWS Nitro .eif"
+	@echo "  build-proxy                   Build proxy binary"
+	@echo "  run                           Build and run with Nitro + SP1"
+	@echo "  run-sp1-only                  Build and run with SP1 only (no Nitro)"
+	@echo "  run-enclave                   Run enclave in debug mode"
+	@echo "  download-genesis              Download genesis file (TAG=$(TAG))"
+	@echo "  clean                         Remove build artifacts"
 	@echo ""
 	@echo "Overrides:"
 	@echo "  EIF_PATH=$(EIF_PATH)"

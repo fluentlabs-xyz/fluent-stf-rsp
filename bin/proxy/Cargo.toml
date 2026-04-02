@@ -37,6 +37,9 @@ alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types.workspace = true
 alloy-sol-types.workspace = true
+alloy-signer = { version = "1.8.1", optional = true }
+alloy-signer-local = { version = "1.8.1", optional = true }
+alloy-network = { workspace = true, optional = true }
 revm-primitives.workspace = true
 
 # http (for beacon API)
@@ -55,7 +58,26 @@ aws-config = { version = "1"}
 aws-credential-types = "1"
 c-kzg = "2.1.7"
 
+# attestation parsing deps (optional, behind feature)
+ciborium = { version = "0.2.2", optional = true }
+x509-parser = { version = "0.18.1", optional = true }
+p384 = { version = "0.13.1", optional = true }
+serde_bytes = { version = "0.11.19", optional = true }
+
+# shared types for attestation guest input
+nitro-validator-common = { path = "../aws-nitro-validator/common", package = "common", optional = true }
+
 [features]
 default=["testnet"]
 devnet  = ["rsp-primitives/devnet"]
 testnet = ["rsp-primitives/testnet"]
+prove-key-attestation = [
+    "dep:alloy-signer",
+    "dep:alloy-signer-local",
+    "dep:alloy-network",
+    "dep:ciborium",
+    "dep:x509-parser",
+    "dep:p384",
+    "dep:serde_bytes",
+    "dep:nitro-validator-common",
+]

@@ -39,7 +39,8 @@ nitro = [
     "dep:webpki-roots",
     "rsp-client-executor/nitro",
     "dep:nitro-types",
-    "dep:c-kzg"
+    "dep:c-kzg",
+    "dep:brotli"
 ]
 
 [dependencies]
@@ -85,6 +86,7 @@ sha3 = "0.10.8"
 c-kzg = { version = "2.1.7", optional = true }
 kzg-rs = "0.2.8"
 bytes = "1.5"
+brotli = {version = "8.0.2", optional = true }
 
 [patch.crates-io]
 # sp1 precompile patches

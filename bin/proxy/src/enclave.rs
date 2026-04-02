@@ -4,6 +4,9 @@ use std::{
     path::Path,
 };
 
+#[cfg(feature = "prove-key-attestation")]
+use std::sync::Arc;
+
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::ProvideCredentials;
 use eyre::WrapErr;
@@ -19,6 +22,19 @@ use nitro_types::{
 use rsp_client_executor::io::EthClientExecutorInput;
 
 use crate::types::NitroConfig;
+
+// ---------------------------------------------------------------------------
+// Attestation config (prove-key-attestation feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "prove-key-attestation")]
+static ATTESTATION_CONFIG: std::sync::OnceLock<Arc<crate::attestation::AttestationConfig>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "prove-key-attestation")]
+pub(crate) fn set_attestation_config(config: Arc<crate::attestation::AttestationConfig>) {
+    let _ = ATTESTATION_CONFIG.set(config);
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -46,35 +62,15 @@ pub(crate) async fn execute_block(
     execute_block_inner(msg, &config).await
 }
 
-/// Challenge block execution — enclave verifies blob tx_data match,
-/// signs with KZG versioned_hashes instead of tx_data_hash.
-pub(crate) async fn execute_block_challenge(
-    input: EthClientExecutorInput,
-    raw_blobs: Vec<Vec<u8>>,
-    config: NitroConfig,
-) -> eyre::Result<EthExecutionResponse> {
-    let msg = EnclaveIncoming::ExecuteBlockChallenge { input, raw_blobs };
-    execute_block_inner(msg, &config).await
-}
-
-/// Batch signing from enclave's in-memory BlockStore.
+/// Batch signing — cache-first with response fallback.
 pub(crate) async fn submit_batch(
     from: u64,
     to: u64,
-    blobs: Vec<Vec<u8>>,
-    config: NitroConfig,
-) -> eyre::Result<SubmitBatchResponse> {
-    let msg = EnclaveIncoming::SubmitBatch { from, to, blobs };
-    submit_batch_inner(msg, &config).await
-}
-
-/// Batch signing from pre-signed EthExecutionResponses.
-pub(crate) async fn submit_batch_from_responses(
     responses: Vec<EthExecutionResponse>,
     blobs: Vec<Vec<u8>>,
     config: NitroConfig,
 ) -> eyre::Result<SubmitBatchResponse> {
-    let msg = EnclaveIncoming::SubmitBatchFromResponses { responses, blobs };
+    let msg = EnclaveIncoming::SubmitBatch { from, to, responses, blobs };
     submit_batch_inner(msg, &config).await
 }
 
@@ -168,12 +164,28 @@ async fn handshake_with_enclave(config: &NitroConfig) -> eyre::Result<(Vec<u8>, 
     }
 }
 
-async fn on_new_attestation(public_key: &[u8], _attestation: &[u8]) -> eyre::Result<()> {
-    // TODO: submit attestation on-chain / register the new public key
-    info!(
-        public_key = %hex::encode(public_key),
-        "Attestation received — on-chain registration not yet implemented"
-    );
+async fn on_new_attestation(public_key: &[u8], attestation: &[u8]) -> eyre::Result<()> {
+    #[cfg(feature = "prove-key-attestation")]
+    {
+        if let Some(config) = ATTESTATION_CONFIG.get() {
+            crate::attestation::prove_and_submit(config, public_key, attestation).await?;
+            return Ok(());
+        }
+        info!(
+            public_key = %hex::encode(public_key),
+            "Attestation received — attestation config not set, skipping proof"
+        );
+    }
+
+    #[cfg(not(feature = "prove-key-attestation"))]
+    {
+        let _ = attestation;
+        info!(
+            public_key = %hex::encode(public_key),
+            "Attestation received — proving disabled (enable prove-key-attestation feature)"
+        );
+    }
+
     Ok(())
 }
 

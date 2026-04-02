@@ -6,11 +6,9 @@
 //!
 //! - `POST /sign-block-execution`           — execute block, return signed result (bincode+zstd)
 //! - `POST /sign-batch-root`                — sign batch Merkle root from in-memory store
-//! - `POST /sign-batch-root-from-responses` — sign batch root from pre-signed responses (blobs from beacon)
 //!
 //! ## Challenge endpoints (proxy builds `ClientInput` from RPC)
 //!
-//! - `POST /challenge/nitro`          — TEE challenge execution (blobs from beacon)
 //! - `POST /challenge/sp1/request`    — submit async SP1 zkVM proof request (blobs from beacon)
 //! - `POST /challenge/sp1/status`     — poll for SP1 proof result
 //!
@@ -25,6 +23,9 @@ mod blob;
 mod enclave;
 mod types;
 
+#[cfg(feature = "prove-key-attestation")]
+mod attestation;
+
 use crate::{
     enclave::ensure_initialized,
     types::{NitroConfig, Sp1ProofResponse},
@@ -32,6 +33,11 @@ use crate::{
 use nitro_types::{EthExecutionResponse, SubmitBatchResponse};
 
 use std::{env, sync::Arc};
+use tokio::sync::OnceCell;
+
+/// Lazily-initialized SP1 prover state.
+/// The background init task populates this; handlers await it on first use.
+type LazySp1 = Arc<OnceCell<Sp1State>>;
 
 use alloy_primitives::Address;
 use axum::{
@@ -89,11 +95,13 @@ pub fn rpc_url() -> String {
 struct AppState {
     api_key: String,
     nitro: Option<NitroState>,
-    sp1: Option<Sp1State>,
+    sp1: Option<LazySp1>,
     /// RPC / chain context — used by challenge endpoints to build ClientInput.
     chain: ChainContext,
     /// L1 context — used by `/sign-batch-root` for blob fetching.
     l1: Option<L1State>,
+    #[cfg(feature = "prove-key-attestation")]
+    attestation: Option<Arc<attestation::AttestationConfig>>,
 }
 
 #[derive(Clone)]
@@ -134,14 +142,6 @@ pub struct BlobVerificationInput {
     pub proofs: Vec<Vec<u8>>,
 }
 
-/// `POST /challenge/nitro` — block ref + batch index for blob fetching.
-#[derive(Deserialize)]
-struct ChallengeNitroRequest {
-    block_number: Option<u64>,
-    block_hash: Option<B256>,
-    batch_index: u64,
-}
-
 /// `POST /challenge/sp1/request` — block ref + batch index for blob fetching.
 #[derive(Deserialize)]
 struct ChallengeSp1Request {
@@ -156,13 +156,7 @@ struct SignBatchRootRequest {
     from_block: u64,
     to_block: u64,
     batch_index: u64,
-}
-
-/// `POST /sign-batch-root-from-responses`
-#[derive(Deserialize)]
-struct SignBatchRootFromResponsesRequest {
     responses: Vec<EthExecutionResponse>,
-    batch_index: u64,
 }
 
 #[derive(Deserialize)]
@@ -224,8 +218,13 @@ fn require_nitro(state: &AppState) -> Result<&NitroState, HandlerError> {
         .ok_or_else(|| internal("Nitro enclave not configured (pass --eif_path at startup)"))
 }
 
-fn require_sp1(state: &AppState) -> Result<&Sp1State, HandlerError> {
-    state.sp1.as_ref().ok_or_else(|| internal("SP1 prover not configured (set SP1_ELF_PATH)"))
+async fn require_sp1(state: &AppState) -> Result<&Sp1State, HandlerError> {
+    match &state.sp1 {
+        None => Err(internal("SP1 prover not configured (set SP1_ELF_PATH)")),
+        Some(cell) => cell
+            .get()
+            .ok_or_else(|| internal("SP1 prover still initializing, please retry")),
+    }
 }
 
 fn require_l1(state: &AppState) -> Result<&L1State, HandlerError> {
@@ -394,37 +393,10 @@ async fn sign_batch_root(
     .await
     .map_err(|e| internal(format!("Blob fetching failed: {e}")))?;
 
-    let response = enclave::submit_batch(req.from_block, req.to_block, blobs, nitro.config)
-        .await
-        .map_err(|e| internal(format!("Batch submission failed: {e}")))?;
-
-    Ok(Json(response))
-}
-
-/// `POST /sign-batch-root-from-responses`
-///
-/// Fetches blobs from L1 + Beacon API using `batch_index`, then sends them
-/// to the enclave alongside the pre-signed responses for batch root signing.
-async fn sign_batch_root_from_responses(
-    State(state): State<AppState>,
-    Json(req): Json<SignBatchRootFromResponsesRequest>,
-) -> Result<Json<SubmitBatchResponse>, HandlerError> {
-    let nitro = require_nitro(&state)?;
-    let l1 = require_l1(&state)?;
-
-    if req.responses.is_empty() {
-        return Err(bad_request("responses must not be empty"));
-    }
-
-    let blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
-
-    if blobs.is_empty() {
-        return Err(bad_request("no blobs found for batch_index"));
-    }
-
-    let response = enclave::submit_batch_from_responses(req.responses, blobs, nitro.config)
-        .await
-        .map_err(|e| internal(format!("Batch-from-responses failed: {e}")))?;
+    let response =
+        enclave::submit_batch(req.from_block, req.to_block, req.responses, blobs, nitro.config)
+            .await
+            .map_err(|e| internal(format!("Batch submission failed: {e}")))?;
 
     Ok(Json(response))
 }
@@ -432,28 +404,6 @@ async fn sign_batch_root_from_responses(
 // ===========================================================================
 // Challenge endpoints — proxy builds ClientInput from RPC
 // ===========================================================================
-
-/// `POST /challenge/nitro`
-/// Body: `{ block_number?, block_hash?, batch_index }`
-///
-/// Fetches blobs from L1 + Beacon API using `batch_index`.
-async fn challenge_nitro(
-    State(state): State<AppState>,
-    Json(req): Json<ChallengeNitroRequest>,
-) -> Result<Json<EthExecutionResponse>, HandlerError> {
-    let nitro = require_nitro(&state)?;
-    let l1 = require_l1(&state)?;
-
-    let raw_blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
-
-    let client_input = build_client_input(req.block_number, req.block_hash, &state.chain).await?;
-
-    let response = enclave::execute_block_challenge(client_input, raw_blobs, nitro.config)
-        .await
-        .map_err(|e| internal(format!("Challenge execution failed: {e}")))?;
-
-    Ok(Json(response))
-}
 
 /// `POST /challenge/sp1/request`
 /// Body: `{ block_number?, block_hash?, batch_index }`
@@ -463,7 +413,7 @@ async fn challenge_sp1_request(
     State(state): State<AppState>,
     Json(req): Json<ChallengeSp1Request>,
 ) -> Result<Json<Sp1RequestResponse>, HandlerError> {
-    let sp1 = require_sp1(&state)?;
+    let sp1 = require_sp1(&state).await?;
     let l1 = require_l1(&state)?;
 
     let raw_blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
@@ -505,7 +455,7 @@ async fn challenge_sp1_status(
     State(state): State<AppState>,
     Json(req): Json<Sp1StatusRequest>,
 ) -> impl IntoResponse {
-    let sp1 = match require_sp1(&state) {
+    let sp1 = match require_sp1(&state).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -612,7 +562,7 @@ async fn main() -> eyre::Result<()> {
 
     let nitro = match eif_path {
         None => {
-            info!("--eif_path not provided — signing & challenge/nitro endpoints disabled");
+            info!("--eif_path not provided — signing endpoints disabled");
             None
         }
         Some(ref path) => {
@@ -623,25 +573,36 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
-    // ── SP1 prover ───────────────────────────────────────────────────────
-    let sp1 = match std::env::var("SP1_ELF_PATH") {
+    // ── SP1 prover (lazy init) ────────────────────────────────────────────
+    let sp1: Option<LazySp1> = match std::env::var("SP1_ELF_PATH") {
         Err(_) => {
             info!("SP1_ELF_PATH not set — /challenge/sp1 endpoints disabled");
             None
         }
         Ok(elf_path) => {
-            let elf = Elf::from(
-                std::fs::read(&elf_path)
-                    .map_err(|e| eyre::eyre!("Failed to read SP1 ELF {elf_path}: {e}"))?,
-            );
+            let elf_bytes = std::fs::read(&elf_path)
+                .map_err(|e| eyre::eyre!("Failed to read SP1 ELF {elf_path}: {e}"))?;
 
-            let client = ProverClient::builder().network_for(NetworkMode::Mainnet).build().await;
-            let pk = client.setup(elf).await.unwrap();
-            let vk = pk.verifying_key();
+            let cell = Arc::new(OnceCell::new());
+            let cell_clone = cell.clone();
 
-            info!(vk_hash = %hex::encode(vk.hash_bytes()), "SP1 prover initialised");
+            tokio::spawn(async move {
+                let elf = Elf::from(elf_bytes);
+                let client = ProverClient::builder()
+                    .network_for(NetworkMode::Mainnet)
+                    .build()
+                    .await;
+                let pk = client.setup(elf).await.unwrap();
+                let vk = pk.verifying_key();
+                info!(vk_hash = %hex::encode(vk.hash_bytes()), "SP1 prover initialised (background)");
+                let _ = cell_clone.set(Sp1State {
+                    client: Arc::new(client),
+                    pk: Arc::new(pk),
+                });
+            });
 
-            Some(Sp1State { client: Arc::new(client), pk: Arc::new(pk) })
+            info!("SP1 prover initialization started in background");
+            Some(cell)
         }
     };
 
@@ -695,18 +656,44 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
+    // ── Attestation config (prove-key-attestation feature) ──────────────
+    #[cfg(feature = "prove-key-attestation")]
+    let attestation_config = {
+        match attestation::AttestationConfig::from_env().await {
+            Ok(cfg) => {
+                info!("Attestation proving enabled");
+                Some(Arc::new(cfg))
+            }
+            Err(e) => {
+                info!("Attestation proving disabled: {e}");
+                None
+            }
+        }
+    };
+
+    #[cfg(feature = "prove-key-attestation")]
+    if let Some(ref att_cfg) = attestation_config {
+        enclave::set_attestation_config(att_cfg.clone());
+    }
+
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
-    let state = AppState { api_key, nitro, sp1, chain, l1 };
+    let state = AppState {
+        api_key,
+        nitro,
+        sp1,
+        chain,
+        l1,
+        #[cfg(feature = "prove-key-attestation")]
+        attestation: attestation_config,
+    };
 
     let app = Router::new()
         // ── Signing (TEE, input from caller) ─────────────
         .route("/sign-block-execution", post(sign_block_execution))
         .route("/sign-batch-root", post(sign_batch_root))
-        .route("/sign-batch-root-from-responses", post(sign_batch_root_from_responses))
         // ── Challenge (proxy builds input from RPC) ──────
-        .route("/challenge/nitro", post(challenge_nitro))
         .route("/challenge/sp1/request", post(challenge_sp1_request))
         .route("/challenge/sp1/status", post(challenge_sp1_status))
         // ── Mock (testing) ───────────────────────────────
