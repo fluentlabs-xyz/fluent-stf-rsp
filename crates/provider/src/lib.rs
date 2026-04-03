@@ -9,7 +9,7 @@ use url::Url;
 
 pub fn create_provider<N: Network>(rpc_url: Url) -> RootProvider<N> {
     let retry_layer =
-        RetryBackoffLayer::new_with_policy(3, 1000, 100, ServerErrorRetryPolicy::default());
+        RetryBackoffLayer::new_with_policy(3, 500, 5000, ServerErrorRetryPolicy::default());
     let client = RpcClient::builder().layer(retry_layer).http(rpc_url);
 
     RootProvider::new(client)

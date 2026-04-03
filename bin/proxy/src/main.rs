@@ -108,8 +108,9 @@ struct AppState {
 struct L1State {
     provider: RootProvider,
     contract_addr: Address,
-    beacon_url: String,
+    beacon_urls: Vec<String>,
     beacon_genesis_timestamp: u64,
+    contract_deploy_block: u64,
     http_client: reqwest::Client,
 }
 
@@ -279,11 +280,12 @@ async fn fetch_challenge_blobs(
 ) -> Result<Vec<Vec<u8>>, HandlerError> {
     blob::fetch_blobs_for_batch(
         &l1.provider,
-        &l1.beacon_url,
+        &l1.beacon_urls,
         &l1.http_client,
         l1.contract_addr,
         batch_index,
         l1.beacon_genesis_timestamp,
+        l1.contract_deploy_block,
     )
     .await
     .map_err(|e| internal(format!("Blob fetching failed: {e}")))
@@ -376,11 +378,12 @@ async fn sign_batch_root(
 
     let blobs = blob::fetch_blobs_for_batch(
         &l1.provider,
-        &l1.beacon_url,
+        &l1.beacon_urls,
         &l1.http_client,
         l1.contract_addr,
         req.batch_index,
         l1.beacon_genesis_timestamp,
+        l1.contract_deploy_block,
     )
     .await
     .map_err(|e| internal(format!("Blob fetching failed: {e}")))?;
@@ -637,20 +640,30 @@ async fn main() -> eyre::Result<()> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1606824023); // Mainnet beacon genesis
+            let contract_deploy_block: u64 = env::var("L1_CONTRACT_DEPLOY_BLOCK")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let beacon_urls: Vec<String> = beacon
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
             let http_client = reqwest::Client::new();
 
             info!(
                 l1_rpc = %l1_rpc,
                 contract_addr = %l1_addr,
-                beacon = %beacon,
+                ?beacon_urls,
                 "L1 context initialized for blob fetching"
             );
 
             Some(L1State {
                 provider: l1_provider,
                 contract_addr,
-                beacon_url: beacon,
+                beacon_urls,
                 beacon_genesis_timestamp,
+                contract_deploy_block,
                 http_client,
             })
         }
