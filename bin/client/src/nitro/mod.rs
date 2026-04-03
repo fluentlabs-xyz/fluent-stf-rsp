@@ -418,6 +418,11 @@ fn sign_batch(
 // SubmitBatch — cache-first with response fallback
 // ---------------------------------------------------------------------------
 
+pub(crate) enum SubmitBatchError {
+    InvalidSignatures(Vec<u64>),
+    Other(anyhow::Error),
+}
+
 pub(crate) fn handle_submit_batch(
     from: u64,
     to: u64,
@@ -425,7 +430,7 @@ pub(crate) fn handle_submit_batch(
     blobs: &[Vec<u8>],
     signing_key: &SigningKey,
     store: &BlockStore,
-) -> anyhow::Result<SubmitBatchResponse> {
+) -> Result<SubmitBatchResponse, SubmitBatchError> {
     let verifying_key = *signing_key.verifying_key();
 
     let response_map: std::collections::HashMap<u64, &EthExecutionResponse> =
@@ -433,23 +438,32 @@ pub(crate) fn handle_submit_batch(
 
     let mut leaves = Vec::with_capacity((to - from + 1) as usize);
     let mut tx_data_hashes = Vec::with_capacity((to - from + 1) as usize);
+    let mut invalid_blocks: Vec<u64> = Vec::new();
 
     for block in from..=to {
         if let Some(entry) = store.get(block) {
             leaves.push(entry.leaf);
             tx_data_hashes.push(entry.tx_data_hash);
+        } else if let Some(resp) = response_map.get(&block) {
+            if verify_response(resp, &verifying_key).is_ok() {
+                leaves.push(resp.leaf);
+                tx_data_hashes.push(resp.tx_data_hash);
+            } else {
+                invalid_blocks.push(block);
+            }
         } else {
-            let resp = response_map.get(&block).ok_or_else(|| {
-                anyhow::anyhow!("block {block} not in store and no response provided")
-            })?;
-            verify_response(resp, &verifying_key)?;
-            leaves.push(resp.leaf);
-            tx_data_hashes.push(resp.tx_data_hash);
+            invalid_blocks.push(block);
         }
     }
 
-    let batch_root = calculate_merkle_root(&leaves)?;
-    let versioned_hashes = verify_blobs(blobs, &tx_data_hashes)?;
+    if !invalid_blocks.is_empty() {
+        return Err(SubmitBatchError::InvalidSignatures(invalid_blocks));
+    }
+
+    let batch_root = calculate_merkle_root(&leaves)
+        .map_err(SubmitBatchError::Other)?;
+    let versioned_hashes = verify_blobs(blobs, &tx_data_hashes)
+        .map_err(SubmitBatchError::Other)?;
     Ok(sign_batch(batch_root, versioned_hashes, signing_key))
 }
 
@@ -653,7 +667,12 @@ impl Enclave {
                         Ok(store) => {
                             match handle_submit_batch(from, to, &responses, &blobs, &id.signing_key, &store) {
                                 Ok(result) => EnclaveResponse::SubmitBatchResult(result),
-                                Err(e) => EnclaveResponse::Error(format!("{e:#}")),
+                                Err(SubmitBatchError::InvalidSignatures(blocks)) => {
+                                    EnclaveResponse::InvalidSignatures { invalid_blocks: blocks }
+                                }
+                                Err(SubmitBatchError::Other(e)) => {
+                                    EnclaveResponse::Error(format!("{e:#}"))
+                                }
                             }
                         }
                         Err(e) => {
@@ -893,5 +912,63 @@ mod tests {
         // let num_blocks = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
 
         println!("{:?}", headers);
+    }
+
+    #[test]
+    fn handle_submit_batch_invalid_signatures() {
+        let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let verifying_key = *signing_key.verifying_key();
+        let store = BlockStore::new();
+
+        // Create one valid response (signed by our key) and one invalid (bad signature)
+        let leaf = [0x01u8; 32];
+        let tx_data_hash = B256::ZERO;
+        let mut payload = [0u8; 64];
+        payload[..32].copy_from_slice(&leaf);
+        payload[32..].copy_from_slice(tx_data_hash.as_slice());
+        let sig: Signature = signing_key.sign(&payload);
+
+        let valid_resp = EthExecutionResponse {
+            block_number: 10,
+            leaf,
+            tx_data_hash,
+            signature: sig.to_vec(),
+        };
+
+        let invalid_resp = EthExecutionResponse {
+            block_number: 11,
+            leaf,
+            tx_data_hash,
+            signature: vec![0u8; 64], // garbage signature
+        };
+
+        let result = handle_submit_batch(
+            10, 11, &[valid_resp, invalid_resp], &[], &signing_key, &store,
+        );
+
+        match result {
+            Err(SubmitBatchError::InvalidSignatures(blocks)) => {
+                assert_eq!(blocks, vec![11]);
+            }
+            _ => panic!("Expected InvalidSignatures error"),
+        }
+    }
+
+    #[test]
+    fn handle_submit_batch_missing_block_collected() {
+        let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let store = BlockStore::new();
+
+        // No responses, no store entries — all blocks should be invalid
+        let result = handle_submit_batch(
+            100, 102, &[], &[], &signing_key, &store,
+        );
+
+        match result {
+            Err(SubmitBatchError::InvalidSignatures(blocks)) => {
+                assert_eq!(blocks, vec![100, 101, 102]);
+            }
+            _ => panic!("Expected InvalidSignatures error"),
+        }
     }
 }

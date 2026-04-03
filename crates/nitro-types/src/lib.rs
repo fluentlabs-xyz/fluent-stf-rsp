@@ -43,5 +43,6 @@ pub enum EnclaveResponse {
     NotInitialized,
     ExecutionResult(EthExecutionResponse),
     SubmitBatchResult(SubmitBatchResponse),
+    InvalidSignatures { invalid_blocks: Vec<u64> },
     Error(String),
 }

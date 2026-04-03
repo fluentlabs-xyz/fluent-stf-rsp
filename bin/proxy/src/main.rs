@@ -30,7 +30,7 @@ use crate::{
     enclave::ensure_initialized,
     types::{NitroConfig, Sp1ProofResponse},
 };
-use nitro_types::{EthExecutionResponse, SubmitBatchResponse};
+use nitro_types::EthExecutionResponse;
 
 use std::{env, sync::Arc};
 use tokio::sync::OnceCell;
@@ -172,6 +172,13 @@ struct Sp1RequestResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+/// Response when batch signing fails due to invalid (stale) signatures.
+#[derive(Serialize)]
+struct InvalidSignaturesResponse {
+    invalid_blocks: Vec<u64>,
+    enclave_address: Address,
 }
 
 type HandlerError = (StatusCode, Json<ErrorResponse>);
@@ -356,7 +363,7 @@ fn decode_bincode<T: serde::de::DeserializeOwned>(
 async fn sign_batch_root(
     State(state): State<AppState>,
     Json(req): Json<SignBatchRootRequest>,
-) -> Result<Json<SubmitBatchResponse>, HandlerError> {
+) -> Result<impl IntoResponse, HandlerError> {
     let nitro = require_nitro(&state)?;
     let l1 = require_l1(&state)?;
 
@@ -378,12 +385,24 @@ async fn sign_batch_root(
     .await
     .map_err(|e| internal(format!("Blob fetching failed: {e}")))?;
 
-    let response =
+    let outcome =
         enclave::submit_batch(req.from_block, req.to_block, req.responses, blobs, nitro.config)
             .await
             .map_err(|e| internal(format!("Batch submission failed: {e}")))?;
 
-    Ok(Json(response))
+    match outcome {
+        enclave::SubmitBatchOutcome::Success(resp) => {
+            Ok(Json(serde_json::to_value(resp).unwrap()).into_response())
+        }
+        enclave::SubmitBatchOutcome::InvalidSignatures { invalid_blocks } => {
+            let address = enclave::enclave_address()
+                .ok_or_else(|| internal("Enclave address not available"))?;
+            Ok((
+                StatusCode::CONFLICT,
+                Json(InvalidSignaturesResponse { invalid_blocks, enclave_address: address }),
+            ).into_response())
+        }
+    }
 }
 
 // ===========================================================================

@@ -21,6 +21,8 @@ use nitro_types::{
 };
 use rsp_client_executor::io::EthClientExecutorInput;
 
+use alloy_primitives::Address;
+
 use crate::types::NitroConfig;
 
 // ---------------------------------------------------------------------------
@@ -62,6 +64,12 @@ pub(crate) async fn execute_block(
     execute_block_inner(msg, &config).await
 }
 
+/// Result of batch submission — either success or invalid signatures requiring re-execution.
+pub(crate) enum SubmitBatchOutcome {
+    Success(SubmitBatchResponse),
+    InvalidSignatures { invalid_blocks: Vec<u64> },
+}
+
 /// Batch signing — cache-first with response fallback.
 pub(crate) async fn submit_batch(
     from: u64,
@@ -69,7 +77,7 @@ pub(crate) async fn submit_batch(
     responses: Vec<EthExecutionResponse>,
     blobs: Vec<Vec<u8>>,
     config: NitroConfig,
-) -> eyre::Result<SubmitBatchResponse> {
+) -> eyre::Result<SubmitBatchOutcome> {
     let msg = EnclaveIncoming::SubmitBatch { from, to, responses, blobs };
     submit_batch_inner(msg, &config).await
 }
@@ -111,11 +119,15 @@ async fn execute_block_inner(
 async fn submit_batch_inner(
     msg: EnclaveIncoming,
     config: &NitroConfig,
-) -> eyre::Result<SubmitBatchResponse> {
+) -> eyre::Result<SubmitBatchOutcome> {
     let resp = send_to_enclave(config.enclave_cid, config.enclave_port, &msg).await?;
 
     match resp {
-        EnclaveResponse::SubmitBatchResult(r) => Ok(r),
+        EnclaveResponse::SubmitBatchResult(r) => Ok(SubmitBatchOutcome::Success(r)),
+
+        EnclaveResponse::InvalidSignatures { invalid_blocks } => {
+            Ok(SubmitBatchOutcome::InvalidSignatures { invalid_blocks })
+        }
 
         EnclaveResponse::NotInitialized => {
             info!("Enclave not initialised — triggering key generation");
@@ -123,7 +135,10 @@ async fn submit_batch_inner(
 
             let retry = send_to_enclave(config.enclave_cid, config.enclave_port, &msg).await?;
             match retry {
-                EnclaveResponse::SubmitBatchResult(r) => Ok(r),
+                EnclaveResponse::SubmitBatchResult(r) => Ok(SubmitBatchOutcome::Success(r)),
+                EnclaveResponse::InvalidSignatures { invalid_blocks } => {
+                    Ok(SubmitBatchOutcome::InvalidSignatures { invalid_blocks })
+                }
                 EnclaveResponse::Error(e) => Err(eyre::eyre!("Enclave error on retry: {e}")),
                 other => Err(eyre::eyre!("Unexpected response on retry: {other:?}")),
             }
@@ -316,4 +331,25 @@ fn write_file(path: &str, data: &[u8]) -> eyre::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, data).wrap_err_with(|| format!("Failed to write {path}"))
+}
+
+// ---------------------------------------------------------------------------
+// Enclave address derivation
+// ---------------------------------------------------------------------------
+
+/// Returns the current enclave's Ethereum address derived from its public key.
+/// Returns None if no key has been generated yet.
+pub(crate) fn enclave_address() -> Option<Address> {
+    let pk_hex = std::fs::read_to_string(public_key_path()).ok()?;
+    let pk_bytes = hex::decode(pk_hex.trim()).ok()?;
+    pubkey_to_address(&pk_bytes).ok()
+}
+
+/// Derive Ethereum address from 65-byte uncompressed secp256k1 public key.
+fn pubkey_to_address(pubkey: &[u8]) -> eyre::Result<Address> {
+    if pubkey.len() != 65 || pubkey[0] != 0x04 {
+        return Err(eyre::eyre!("Invalid uncompressed pubkey: len={}", pubkey.len()));
+    }
+    let hash = alloy_primitives::keccak256(&pubkey[1..]);
+    Ok(Address::from_slice(&hash[12..]))
 }
