@@ -10,8 +10,7 @@ members = [
     "crates/primitives",
     "crates/provider",
     "crates/storage/rpc-db",
-    "crates/storage/witness-db",
-    "bin/aws-nitro-validator/script", "crates/nitro-types",
+    "crates/storage/witness-db","crates/nitro-types",
     "crates/e2e-tests",
     "crates/blob-builder",
 ]

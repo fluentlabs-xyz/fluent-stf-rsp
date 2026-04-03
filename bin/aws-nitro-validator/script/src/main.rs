@@ -12,7 +12,7 @@ const EXPECTED_PUBKEY: [u8; 65] = hex!(
 );
 
 const ROOT_CERT_DER: &[u8] = include_bytes!("../../root.der");
-const ATTESTATION: &[u8] = include_bytes!("../../attestation.bin");
+// const ATTESTATION: &[u8] = include_bytes!("../../attestation.bin");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
