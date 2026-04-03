@@ -143,7 +143,7 @@ op-alloy-rpc-types = "0.18.12"
 
 kzg-rs = { git = "https://github.com/succinctlabs/kzg-rs" }
 
-rwasm = { git = "https://github.com/fluentlabs-xyz/rwasm", branch = "devel" }
+rwasm = { version="0.4.3", git = "https://github.com/fluentlabs-xyz/rwasm", tag = "v0.4.3" }
 
 [workspace.lints]
 rust.missing_debug_implementations = "warn"
@@ -175,5 +175,5 @@ revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.g
 revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
 op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
 
-#[patch."https://github.com/fluentlabs-xyz/rwasm"]
-#rwasm = { git = "https://www.github.com/fluentlabs-xyz/rwasm", branch = "devel" }
+[patch."https://github.com/fluentlabs-xyz/rwasm"]
+rwasm = { git = "https://www.github.com/fluentlabs-xyz/rwasm", tag = "v0.4.3" }

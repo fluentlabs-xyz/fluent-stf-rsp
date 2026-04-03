@@ -88,6 +88,8 @@ kzg-rs = "0.2.8"
 bytes = "1.5"
 brotli = {version = "8.0.2", optional = true }
 
+rwasm = { version="0.4.3", git = "https://github.com/fluentlabs-xyz/rwasm", tag = "v0.4.3" }
+
 [patch.crates-io]
 # sp1 precompile patches
 sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha2-0.10.9-sp1-6.0.0", package = "sha2" }
@@ -126,5 +128,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [build-dependencies]
 sp1-build = {version = "5", optional = true}
 
-#[patch."https://github.com/fluentlabs-xyz/rwasm"]
-#rwasm = { git = "https://www.github.com/fluentlabs-xyz/rwasm", branch = "devel" }
+[patch."https://github.com/fluentlabs-xyz/rwasm"]
+rwasm = { git = "https://www.github.com/fluentlabs-xyz/rwasm", tag = "v0.4.3" }
