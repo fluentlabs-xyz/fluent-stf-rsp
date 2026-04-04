@@ -20,7 +20,7 @@ use tracing::{info, warn};
 const LOG_PAGE_SIZE: u64 = 10_000;
 
 /// Small delay between sequential L1 RPC calls to avoid bursts.
-const RPC_INTER_CALL_DELAY: Duration = Duration::from_millis(100);
+const RPC_INTER_CALL_DELAY: Duration = Duration::from_secs(1);
 
 /// Maximum number of retry attempts for Beacon API requests.
 const BEACON_MAX_RETRIES: u32 = 5;

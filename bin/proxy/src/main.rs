@@ -158,6 +158,7 @@ struct SignBatchRootRequest {
     to_block: u64,
     batch_index: u64,
     responses: Vec<EthExecutionResponse>,
+    blobs: Vec<Vec<u8>>,
 }
 
 #[derive(Deserialize)]
@@ -367,7 +368,6 @@ async fn sign_batch_root(
     Json(req): Json<SignBatchRootRequest>,
 ) -> Result<impl IntoResponse, HandlerError> {
     let nitro = require_nitro(&state)?;
-    let l1 = require_l1(&state)?;
 
     if req.from_block > req.to_block {
         return Err(bad_request(format!(
@@ -376,20 +376,13 @@ async fn sign_batch_root(
         )));
     }
 
-    let blobs = blob::fetch_blobs_for_batch(
-        &l1.provider,
-        &l1.beacon_urls,
-        &l1.http_client,
-        l1.contract_addr,
-        req.batch_index,
-        l1.beacon_genesis_timestamp,
-        l1.contract_deploy_block,
-    )
-    .await
-    .map_err(|e| internal(format!("Blob fetching failed: {e}")))?;
+    if req.blobs.is_empty() {
+        return Err(bad_request("blobs field is required and must not be empty"));
+    }
 
+    // Blobs are now provided by the courier — no L1/Beacon fetch needed
     let outcome =
-        enclave::submit_batch(req.from_block, req.to_block, req.responses, blobs, nitro.config)
+        enclave::submit_batch(req.from_block, req.to_block, req.responses, req.blobs, nitro.config)
             .await
             .map_err(|e| internal(format!("Batch submission failed: {e}")))?;
 
