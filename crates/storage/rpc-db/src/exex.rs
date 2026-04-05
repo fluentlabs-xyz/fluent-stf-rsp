@@ -9,7 +9,7 @@ use reth_provider::{
     BlockReader, HeaderProvider, StateProofProvider, StateProviderBox, StateProviderFactory,
 };
 use reth_storage_errors::{db::DatabaseError, provider::ProviderError};
-use reth_trie::{HashedPostState, KeccakKeyHasher, MultiProofTargets, TrieInput};
+use reth_trie::{MultiProofTargets, TrieInput};
 use revm_database::BundleState;
 use revm_database_interface::DatabaseRef;
 use revm_primitives::{map::B256Set, Address, B256, KECCAK_EMPTY};
@@ -64,18 +64,27 @@ where
 {
     /// Creates a new `ExExDb`.
     ///
-    /// Uses `state_by_block_hash(parent_hash)` instead of
-    /// `history_by_block_number(N-1)` to correctly handle reorgs: the
-    /// hash-based lookup checks the in-memory blockchain tree first, where
-    /// reorg state is already resolved, before falling back to MDBX.
+    /// Tries `state_by_block_hash(parent_hash)` first (handles reorgs via
+    /// in-memory blockchain tree). Falls back to `history_by_block_number(N-1)`
+    /// which uses MDBX changesets — works during pipeline sync where the
+    /// blockchain tree is empty but changesets are committed.
     pub fn new(
         provider_factory: F,
         block_number: u64,
         parent_hash: B256,
         state_root: B256,
     ) -> Result<Self, RpcDbError> {
-        let before_provider =
-            provider_factory.state_by_block_hash(parent_hash).map_err(RpcDbError::from)?;
+        let before_provider = provider_factory
+            .state_by_block_hash(parent_hash)
+            .or_else(|_| {
+                debug!(
+                    block_number,
+                    %parent_hash,
+                    "state_by_block_hash failed, falling back to history_by_block_number"
+                );
+                provider_factory.history_by_block_number(block_number.saturating_sub(1))
+            })
+            .map_err(RpcDbError::from)?;
 
         Ok(Self {
             provider_factory,
@@ -87,6 +96,10 @@ where
             storage: RefCell::new(HashMap::with_hasher(Default::default())),
             oldest_ancestor: Cell::new(block_number),
         })
+    }
+
+    fn after_provider(&self) -> Result<StateProviderBox, RpcDbError> {
+        self.provider_factory.history_by_block_number(self.block_number).map_err(RpcDbError::from)
     }
 
     /// Fetches account info from the before-state (block N-1).
@@ -229,23 +242,18 @@ where
         let before_provider = self
             .provider_factory
             .state_by_block_hash(self.parent_hash)
+            .or_else(|_| {
+                self.provider_factory.history_by_block_number(self.block_number.saturating_sub(1))
+            })
             .map_err(RpcDbError::from)?;
         let before_multiproof = before_provider
             .multiproof(TrieInput::default(), before_targets)
             .map_err(|e| RpcDbError::GetProofError(Address::ZERO, e.to_string()))?;
 
-        // ── After-multiproof via overlay (new path) ──────────────
         let after_targets = self.get_targets(bundle_state);
-        let after_base_provider = self
-            .provider_factory
-            .state_by_block_hash(self.parent_hash)
-            .map_err(RpcDbError::from)?;
-        let hashed_post_state =
-            HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle_state.state);
-        let mut after_input = TrieInput::default();
-        after_input.prepend(hashed_post_state);
-        let after_multiproof = after_base_provider
-            .multiproof(after_input, after_targets)
+        let after_provider = self.after_provider()?;
+        let after_multiproof = after_provider
+            .multiproof(TrieInput::default(), after_targets)
             .map_err(|e| RpcDbError::GetProofError(Address::ZERO, e.to_string()))?;
 
         let state = EthereumState::from_transition_multiproofs(
@@ -358,82 +366,5 @@ where
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         self.fetch_block_hash(number)
             .map_err(|e| ProviderError::Database(DatabaseError::Other(e.to_string())))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Compares after_multiproof from `history_by_block_number(N)`
-    /// vs before_provider + `TrieInput` overlay.
-    ///
-    /// Requires a reth provider with full state at block N and N-1.
-    /// Only runnable inside integration tests with DB access.
-    pub fn assert_overlay_matches_direct<F>(
-        provider_factory: &F,
-        block_number: u64,
-        parent_hash: B256,
-        state_root: B256,
-        bundle_state: &BundleState,
-    ) where
-        F: StateProviderFactory
-            + HeaderProvider<Header = Header>
-            + BlockReader
-            + Clone,
-    {
-        let exex_db = ExExDb::new(
-            provider_factory.clone(),
-            block_number,
-            parent_hash,
-            state_root,
-        )
-        .expect("ExExDb::new failed");
-
-        let targets = exex_db.get_targets(bundle_state);
-
-        // ── OLD: after_provider via history_by_block_number ───────
-        let old_after_provider = provider_factory
-            .history_by_block_number(block_number)
-            .expect("history_by_block_number failed");
-        let old_multiproof = old_after_provider
-            .multiproof(TrieInput::default(), targets.clone())
-            .expect("old multiproof failed");
-
-        // ── NEW: overlay on before_provider ───────────────────────
-        let new_after_base = provider_factory
-            .state_by_block_hash(parent_hash)
-            .expect("state_by_block_hash failed");
-        let hashed_post_state =
-            HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle_state.state);
-        let mut after_input = TrieInput::default();
-        after_input.prepend(hashed_post_state);
-        let new_multiproof = new_after_base
-            .multiproof(after_input, targets)
-            .expect("overlay multiproof failed");
-
-        // ── Compare ──────────────────────────────────────────────
-        assert_eq!(
-            old_multiproof.account_subtree,
-            new_multiproof.account_subtree,
-            "Account subtree mismatch at block {block_number}"
-        );
-
-        for (hashed_addr, old_storage) in &old_multiproof.storages {
-            let new_storage = new_multiproof
-                .storages
-                .get(hashed_addr)
-                .unwrap_or_else(|| panic!("Missing storage for {hashed_addr} in overlay"));
-            assert_eq!(
-                old_storage.root, new_storage.root,
-                "Storage root mismatch for {hashed_addr} at block {block_number}"
-            );
-            assert_eq!(
-                old_storage.subtree, new_storage.subtree,
-                "Storage subtree mismatch for {hashed_addr} at block {block_number}"
-            );
-        }
-
-        tracing::info!(block_number, "Overlay multiproof matches direct provider");
     }
 }
