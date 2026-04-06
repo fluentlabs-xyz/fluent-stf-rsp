@@ -9,7 +9,7 @@ use reth_provider::{
     BlockReader, HeaderProvider, StateProofProvider, StateProviderBox, StateProviderFactory,
 };
 use reth_storage_errors::{db::DatabaseError, provider::ProviderError};
-use reth_trie::{MultiProofTargets, TrieInput};
+use reth_trie::{HashedPostState, KeccakKeyHasher, MultiProofTargets, TrieInput};
 use revm_database::BundleState;
 use revm_database_interface::DatabaseRef;
 use revm_primitives::{map::B256Set, Address, B256, KECCAK_EMPTY};
@@ -96,10 +96,6 @@ where
             storage: RefCell::new(HashMap::with_hasher(Default::default())),
             oldest_ancestor: Cell::new(block_number),
         })
-    }
-
-    fn after_provider(&self) -> Result<StateProviderBox, RpcDbError> {
-        self.provider_factory.history_by_block_number(self.block_number).map_err(RpcDbError::from)
     }
 
     /// Fetches account info from the before-state (block N-1).
@@ -250,10 +246,25 @@ where
             .multiproof(TrieInput::default(), before_targets)
             .map_err(|e| RpcDbError::GetProofError(Address::ZERO, e.to_string()))?;
 
+        // ── After-multiproof via overlay ──────────────────────────
+        // Instead of history_by_block_number(N) (requires history indices),
+        // reuse the before-provider (block N-1) and prepend the execution's
+        // BundleState as a HashedPostState overlay. This gives the trie walker
+        // the post-execution state without needing a separate provider.
         let after_targets = self.get_targets(bundle_state);
-        let after_provider = self.after_provider()?;
-        let after_multiproof = after_provider
-            .multiproof(TrieInput::default(), after_targets)
+        let after_base_provider = self
+            .provider_factory
+            .state_by_block_hash(self.parent_hash)
+            .or_else(|_| {
+                self.provider_factory.history_by_block_number(self.block_number.saturating_sub(1))
+            })
+            .map_err(RpcDbError::from)?;
+        let hashed_post_state =
+            HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle_state.state);
+        let mut after_input = TrieInput::default();
+        after_input.prepend(hashed_post_state);
+        let after_multiproof = after_base_provider
+            .multiproof(after_input, after_targets)
             .map_err(|e| RpcDbError::GetProofError(Address::ZERO, e.to_string()))?;
 
         let state = EthereumState::from_transition_multiproofs(

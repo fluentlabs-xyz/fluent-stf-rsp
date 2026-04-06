@@ -43,7 +43,7 @@ pub struct ClientExecutor<C: ConfigureEvm, CS> {
 }
 
 static BRIDGE_INFO: BridgeInfo = BridgeInfo {
-    bridge_address: address!("0x9CAcf613fC29015893728563f423fD26dCdB8Ddc"),
+    bridge_address: address!("0xfCcb6F2BF4aF9B8B6d0f88613885a0714ff28596"),
     withdrawal_topic: b256!("0x7b397c6ce16a73396390bf270a2021417ca4d97f44e82cdce3f5eb750fd34134"),
     rollback_topic: b256!("0xdf7aa00ff05158efbc91b05d801c14d80f3d08daf5b13c7f066030c864be3d65"),
     deposit_topic: b256!("0xc5797c3a3c0e6c245576d05b8c3929881b44e1a21fdb4f1b118ede3c009683c5"),
