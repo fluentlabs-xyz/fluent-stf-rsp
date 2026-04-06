@@ -18,6 +18,11 @@ An HTTP proxy that sits between callers and execution backends, managing the Mul
 | `POST /challenge/sp1/request` | SP1 zkVM (network) | `request_id` for async Groth16 proof |
 | `POST /challenge/sp1/status` | SP1 zkVM (network) | Proof result by `request_id` |
 
+### Attestation retry
+| Endpoint | Backend | Output |
+|---|---|---|
+| `POST /retry-attestation` | SP1 zkVM (network) + L1 | Retry attestation proof or check status |
+
 ### Mock endpoints (testing, no SP1 network calls)
 | Endpoint | Backend | Output |
 |---|---|---|
@@ -103,6 +108,10 @@ proxy --eif_path /path/to/enclave.eif
 | `PUBLIC_KEY_STORAGE` | `./public_key.hex` | Path to the enclave's hex-encoded ECDSA public key |
 | `SP1_ELF_PATH` | *(unset)* | Path to compiled SP1 zkVM ELF. Disables SP1 endpoints if unset |
 | `SP1_PRIVATE_KEY` | — | Required for Succinct network prover authentication |
+| `NITRO_VALIDATOR_ELF_PATH` | *(unset)* | Path to nitro validator SP1 ELF. Required for attestation proving |
+| `NITRO_VERIFIER_ADDR` | *(unset)* | L1 NitroVerifier contract address. Required for attestation proving |
+| `L1_SUBMITTER_KEY` | *(unset)* | Private key for L1 attestation tx submission |
+| `ATTESTATION_REQUEST_ID_STORAGE` | `./attestation_request_id.hex` | Path to persisted SP1 attestation proof request ID |
 
 ---
 
@@ -300,6 +309,50 @@ ISP1Verifier(verifier).verifyProof(
 
 ---
 
+### POST /retry-attestation
+
+Manually retry the attestation proof flow. Reads the enclave's public key and attestation document from disk. Requires `prove-key-attestation` feature and related env vars (`NITRO_VALIDATOR_ELF_PATH`, `NITRO_VERIFIER_ADDR`, `L1_SUBMITTER_KEY`).
+
+**Mode 1 — Submit new proof** (no `request_id` in body):
+
+```json
+{}
+```
+
+Submits a new SP1 proof request, saves the `request_id` to disk, and returns immediately. Proof wait + L1 submission happens in background.
+
+**Response** `200 OK`
+```json
+{
+  "request_id": "0x…",
+  "status": "proof_requested",
+  "public_key": "04…"
+}
+```
+
+**Mode 2 — Check existing proof** (with `request_id`):
+
+```json
+{
+  "request_id": "0x…"
+}
+```
+
+Checks SP1 for proof status. If the proof is ready, submits to L1 and returns `"proof_submitted_to_l1"`. If still pending, returns the current status.
+
+**Response** `200 OK`
+```json
+{
+  "request_id": "0x…",
+  "status": "proof_submitted_to_l1",
+  "public_key": "04…"
+}
+```
+
+Without the `prove-key-attestation` feature, returns `"status": "proving_disabled"`.
+
+---
+
 ### POST /mock/sp1/request
 
 Returns a fake `request_id` without submitting anything to the SP1 network. Takes the same payload as `/challenge/sp1/request`. Does not require `SP1_ELF_PATH`. Useful for integration testing.
@@ -406,6 +459,7 @@ proxy                                       enclave (VSOCK)
 | `data_key.enc` | `DATA_KEY_STORAGE` | KMS-encrypted data key |
 | `attestation.bin` | `ATTESTATION_STORAGE` | NSM attestation document binding the enclave image to the generated key |
 | `public_key.hex` | `PUBLIC_KEY_STORAGE` | Hex-encoded ECDSA public key for off-chain signature verification |
+| `attestation_request_id.hex` | `ATTESTATION_REQUEST_ID_STORAGE` | SP1 proof request ID for attestation (survives restarts) |
 
 The AWS credentials must grant `kms:GenerateDataKey` and `kms:Decrypt` on the KMS key configured in the enclave image.
 
@@ -414,10 +468,13 @@ The AWS credentials must grant `kms:GenerateDataKey` and `kms:Decrypt` on the KM
 ## Source layout
 ```text
 src/
-├── main.rs      # HTTP server, handlers, request deserialization (bincode+zstd)
-├── types.rs     # Shared request/response structs and configuration types
-├── enclave.rs   # Nitro enclave VSOCK communication and key management
-└── blob.rs      # EIP-4844 blob fetching from L1 contract + Beacon API
+├── main.rs           # HTTP server, handlers, request deserialization (bincode+zstd)
+├── types.rs          # Shared request/response structs and configuration types
+├── enclave.rs        # Nitro enclave VSOCK communication and key management
+├── blob.rs           # EIP-4844 blob fetching from L1 contract + Beacon API
+└── attestation/      # Attestation proving via SP1 + L1 submission (prove-key-attestation feature)
+    ├── mod.rs        # SP1 proof request/wait/submit, request-id persistence
+    └── prepare.rs    # Parse attestation document into SP1 guest input
 ```
 
 ---

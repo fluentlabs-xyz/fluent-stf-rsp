@@ -12,6 +12,10 @@
 //! - `POST /challenge/sp1/request`    — submit async SP1 zkVM proof request (blobs from beacon)
 //! - `POST /challenge/sp1/status`     — poll for SP1 proof result
 //!
+//! ## Attestation retry
+//!
+//! - `POST /retry-attestation`          — retry attestation proof (SP1 + L1)
+//!
 //! ## Mock endpoints (testing, no SP1 network calls)
 //!
 //! - `POST /mock/sp1/request`         — returns a fake request_id
@@ -171,6 +175,19 @@ struct Sp1RequestResponse {
     request_id: B256,
 }
 
+#[derive(Deserialize)]
+#[allow(dead_code)] // field read inside #[cfg(feature = "prove-key-attestation")]
+struct RetryAttestationRequest {
+    request_id: Option<B256>,
+}
+
+#[derive(Serialize)]
+struct RetryAttestationResponse {
+    request_id: Option<B256>,
+    status: String,
+    public_key: String,
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
@@ -230,9 +247,9 @@ fn require_nitro(state: &AppState) -> Result<&NitroState, HandlerError> {
 async fn require_sp1(state: &AppState) -> Result<&Sp1State, HandlerError> {
     match &state.sp1 {
         None => Err(internal("SP1 prover not configured (set SP1_ELF_PATH)")),
-        Some(cell) => cell
-            .get()
-            .ok_or_else(|| internal("SP1 prover still initializing, please retry")),
+        Some(cell) => {
+            cell.get().ok_or_else(|| internal("SP1 prover still initializing, please retry"))
+        }
     }
 }
 
@@ -352,9 +369,7 @@ async fn sign_block_execution(
 }
 
 /// Decode a bincode payload.
-fn decode_bincode<T: serde::de::DeserializeOwned>(
-    body: &[u8],
-) -> Result<T, HandlerError> {
+fn decode_bincode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, HandlerError> {
     bincode::deserialize(body)
         .map_err(|e| bad_request(format!("Bincode deserialization failed: {e}")))
 }
@@ -396,7 +411,8 @@ async fn sign_batch_root(
             Ok((
                 StatusCode::CONFLICT,
                 Json(InvalidSignaturesResponse { invalid_blocks, enclave_address: address }),
-            ).into_response())
+            )
+                .into_response())
         }
     }
 }
@@ -499,6 +515,52 @@ async fn challenge_sp1_status(
 }
 
 // ===========================================================================
+// Attestation retry endpoint
+// ===========================================================================
+
+/// `POST /retry-attestation`
+///
+/// Without request_id: submit new SP1 proof, return request_id immediately.
+/// With request_id: check SP1 proof status, submit to L1 if ready.
+async fn retry_attestation(
+    State(state): State<AppState>,
+    Json(req): Json<RetryAttestationRequest>,
+) -> Result<Json<RetryAttestationResponse>, HandlerError> {
+    let (public_key, attestation) = enclave::load_attestation_artifacts()
+        .map_err(|e| bad_request(format!("Enclave not initialized: {e}")))?;
+
+    let pk_hex = hex::encode(&public_key);
+
+    #[cfg(feature = "prove-key-attestation")]
+    {
+        let config = state
+            .attestation
+            .as_ref()
+            .ok_or_else(|| internal("Attestation proving not configured"))?;
+
+        let result = attestation::retry(config, &public_key, &attestation, req.request_id)
+            .await
+            .map_err(|e| internal(format!("Attestation retry failed: {e}")))?;
+
+        return Ok(Json(RetryAttestationResponse {
+            request_id: result.request_id,
+            status: result.status,
+            public_key: pk_hex,
+        }));
+    }
+
+    #[cfg(not(feature = "prove-key-attestation"))]
+    {
+        let _ = (req, state, attestation);
+        Ok(Json(RetryAttestationResponse {
+            request_id: None,
+            status: "proving_disabled".to_string(),
+            public_key: pk_hex,
+        }))
+    }
+}
+
+// ===========================================================================
 // Mock endpoints
 // ===========================================================================
 
@@ -588,17 +650,12 @@ async fn main() -> eyre::Result<()> {
 
             tokio::spawn(async move {
                 let elf = Elf::from(elf_bytes);
-                let client = ProverClient::builder()
-                    .network_for(NetworkMode::Mainnet)
-                    .build()
-                    .await;
+                let client =
+                    ProverClient::builder().network_for(NetworkMode::Mainnet).build().await;
                 let pk = client.setup(elf).await.unwrap();
                 let vk = pk.verifying_key();
                 info!(vk_hash = %hex::encode(vk.hash_bytes()), "SP1 prover initialised (background)");
-                let _ = cell_clone.set(Sp1State {
-                    client: Arc::new(client),
-                    pk: Arc::new(pk),
-                });
+                let _ = cell_clone.set(Sp1State { client: Arc::new(client), pk: Arc::new(pk) });
             });
 
             info!("SP1 prover initialization started in background");
@@ -633,15 +690,10 @@ async fn main() -> eyre::Result<()> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1606824023); // Mainnet beacon genesis
-            let contract_deploy_block: u64 = env::var("L1_CONTRACT_DEPLOY_BLOCK")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let beacon_urls: Vec<String> = beacon
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let contract_deploy_block: u64 =
+                env::var("L1_CONTRACT_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let beacon_urls: Vec<String> =
+                beacon.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             let http_client = reqwest::Client::new();
 
             info!(
@@ -706,6 +758,8 @@ async fn main() -> eyre::Result<()> {
         // ── Challenge (proxy builds input from RPC) ──────
         .route("/challenge/sp1/request", post(challenge_sp1_request))
         .route("/challenge/sp1/status", post(challenge_sp1_status))
+        // ── Attestation retry ────────────────────────────
+        .route("/retry-attestation", post(retry_attestation))
         // ── Mock (testing) ───────────────────────────────
         .route("/mock/sp1/request", post(mock_sp1_request))
         .route("/mock/sp1/status", post(mock_sp1_status))

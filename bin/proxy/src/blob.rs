@@ -101,13 +101,9 @@ pub(crate) async fn fetch_blobs_for_batch(
     info!(batch_index, count = versioned_hashes.len(), "Fetched versioned hashes from L1");
 
     // ── 2. Find L1 blocks where submitBlobs was called (paginated) ─────
-    let l1_blocks = fetch_batch_log_blocks(
-        l1_provider,
-        contract_addr,
-        batch_index,
-        contract_deploy_block,
-    )
-    .await?;
+    let l1_blocks =
+        fetch_batch_log_blocks(l1_provider, contract_addr, batch_index, contract_deploy_block)
+            .await?;
 
     info!(batch_index, ?l1_blocks, "Found submitBlobs L1 blocks");
 
@@ -141,11 +137,8 @@ pub(crate) async fn fetch_blobs_for_batch(
     // ── 4. Order blobs to match _batchBlobHashes order ──────────────────
     let mut ordered = Vec::with_capacity(versioned_hashes.len());
     for vh in &versioned_hashes {
-        let blob = found
-            .iter()
-            .find(|(h, _)| h == vh)
-            .map(|(_, data)| data.clone())
-            .ok_or_else(|| {
+        let blob =
+            found.iter().find(|(h, _)| h == vh).map(|(_, data)| data.clone()).ok_or_else(|| {
                 eyre!(
                     "Blob not found for versioned hash {vh} — \
                      blobs may have been pruned (EIP-4844 ~18 day retention)"
@@ -188,10 +181,9 @@ async fn fetch_batch_log_blocks(
             .from_block(cursor)
             .to_block(chunk_end);
 
-        let logs = l1_provider
-            .get_logs(&filter)
-            .await
-            .map_err(|e| eyre!("BatchBlobsSubmitted log query failed ({cursor}..{chunk_end}): {e}"))?;
+        let logs = l1_provider.get_logs(&filter).await.map_err(|e| {
+            eyre!("BatchBlobsSubmitted log query failed ({cursor}..{chunk_end}): {e}")
+        })?;
 
         l1_blocks.extend(logs.iter().filter_map(|l| l.block_number));
 
@@ -262,13 +254,14 @@ async fn fetch_blob_sidecars_single(
                     backoff *= 2;
                     continue;
                 }
-                return Err(eyre!("Beacon API rate-limited for slot {slot} after {BEACON_MAX_RETRIES} retries"));
+                return Err(eyre!(
+                    "Beacon API rate-limited for slot {slot} after {BEACON_MAX_RETRIES} retries"
+                ));
             }
             Ok(r) if r.status().is_success() => {
-                return r
-                    .json()
-                    .await
-                    .map_err(|e| eyre!("Failed to parse beacon blob sidecars for slot {slot}: {e}"));
+                return r.json().await.map_err(|e| {
+                    eyre!("Failed to parse beacon blob sidecars for slot {slot}: {e}")
+                });
             }
             Ok(r) => {
                 let status = r.status();
@@ -288,7 +281,9 @@ async fn fetch_blob_sidecars_single(
                     backoff *= 2;
                     continue;
                 }
-                return Err(eyre!("Beacon API failed for slot {slot} after {BEACON_MAX_RETRIES} retries: {e}"));
+                return Err(eyre!(
+                    "Beacon API failed for slot {slot} after {BEACON_MAX_RETRIES} retries: {e}"
+                ));
             }
         }
     }

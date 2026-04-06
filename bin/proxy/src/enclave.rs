@@ -231,7 +231,7 @@ async fn resolve_aws_credentials() -> eyre::Result<AwsCredentials> {
 // Storage
 // ---------------------------------------------------------------------------
 
-fn storage_path(var: &str, default: &str) -> String {
+pub(crate) fn storage_path(var: &str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_string())
 }
 
@@ -241,6 +241,17 @@ fn attestation_path() -> String {
 
 fn public_key_path() -> String {
     storage_path("PUBLIC_KEY_STORAGE", "./public_key.hex")
+}
+
+/// Read saved attestation artifacts from disk (for retry endpoint).
+pub(crate) fn load_attestation_artifacts() -> eyre::Result<(Vec<u8>, Vec<u8>)> {
+    let pk_hex = fs::read_to_string(public_key_path())
+        .wrap_err("Public key file not found — enclave not initialized")?;
+    let public_key =
+        hex::decode(pk_hex.trim()).map_err(|e| eyre::eyre!("Invalid public key hex: {e}"))?;
+    let attestation = fs::read(attestation_path())
+        .wrap_err("Attestation file not found — enclave not initialized")?;
+    Ok((public_key, attestation))
 }
 
 fn save_artifacts(public_key: &[u8], attestation: &[u8]) -> eyre::Result<()> {
