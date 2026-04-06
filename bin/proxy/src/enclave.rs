@@ -194,11 +194,11 @@ async fn on_new_attestation(public_key: &[u8], attestation: &[u8]) -> eyre::Resu
 
     #[cfg(not(feature = "prove-key-attestation"))]
     {
-        let _ = attestation;
         info!(
             public_key = %hex::encode(public_key),
-            "Attestation received — proving disabled (enable prove-key-attestation feature)"
+            "Attestation received — running local SP1 validation"
         );
+        crate::attestation::execute_local(attestation).await;
     }
 
     Ok(())

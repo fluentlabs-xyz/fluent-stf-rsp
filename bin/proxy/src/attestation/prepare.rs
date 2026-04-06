@@ -34,7 +34,7 @@ struct AttestationDoc {
 
 /// Parse the raw attestation document, validate the certificate chain,
 /// and produce a minimal `GuestInput` for the SP1 guest program.
-pub(super) fn prepare_guest_input(
+pub(crate) fn prepare_guest_input(
     attestation_bytes: &[u8],
     root_cert_der: &[u8],
 ) -> Result<GuestInput, Box<dyn std::error::Error>> {

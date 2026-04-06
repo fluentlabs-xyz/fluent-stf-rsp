@@ -27,7 +27,6 @@ mod blob;
 mod enclave;
 mod types;
 
-#[cfg(feature = "prove-key-attestation")]
 mod attestation;
 
 use crate::{
