@@ -15,6 +15,7 @@ pub struct CertData {
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
     /// SEC1 uncompressed P-384 public key of this certificate (0x04 || X || Y)
+    #[serde(with = "serde_bytes")]
     pub pubkey: Vec<u8>,
 }
 
@@ -35,9 +36,11 @@ pub struct GuestInput {
     pub sig_structure: Vec<u8>,
 
     /// 96-byte raw ECDSA P-384 COSE Sign1 signature (R || S)
+    #[serde(with = "serde_bytes")]
     pub cose_signature: Vec<u8>,
 
     /// PCR0 from the attestation document (48-byte SHA-384)
+    #[serde(with = "serde_bytes")]
     pub pcr0: Vec<u8>,
 
     /// user_data from the attestation document

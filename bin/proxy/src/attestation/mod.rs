@@ -15,7 +15,7 @@ pub(crate) use network::*;
 
 /// Run local SP1 execute to validate the attestation document.
 /// Logs errors and returns on failure so the proxy continues.
-#[cfg(not(feature = "prove-key-attestation"))]
+#[cfg(any(not(feature = "prove-key-attestation"), test))]
 pub(crate) async fn execute_local(attestation: &[u8]) {
     use sp1_sdk::Prover as _;
     use tracing::info;
@@ -60,5 +60,65 @@ pub(crate) async fn execute_local(attestation: &[u8]) {
         Err(e) => {
             tracing::error!(?e, "Local SP1 attestation validation failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ATTESTATION_BYTES: &[u8] = include_bytes!("../../../../attestation.bin");
+
+    #[test]
+    fn test_prepare_guest_input() {
+        let result = prepare::prepare_guest_input(ATTESTATION_BYTES, ROOT_CERT_DER);
+        assert!(result.is_ok(), "prepare_guest_input failed: {:?}", result.err());
+
+        let input = result.unwrap();
+        println!("pcr0 (len={}): {:?}", input.pcr0.len(), input.pcr0);
+        println!("cose_signature (len={}): {:?}", input.cose_signature.len(), &input.cose_signature[..8]);
+        println!("user_data (len={}): {:?}", input.user_data.len(), &input.user_data[..4]);
+        assert!(!input.chain.is_empty(), "certificate chain should not be empty");
+        assert!(!input.sig_structure.is_empty(), "sig_structure should not be empty");
+        assert!(!input.user_data.is_empty(), "user_data should not be empty");
+    }
+
+    /// Debug: parse CBOR directly to inspect PCRs map
+    #[test]
+    fn test_debug_pcrs_from_cbor() {
+        use serde::Deserialize;
+        use serde_bytes::ByteBuf;
+
+        #[derive(Deserialize)]
+        struct CoseSign1(ByteBuf, ciborium::Value, ByteBuf, ByteBuf);
+
+        let cose: CoseSign1 = ciborium::from_reader(ATTESTATION_BYTES).unwrap();
+        let payload = &cose.2[..];
+
+        // Parse as raw ciborium::Value to see what PCRs looks like
+        let raw: ciborium::Value = ciborium::from_reader(payload).unwrap();
+        if let ciborium::Value::Map(entries) = &raw {
+            for (k, v) in entries {
+                if let ciborium::Value::Text(key) = k {
+                    if key == "pcrs" {
+                        println!("pcrs raw CBOR value: {:?}", v);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_local() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let elf_path = format!("{}/../../nitro-validator.elf", manifest_dir);
+
+        assert!(
+            std::path::Path::new(&elf_path).exists(),
+            "nitro-validator.elf not found at {elf_path}"
+        );
+
+        std::env::set_var("NITRO_VALIDATOR_ELF_PATH", &elf_path);
+        execute_local(ATTESTATION_BYTES).await;
     }
 }

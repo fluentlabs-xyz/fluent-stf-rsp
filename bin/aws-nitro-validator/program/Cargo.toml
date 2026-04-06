@@ -15,7 +15,7 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 sha3 = "0.10"
 x509-parser = { version = "0.16", default-features = false }
-sp1-zkvm = "5.2.0"
+sp1-zkvm = "6.0.2"
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
 common = {path = "../common"}
 
@@ -23,6 +23,6 @@ common = {path = "../common"}
 hex = "0.4"
 
 [patch.crates-io]
-sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.9-sp1-4.0.0" }
-sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha3-0.10.8-sp1-4.0.0" }
-crypto-bigint = { git = "https://github.com/sp1-patches/RustCrypto-bigint", tag = "patch-0.5.5-sp1-4.0.0" }
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.9-sp1-6.0.0" }
+sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha3-0.10.8-sp1-6.0.0" }
+crypto-bigint = { git = "https://github.com/sp1-patches/RustCrypto-bigint", tag = "patch-0.5.5-sp1-6.0.0" }
