@@ -103,7 +103,6 @@ struct AppState {
     chain: ChainContext,
     /// L1 context — used by `/sign-batch-root` for blob fetching.
     l1: Option<L1State>,
-    #[cfg(feature = "prove-key-attestation")]
     attestation: Option<Arc<attestation::AttestationConfig>>,
 }
 
@@ -175,7 +174,6 @@ struct Sp1RequestResponse {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)] // field read inside #[cfg(feature = "prove-key-attestation")]
 struct RetryAttestationRequest {
     request_id: Option<B256>,
 }
@@ -530,33 +528,20 @@ async fn retry_attestation(
 
     let pk_hex = hex::encode(&public_key);
 
-    #[cfg(feature = "prove-key-attestation")]
-    {
-        let config = state
-            .attestation
-            .as_ref()
-            .ok_or_else(|| internal("Attestation proving not configured"))?;
+    let config = state
+        .attestation
+        .as_ref()
+        .ok_or_else(|| internal("Attestation proving not configured"))?;
 
-        let result = attestation::retry(config, &public_key, &attestation, req.request_id)
-            .await
-            .map_err(|e| internal(format!("Attestation retry failed: {e}")))?;
+    let result = attestation::retry(config, &public_key, &attestation, req.request_id)
+        .await
+        .map_err(|e| internal(format!("Attestation retry failed: {e}")))?;
 
-        return Ok(Json(RetryAttestationResponse {
-            request_id: result.request_id,
-            status: result.status,
-            public_key: pk_hex,
-        }));
-    }
-
-    #[cfg(not(feature = "prove-key-attestation"))]
-    {
-        let _ = (req, state, attestation);
-        Ok(Json(RetryAttestationResponse {
-            request_id: None,
-            status: "proving_disabled".to_string(),
-            public_key: pk_hex,
-        }))
-    }
+    Ok(Json(RetryAttestationResponse {
+        request_id: result.request_id,
+        status: result.status,
+        public_key: pk_hex,
+    }))
 }
 
 // ===========================================================================
@@ -717,8 +702,7 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
-    // ── Attestation config (prove-key-attestation feature) ──────────────
-    #[cfg(feature = "prove-key-attestation")]
+    // ── Attestation config ──────────────────────────────────────────────
     let attestation_config = {
         match attestation::AttestationConfig::from_env().await {
             Ok(cfg) => {
@@ -746,7 +730,6 @@ async fn main() -> eyre::Result<()> {
         sp1,
         chain,
         l1,
-        #[cfg(feature = "prove-key-attestation")]
         attestation: attestation_config,
     };
 

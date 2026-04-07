@@ -13,7 +13,7 @@ use rsp_primitives::genesis::Genesis;
 use sha2::{Digest, Sha256};
 
 use crate::sp1::{
-    parse_da_header, read_logical, validate_canonical_padding, BlobVerificationInput,
+    decode_blob_payload, parse_da_header, validate_canonical_padding, BlobVerificationInput,
 };
 
 const START_BLOCK: u64 = 22610746;
@@ -54,7 +54,8 @@ async fn test_sp1_full_flow() {
 
     validate_canonical_padding(&blob_input.blobs);
 
-    let (tx_data_offset, tx_data_len) = parse_da_header(&blob_input.blobs, block_number);
+    let decompressed = decode_blob_payload(&blob_input.blobs);
+    let (tx_data_offset, tx_data_len) = parse_da_header(&decompressed, block_number);
 
     let tx_data_hash_exec = B256::from_slice(&Sha256::digest(&tx_data));
 
@@ -84,9 +85,8 @@ async fn test_sp1_full_flow() {
         versioned_hashes.push(vh);
     }
 
-    let mut blob_tx_data = vec![0u8; tx_data_len];
-    read_logical(&blob_input.blobs, tx_data_offset, &mut blob_tx_data);
-    let blob_tx_data_hash = B256::from_slice(&Sha256::digest(&blob_tx_data));
+    let blob_tx_data = &decompressed[tx_data_offset..tx_data_offset + tx_data_len];
+    let blob_tx_data_hash = B256::from_slice(&Sha256::digest(blob_tx_data));
 
     assert_eq!(tx_data_hash_exec, blob_tx_data_hash, "EXEC vs DA tx_data mismatch");
     assert_eq!(versioned_hashes.len(), built_blobs.len());

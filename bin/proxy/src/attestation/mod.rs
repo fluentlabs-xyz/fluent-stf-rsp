@@ -7,10 +7,8 @@ pub(crate) mod prepare;
 
 pub(crate) const ROOT_CERT_DER: &[u8] = include_bytes!("../../../aws-nitro-validator/root.der");
 
-#[cfg(feature = "prove-key-attestation")]
 mod network;
 
-#[cfg(feature = "prove-key-attestation")]
 pub(crate) use network::*;
 
 /// Run local SP1 execute to validate the attestation document.
@@ -54,6 +52,7 @@ pub(crate) async fn execute_local(attestation: &[u8]) {
         Ok((_public_values, report)) => {
             info!(
                 total_instructions = report.total_instruction_count(),
+                committed_hex = %hex_encoded,
                 "Local SP1 attestation validation succeeded"
             );
         }

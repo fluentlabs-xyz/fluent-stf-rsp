@@ -8048,6 +8048,7 @@ name = "rsp-blob-builder"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "brotli",
  "c-kzg",
  "eyre",
  "sha2",
@@ -8090,7 +8091,6 @@ dependencies = [
  "rsp-host-executor",
  "rsp-primitives",
  "rustls 0.21.12",
- "rwasm",
  "serde",
  "serde_bytes",
  "serde_json",

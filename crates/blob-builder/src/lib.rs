@@ -12,6 +12,7 @@ use alloy_primitives::B256;
 use c_kzg::{Blob, KzgSettings, BYTES_PER_BLOB};
 use eyre::{eyre, Result};
 use sha2::{Digest, Sha256};
+use std::io::Cursor;
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
@@ -68,10 +69,11 @@ pub fn build_blobs_from_blocks(
     tx_data_per_block: &[Vec<u8>],
 ) -> Result<Vec<BuiltBlob>> {
     let payload = encode_blob_payload(from_block, tx_data_per_block);
-    if payload.is_empty() {
+    let compressed = brotli_compress(&payload)?;
+    if compressed.is_empty() {
         return build_blob(&[0u8]).map(|b| vec![b]);
     }
-    payload.chunks(MAX_RAW_BYTES_PER_BLOB).map(build_blob).collect()
+    compressed.chunks(MAX_RAW_BYTES_PER_BLOB).map(build_blob).collect()
 }
 
 /// Encode per-block transaction data into the canonical blob payload format.
@@ -132,6 +134,15 @@ pub fn build_blob(raw: &[u8]) -> Result<BuiltBlob> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Brotli compress with quality=6 to match production Go sequencer.
+fn brotli_compress(data: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let params = brotli::enc::BrotliEncoderParams { quality: 6, ..Default::default() };
+    brotli::BrotliCompress(&mut Cursor::new(data), &mut output, &params)
+        .map_err(|e| eyre!("brotli compression failed: {e}"))?;
+    Ok(output)
+}
 
 /// Canonicalise `raw` bytes into a full `BYTES_PER_BLOB`-length buffer.
 ///

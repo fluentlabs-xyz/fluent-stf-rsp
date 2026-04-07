@@ -15,7 +15,8 @@ default = ["sp1"]
 sp1 = [
     "dep:sp1-zkvm",
     "rsp-client-executor/sp1",
-    "sp1-build"
+    "sp1-build",
+    "dep:brotli"
 ]
 nitro = [
     "dep:aws-sdk-kms",
@@ -87,8 +88,6 @@ c-kzg = { version = "2.1.7", optional = true }
 kzg-rs = "0.2.8"
 bytes = "1.5"
 brotli = {version = "8.0.2", optional = true }
-
-rwasm = { version="0.4.3", git = "https://github.com/fluentlabs-xyz/rwasm", tag = "v0.4.3" }
 
 [patch.crates-io]
 # sp1 precompile patches

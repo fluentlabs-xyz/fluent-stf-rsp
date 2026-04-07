@@ -13,6 +13,7 @@ use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::B256;
 use bytes::{buf::UninitSlice, BufMut};
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::sync::Arc;
 
 use kzg_rs::{Blob, Bytes48, KzgProof, KzgSettings};
@@ -30,47 +31,33 @@ pub struct BlobVerificationInput {
     pub proofs: Vec<Vec<u8>>,
 }
 
-/// Utility for reading raw logical bytes into a provided buffer (stack-allocated).
-/// Ensures zero heap allocations during header parsing.
-///
-/// # Panics
-/// Panics if the requested read exceeds the available logical payload in the blobs.
-pub(crate) fn read_logical(blobs: &[Vec<u8>], logical_offset: usize, buf: &mut [u8]) {
-    let mut current_offset = logical_offset;
-    let mut remaining = buf.len();
-    let mut buf_pos = 0;
+/// Extracts raw bytes from a single blob's KZG field elements.
+/// Inverse of canonicalize: skips the 0x00 high byte of each 32-byte field.
+fn decanonicalize(blob: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(MAX_RAW_BYTES_PER_BLOB);
+    let mut offset = 0;
+    while offset < blob.len() && result.len() < MAX_RAW_BYTES_PER_BLOB {
+        assert_eq!(blob[offset], 0x00, "non-canonical field element at offset {offset}");
+        offset += 1;
+        let remaining = MAX_RAW_BYTES_PER_BLOB - result.len();
+        let take = remaining.min(BYTES_PER_FIELD);
+        result.extend_from_slice(&blob[offset..offset + take]);
+        offset += BYTES_PER_FIELD;
+    }
+    result
+}
 
-    if remaining == 0 {
-        return;
+/// Decanonicalize all blobs, concatenate, and brotli-decompress the payload.
+pub(crate) fn decode_blob_payload(blobs: &[Vec<u8>]) -> Vec<u8> {
+    let mut all_raw = Vec::with_capacity(blobs.len() * MAX_RAW_BYTES_PER_BLOB);
+    for blob in blobs {
+        all_raw.extend_from_slice(&decanonicalize(blob));
     }
 
-    for blob in blobs.iter() {
-        if remaining == 0 {
-            break;
-        }
-        if current_offset >= MAX_RAW_BYTES_PER_BLOB {
-            current_offset -= MAX_RAW_BYTES_PER_BLOB;
-            continue;
-        }
-
-        let mut field_idx = current_offset / BYTES_PER_FIELD;
-        let mut byte_in_field = current_offset % BYTES_PER_FIELD;
-
-        while field_idx < FIELDS_PER_BLOB && remaining > 0 {
-            let available = BYTES_PER_FIELD - byte_in_field;
-            let take = remaining.min(available);
-            let start = field_idx * FIELD_SIZE + 1 + byte_in_field;
-
-            buf[buf_pos..buf_pos + take].copy_from_slice(&blob[start..start + take]);
-
-            buf_pos += take;
-            remaining -= take;
-            field_idx += 1;
-            byte_in_field = 0;
-        }
-        current_offset = 0;
-    }
-    assert_eq!(remaining, 0, "Unexpected end of DA blob payload");
+    let mut decompressed = Vec::new();
+    let mut decompressor = brotli::Decompressor::new(all_raw.as_slice(), 4096);
+    decompressor.read_to_end(&mut decompressed).expect("brotli decompression failed");
+    decompressed
 }
 
 /// Validates that all fields within the provided DA blobs adhere to the canonical KZG padding rules.
@@ -93,42 +80,43 @@ pub fn validate_canonical_padding(blobs: &[Vec<u8>]) {
     }
 }
 
-/// Parses the logical DA header to locate the transaction data offset and length for a specific block.
+/// Parses the DA header from a decompressed flat buffer to locate tx_data for a specific block.
 ///
-/// # Arguments
-/// * `blobs` - The contiguous logical representation of KZG blob data.
-/// * `block_number` - The target L2 block number to extract data for.
-///
-/// # Returns
-/// A tuple containing `(tx_data_offset, tx_data_len)`.
-///
-/// # Panics
-/// Panics if the requested `block_number` falls outside the DA batch range.
-pub fn parse_da_header(blobs: &[Vec<u8>], block_number: u64) -> (usize, usize) {
-    let mut fixed_header = [0u8; FIXED_HEADER_SIZE];
-    read_logical(blobs, 0, &mut fixed_header);
+/// Returns `(tx_data_offset, tx_data_len)` within the decompressed buffer.
+pub(crate) fn parse_da_header(data: &[u8], block_number: u64) -> (usize, usize) {
+    assert!(data.len() >= FIXED_HEADER_SIZE, "blob payload too short for header");
 
-    let from_block = u64::from_be_bytes(fixed_header[0..8].try_into().unwrap());
-    let to_block = u64::from_be_bytes(fixed_header[8..16].try_into().unwrap());
-    let num_blocks = u32::from_be_bytes(fixed_header[16..20].try_into().unwrap()) as usize;
+    let from_block = u64::from_be_bytes(data[0..8].try_into().unwrap());
+    let to_block = u64::from_be_bytes(data[8..16].try_into().unwrap());
+    let num_blocks = u32::from_be_bytes(data[16..20].try_into().unwrap()) as usize;
 
-    assert!(block_number >= from_block && block_number <= to_block, "Block number out of DA range");
+    assert!(
+        block_number >= from_block && block_number <= to_block,
+        "Block number out of DA range"
+    );
+
+    let full_header_size = FIXED_HEADER_SIZE + num_blocks * 4;
+    assert!(
+        data.len() >= full_header_size,
+        "blob payload too short for {num_blocks} block boundaries"
+    );
 
     let target_idx = (block_number - from_block) as usize;
-    let mut tx_data_offset = FIXED_HEADER_SIZE + (num_blocks * 4);
-    let mut boundary_offset = FIXED_HEADER_SIZE;
-    let mut buf4 = [0u8; 4];
+    let mut tx_data_offset = full_header_size;
+    let boundary_base = FIXED_HEADER_SIZE;
 
-    // Traverse lengths to compute the absolute offset for the target block
-    for _ in 0..target_idx {
-        read_logical(blobs, boundary_offset, &mut buf4);
-        tx_data_offset += u32::from_be_bytes(buf4) as usize;
-        boundary_offset += 4;
+    for i in 0..target_idx {
+        let off = boundary_base + i * 4;
+        tx_data_offset += u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
     }
 
-    // Extract length for the target block
-    read_logical(blobs, boundary_offset, &mut buf4);
-    let tx_data_len = u32::from_be_bytes(buf4) as usize;
+    let len_off = boundary_base + target_idx * 4;
+    let tx_data_len = u32::from_be_bytes(data[len_off..len_off + 4].try_into().unwrap()) as usize;
+
+    assert!(
+        tx_data_offset + tx_data_len <= data.len(),
+        "tx_data exceeds blob payload"
+    );
 
     (tx_data_offset, tx_data_len)
 }
@@ -235,8 +223,15 @@ pub fn main() {
     // 2. Fast validation of canonical padding for all fields (Zero-Alloc)
     validate_canonical_padding(&blob_input.blobs);
 
-    // 3. DA Header Parsing (Stack-based)
-    let (tx_data_offset, tx_data_len) = parse_da_header(&blob_input.blobs, block_number);
+    // 3. Decanonicalize + brotli decompress + hash blob tx_data
+    //    Compute blob_tx_data_hash early and drop decompressed BEFORE STF execution
+    //    to avoid holding ~MBs of decompressed payload during the memory-heavy executor step.
+    let blob_tx_data_hash = {
+        let decompressed = decode_blob_payload(&blob_input.blobs);
+        let (tx_data_offset, tx_data_len) = parse_da_header(&decompressed, block_number);
+        B256::from_slice(&Sha256::digest(&decompressed[tx_data_offset..tx_data_offset + tx_data_len]))
+        // decompressed dropped here
+    };
 
     // 4. Execution & Zero-Alloc Streaming Hashing of transactions
     let tx_data_hash_exec = {
@@ -276,36 +271,7 @@ pub fn main() {
         versioned_hashes.push(vh);
     }
 
-    // 6. Zero-Alloc Streaming Hashing of blob-extracted tx_data
-    let mut hasher = Sha256::new();
-    let mut remaining = tx_data_len;
-    let mut current_offset = tx_data_offset;
-
-    for blob in blob_input.blobs.iter() {
-        if remaining == 0 {
-            break;
-        }
-        if current_offset >= MAX_RAW_BYTES_PER_BLOB {
-            current_offset -= MAX_RAW_BYTES_PER_BLOB;
-            continue;
-        }
-        let mut field_idx = current_offset / BYTES_PER_FIELD;
-        let mut byte_in_field = current_offset % BYTES_PER_FIELD;
-
-        while field_idx < FIELDS_PER_BLOB && remaining > 0 {
-            let take = remaining.min(BYTES_PER_FIELD - byte_in_field);
-            let start = field_idx * FIELD_SIZE + 1 + byte_in_field;
-            hasher.update(&blob[start..start + take]);
-            remaining -= take;
-            field_idx += 1;
-            byte_in_field = 0;
-        }
-        current_offset = 0;
-    }
-
-    assert_eq!(remaining, 0, "DA payload is truncated");
-    let blob_tx_data_hash = B256::from_slice(&hasher.finalize());
-
+    // 6. Compare blob tx_data hash with execution tx_data hash
     assert_eq!(tx_data_hash_exec, blob_tx_data_hash, "Data integrity mismatch: EXEC vs DA");
 
     // 7. Commit results for L1 Verifier
@@ -345,37 +311,6 @@ mod tests {
         blob
     }
 
-    /// Helper function to construct a mock blob with an embedded logical DA header.
-    fn create_mock_header_blob(
-        from_block: u64,
-        to_block: u64,
-        block_lengths: &[u32],
-    ) -> Vec<Vec<u8>> {
-        let mut header_data = Vec::new();
-        header_data.extend_from_slice(&from_block.to_be_bytes());
-        header_data.extend_from_slice(&to_block.to_be_bytes());
-
-        let num_blocks = block_lengths.len() as u32;
-        header_data.extend_from_slice(&num_blocks.to_be_bytes());
-
-        for &length in block_lengths {
-            header_data.extend_from_slice(&length.to_be_bytes());
-        }
-
-        let mut blob = vec![0u8; FIELDS_PER_BLOB * FIELD_SIZE];
-        let mut current_byte = 0;
-
-        // Scatter logical bytes into KZG fields, skipping the 0x00 padding byte
-        for &byte in &header_data {
-            let field_idx = current_byte / BYTES_PER_FIELD;
-            let byte_in_field = current_byte % BYTES_PER_FIELD;
-            blob[field_idx * FIELD_SIZE + 1 + byte_in_field] = byte;
-            current_byte += 1;
-        }
-
-        vec![blob]
-    }
-
     // --- validate_canonical_padding Tests ---
 
     #[test]
@@ -396,125 +331,77 @@ mod tests {
         validate_canonical_padding(&blobs);
     }
 
-    // --- parse_da_header Tests ---
+    // --- decanonicalize Tests ---
 
     #[test]
-    fn test_parse_da_header_single_block() {
-        let blobs = create_mock_header_blob(100, 100, &[500]);
-        let (offset, length) = parse_da_header(&blobs, 100);
-
-        // Fixed header (20) + 1 length field (4) = 24
-        assert_eq!(offset, 24, "Incorrect offset for single block header");
-        assert_eq!(length, 500, "Incorrect length for single block header");
+    fn test_decanonicalize_extracts_raw_bytes() {
+        let mut blob = vec![0u8; FIELDS_PER_BLOB * FIELD_SIZE];
+        for f in 0..FIELDS_PER_BLOB {
+            blob[f * FIELD_SIZE] = 0x00;
+            for b in 0..BYTES_PER_FIELD {
+                blob[f * FIELD_SIZE + 1 + b] = ((f * BYTES_PER_FIELD + b) % 256) as u8;
+            }
+        }
+        let raw = decanonicalize(&blob);
+        assert_eq!(raw.len(), MAX_RAW_BYTES_PER_BLOB);
+        assert_eq!(raw[0], 0);
+        assert_eq!(raw[1], 1);
+        assert_eq!(raw[31], 31);
     }
 
     #[test]
-    fn test_parse_da_header_multi_block_middle_target() {
-        // Block 100: len 500 | Block 101: len 600 | Block 102: len 700
-        let blobs = create_mock_header_blob(100, 102, &[500, 600, 700]);
-        let (offset, length) = parse_da_header(&blobs, 101);
+    #[should_panic(expected = "non-canonical field element")]
+    fn test_decanonicalize_rejects_non_canonical() {
+        let mut blob = vec![0u8; FIELDS_PER_BLOB * FIELD_SIZE];
+        blob[0] = 0x01;
+        decanonicalize(&blob);
+    }
 
-        // Fixed header (20) + 3 length fields (12) + len of block 100 (500) = 532
-        assert_eq!(offset, 532, "Incorrect offset calculation for multi-block header");
-        assert_eq!(length, 600, "Failed to read the correct tx_data_len for the target block");
+    // --- decode_blob_payload + parse_da_header Tests ---
+
+    fn build_test_blobs(from_block: u64, tx_data_per_block: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        rsp_blob_builder::build_blobs_from_blocks(from_block, tx_data_per_block)
+            .expect("build_blobs_from_blocks failed")
+            .into_iter()
+            .map(|b| b.blob)
+            .collect()
     }
 
     #[test]
-    fn test_parse_da_header_multi_block_last_target() {
-        let blobs = create_mock_header_blob(100, 102, &[500, 600, 700]);
-        let (offset, length) = parse_da_header(&blobs, 102);
+    fn test_decode_and_parse_single_block() {
+        let tx_data = vec![0xAA; 500];
+        let blobs = build_test_blobs(100, &[tx_data.clone()]);
+        let decompressed = decode_blob_payload(&blobs);
+        let (offset, len) = parse_da_header(&decompressed, 100);
+        assert_eq!(len, 500);
+        assert_eq!(&decompressed[offset..offset + len], tx_data.as_slice());
+    }
 
-        // Fixed header (20) + 3 length fields (12) + len of block 100 (500) + len of block 101 (600) = 1132
-        assert_eq!(offset, 1132, "Incorrect offset for the last block in DA batch");
-        assert_eq!(length, 700, "Incorrect length for the last block in DA batch");
+    #[test]
+    fn test_decode_and_parse_multi_block() {
+        let blocks = vec![vec![0x01; 100], vec![0x02; 200], vec![0x03; 300]];
+        let blobs = build_test_blobs(10, &blocks);
+        let decompressed = decode_blob_payload(&blobs);
+
+        let (off1, len1) = parse_da_header(&decompressed, 10);
+        assert_eq!(len1, 100);
+        assert_eq!(&decompressed[off1..off1 + len1], vec![0x01; 100].as_slice());
+
+        let (off2, len2) = parse_da_header(&decompressed, 11);
+        assert_eq!(len2, 200);
+        assert_eq!(&decompressed[off2..off2 + len2], vec![0x02; 200].as_slice());
+
+        let (off3, len3) = parse_da_header(&decompressed, 12);
+        assert_eq!(len3, 300);
+        assert_eq!(&decompressed[off3..off3 + len3], vec![0x03; 300].as_slice());
     }
 
     #[test]
     #[should_panic(expected = "Block number out of DA range")]
-    fn test_parse_da_header_out_of_bounds_low() {
-        let blobs = create_mock_header_blob(100, 102, &[500, 600, 700]);
-        parse_da_header(&blobs, 99);
-    }
-
-    #[test]
-    #[should_panic(expected = "Block number out of DA range")]
-    fn test_parse_da_header_out_of_bounds_high() {
-        let blobs = create_mock_header_blob(100, 102, &[500, 600, 700]);
-        parse_da_header(&blobs, 103);
-    }
-
-    // --- read_logical Tests ---
-
-    #[test]
-    fn test_read_logical_single_field_extraction() {
-        let blobs = vec![generate_mock_blob(1)];
-        let mut buf = [0u8; 10];
-        read_logical(&blobs, 0, &mut buf);
-        let expected: Vec<u8> = (1..=10).collect();
-        assert_eq!(
-            buf,
-            expected.as_slice(),
-            "Failed to read sequential bytes within a single field"
-        );
-    }
-
-    #[test]
-    fn test_read_logical_cross_field_boundary() {
-        let blobs = vec![generate_mock_blob(1)];
-        let mut buf = [0u8; 40];
-        read_logical(&blobs, 0, &mut buf);
-        assert_eq!(buf[30], 31, "Incorrect read at the end of the first field");
-        assert_eq!(buf[31], 32, "Failed to skip padding when crossing field boundary");
-    }
-
-    #[test]
-    fn test_read_logical_cross_blob_boundary() {
-        let blob1 = generate_mock_blob(1);
-        let blob2 = generate_mock_blob(100);
-        let blobs = vec![blob1, blob2];
-        let mut buf = [0u8; 10];
-        let offset = MAX_RAW_BYTES_PER_BLOB - 5;
-        read_logical(&blobs, offset, &mut buf);
-        assert_eq!(buf.len(), 10, "Buffer was not fully populated");
-        assert_ne!(buf[4], buf[5], "Expected discontinuity in values crossing the blob boundary");
-    }
-
-    #[test]
-    fn test_read_logical_absolute_offset() {
-        let blob1 = generate_mock_blob(0);
-        let blob2 = generate_mock_blob(50);
-        let blobs = vec![blob1, blob2];
-        let mut buf = [0u8; 5];
-        read_logical(&blobs, MAX_RAW_BYTES_PER_BLOB, &mut buf);
-        assert_eq!(
-            buf,
-            [50, 51, 52, 53, 54],
-            "Failed to read correctly from an absolute offset targeting a subsequent blob"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "Unexpected end of DA blob payload")]
-    fn test_read_logical_out_of_bounds() {
-        let blobs = vec![generate_mock_blob(1)];
-        let mut buf = vec![0u8; MAX_RAW_BYTES_PER_BLOB + 1];
-        read_logical(&blobs, 0, &mut buf);
-    }
-
-    #[test]
-    fn test_read_logical_zero_size_buffer() {
-        let blobs = vec![generate_mock_blob(1)];
-        let mut buf = [0u8; 0];
-        read_logical(&blobs, 0, &mut buf);
-        assert_eq!(buf.len(), 0);
-    }
-
-    #[test]
-    fn test_read_logical_exact_boundary() {
-        let blobs = vec![generate_mock_blob(1)];
-        let mut buf = vec![0u8; MAX_RAW_BYTES_PER_BLOB];
-        read_logical(&blobs, 0, &mut buf);
-        assert_eq!(buf.len(), MAX_RAW_BYTES_PER_BLOB);
+    fn test_parse_da_header_out_of_range() {
+        let blobs = build_test_blobs(100, &[vec![0xAA; 50]]);
+        let decompressed = decode_blob_payload(&blobs);
+        parse_da_header(&decompressed, 99);
     }
 
     // --- Sha256Stream (BufMut) Tests ---

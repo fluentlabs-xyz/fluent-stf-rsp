@@ -36,9 +36,9 @@ alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types.workspace = true
 alloy-sol-types.workspace = true
-alloy-signer = { version = "1.8.1", optional = true }
-alloy-signer-local = { version = "1.8.1", optional = true }
-alloy-network = { workspace = true, optional = true }
+alloy-signer = "1.8.1"
+alloy-signer-local = "1.8.1"
+alloy-network.workspace = true
 revm-primitives.workspace = true
 
 # http (for beacon API)
@@ -70,8 +70,4 @@ nitro-validator-common = { path = "../aws-nitro-validator/common", package = "co
 default=["testnet"]
 devnet  = ["rsp-primitives/devnet"]
 testnet = ["rsp-primitives/testnet"]
-prove-key-attestation = [
-    "dep:alloy-signer",
-    "dep:alloy-signer-local",
-    "dep:alloy-network",
-]
+prove-key-attestation = []

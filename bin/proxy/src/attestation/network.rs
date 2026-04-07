@@ -89,6 +89,7 @@ fn save_request_id(id: B256) -> Result<()> {
     std::fs::write(&path, hex::encode(id)).map_err(|e| eyre!("Failed to write request_id: {e}"))
 }
 
+#[cfg(feature = "prove-key-attestation")]
 fn load_request_id() -> Option<B256> {
     let path = request_id_path();
     let hex_str = std::fs::read_to_string(&path).ok()?;
@@ -220,6 +221,7 @@ async fn submit_proof_to_l1(
 }
 
 /// Resilient prove_and_submit: checks for existing request_id before submitting new.
+#[cfg(feature = "prove-key-attestation")]
 pub(crate) async fn prove_and_submit(
     config: &AttestationConfig,
     public_key: &[u8],

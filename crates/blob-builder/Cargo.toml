@@ -14,3 +14,4 @@ c-kzg = "2.1.7"
 alloy-primitives.workspace = true
 sha2 = "0.10"
 eyre.workspace = true
+brotli = "8.0.2"
