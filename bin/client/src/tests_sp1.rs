@@ -12,9 +12,8 @@ use rsp_host_executor::EthHostExecutor;
 use rsp_primitives::genesis::Genesis;
 use sha2::{Digest, Sha256};
 
-use crate::sp1::{
-    decode_blob_payload, parse_da_header, validate_canonical_padding, BlobVerificationInput,
-};
+use crate::blob;
+use crate::sp1::BlobVerificationInput;
 
 const START_BLOCK: u64 = 22610746;
 const RPC_URL: &str = "http://207.154.218.23:8545";
@@ -52,10 +51,9 @@ async fn test_sp1_full_flow() {
         proofs: built_blobs.iter().map(|b| b.proof.clone()).collect(),
     };
 
-    validate_canonical_padding(&blob_input.blobs);
-
-    let decompressed = decode_blob_payload(&blob_input.blobs);
-    let (tx_data_offset, tx_data_len) = parse_da_header(&decompressed, block_number);
+    let (header, decompressed) = blob::decode_blob_payload(&blob_input.blobs).unwrap();
+    let blob_tx_data =
+        blob::extract_block_tx_data(&header, &decompressed, block_number).unwrap();
 
     let tx_data_hash_exec = B256::from_slice(&Sha256::digest(&tx_data));
 
@@ -85,7 +83,6 @@ async fn test_sp1_full_flow() {
         versioned_hashes.push(vh);
     }
 
-    let blob_tx_data = &decompressed[tx_data_offset..tx_data_offset + tx_data_len];
     let blob_tx_data_hash = B256::from_slice(&Sha256::digest(blob_tx_data));
 
     assert_eq!(tx_data_hash_exec, blob_tx_data_hash, "EXEC vs DA tx_data mismatch");

@@ -4,7 +4,7 @@ use vsock::{VsockListener, VsockStream};
 
 use crate::nitro::MAX_FRAME_SIZE;
 
-/// A helper structure to handle length-prefixed JSON communication over VSOCK.
+/// A helper structure to handle length-prefixed bincode communication over VSOCK.
 /// Uses the global MAX_FRAME_SIZE constant to enforce security limits.
 pub struct VsockChannel {
     stream: VsockStream,

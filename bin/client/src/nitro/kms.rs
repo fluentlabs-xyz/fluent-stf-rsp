@@ -59,7 +59,7 @@ impl KmsClient {
 
         let mut tls = self.connect()?;
         tls.write_all(http_req.as_bytes())?;
-        tls.flush().ok();
+        tls.flush()?;
 
         let mut resp_str = String::new();
         tls.read_to_string(&mut resp_str)?;
@@ -138,7 +138,7 @@ impl KmsClient {
         let signing_key = self.get_signature_key(&date_stamp);
         let signature = hex::encode(self.hmac_sha256(&signing_key, string_to_sign.as_bytes()));
 
-        let mut req = format!("POST / HTTP/1.1\r\n");
+        let mut req = String::from("POST / HTTP/1.1\r\n");
         req.push_str(&format!("Content-Length: {}\r\n", body.len()));
         for (k, v) in &headers {
             req.push_str(&format!("{}: {}\r\n", k, v));
