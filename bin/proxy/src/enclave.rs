@@ -32,6 +32,10 @@ use crate::types::NitroConfig;
 static ATTESTATION_CONFIG: tokio::sync::OnceCell<crate::attestation::AttestationConfig> =
     tokio::sync::OnceCell::const_new();
 
+/// Guard to ensure only one `prove_and_submit` runs at a time.
+#[cfg(feature = "prove-key-attestation")]
+static ATTESTATION_PROVING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Try to initialize attestation config. Called from background task in main().
 /// If `on_new_attestation` already triggered init, this is a no-op.
 pub(crate) async fn init_attestation_config() {
@@ -199,24 +203,41 @@ async fn handshake_with_enclave(config: &NitroConfig) -> eyre::Result<(Vec<u8>, 
 async fn on_new_attestation(public_key: &[u8], attestation: &[u8]) -> eyre::Result<()> {
     #[cfg(feature = "prove-key-attestation")]
     {
-        info!("New key generated — initializing attestation config if needed...");
-        // If the background task in main() already initialized this, `get_or_try_init`
-        // returns immediately. Otherwise we initialize here (first caller wins).
-        match ATTESTATION_CONFIG
-            .get_or_try_init(crate::attestation::AttestationConfig::from_env)
-            .await
-        {
-            Ok(config) => {
-                crate::attestation::prove_and_submit(config, public_key, attestation).await?;
-                return Ok(());
+        let pk = public_key.to_vec();
+        let att = attestation.to_vec();
+
+        tokio::spawn(async move {
+            // Serialize attestation proving — only one at a time.
+            // If a previous proof is in-flight, we wait for it to finish
+            // before starting a new one for the latest key.
+            let _guard = ATTESTATION_PROVING.lock().await;
+
+            // Delete stale request_id AFTER acquiring the lock, so we don't
+            // race with an in-flight prove_and_submit saving its request_id.
+            crate::attestation::delete_stale_request_id();
+
+            info!("New key generated — initializing attestation config if needed...");
+            match ATTESTATION_CONFIG
+                .get_or_try_init(crate::attestation::AttestationConfig::from_env)
+                .await
+            {
+                Ok(config) => {
+                    if let Err(e) =
+                        crate::attestation::prove_and_submit(config, &pk, &att).await
+                    {
+                        tracing::error!("Background attestation proving failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        public_key = %hex::encode(&pk),
+                        "Attestation config not available: {e} — skipping proof"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    public_key = %hex::encode(public_key),
-                    "Attestation config not available: {e} — skipping proof"
-                );
-            }
-        }
+        });
+
+        return Ok(());
     }
 
     #[cfg(not(feature = "prove-key-attestation"))]

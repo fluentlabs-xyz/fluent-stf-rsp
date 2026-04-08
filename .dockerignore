@@ -6,3 +6,6 @@
 !/crates
 !Cargo.lock
 !Cargo.toml
+
+# Exclude build artifacts from context
+**/target

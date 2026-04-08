@@ -56,17 +56,14 @@ build-nitro-validator-docker:
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────
 
-## Build .eif for AWS Nitro
+## Build .eif for AWS Nitro (reproducible)
 build-enclave:
-	cargo build \
-		--target $(TARGET) \
-		--release \
-		--manifest-path $(CLIENT_DIR)/Cargo.toml \
-		--features nitro \
-		--no-default-features
-	tar -C $(CLIENT_DIR)/target/$(TARGET)/release/ -cf - $(BINARY) \
-		| docker import --change "ENTRYPOINT [\"/$(BINARY)\"]" - $(BINARY)
-	nitro-cli build-enclave --docker-uri $(BINARY) --output-file $(EIF)
+	SOURCE_DATE_EPOCH=$$(git log -1 --pretty=%ct) \
+	docker buildx build \
+		-f Dockerfile.enclave \
+		--output type=docker,rewrite-timestamp=true \
+		-t $(BINARY):latest .
+	nitro-cli build-enclave --docker-uri $(BINARY):latest --output-file $(EIF)
 
 ## Run enclave locally (debug)
 run-enclave:

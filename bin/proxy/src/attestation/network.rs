@@ -101,6 +101,13 @@ fn delete_request_id() {
     let _ = std::fs::remove_file(request_id_path());
 }
 
+/// Delete any saved request_id. Called when a new enclave key is generated
+/// to prevent `prove_and_submit` from picking up a stale proof for a
+/// previous key.
+pub(crate) fn delete_stale_request_id() {
+    delete_request_id();
+}
+
 /// Submit new attestation proof request to SP1. Returns request_id.
 /// Saves request_id to disk for resilience.
 async fn submit_attestation_proof(config: &AttestationConfig, attestation: &[u8]) -> Result<B256> {
@@ -211,6 +218,13 @@ async fn submit_proof_to_l1(
 
     let receipt =
         pending.get_receipt().await.map_err(|e| eyre!("verifyAttestation tx failed: {e}"))?;
+
+    if !receipt.status() {
+        return Err(eyre!(
+            "verifyAttestation tx reverted (tx_hash: {})",
+            receipt.transaction_hash
+        ));
+    }
 
     info!(
         tx_hash = %receipt.transaction_hash,
