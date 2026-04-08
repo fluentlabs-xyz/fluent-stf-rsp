@@ -23,11 +23,10 @@ An HTTP proxy that sits between callers and execution backends, managing the Mul
 |---|---|---|
 | `POST /retry-attestation` | SP1 zkVM (network) + L1 | Retry attestation proof or check status |
 
-### Mock endpoints (testing, no SP1 network calls)
+### Mock endpoints (testing, local SP1 execution)
 | Endpoint | Backend | Output |
 |---|---|---|
-| `POST /mock/sp1/request` | — | Random `request_id` (testing) |
-| `POST /mock/sp1/status` | — | Hardcoded proof (testing) |
+| `POST /mock/sp1/request` | SP1 zkVM (local CPU) | `{ success, error? }` — real execution, no proof |
 
 ---
 
@@ -355,7 +354,9 @@ Without the `prove-key-attestation` feature, returns `"status": "proving_disable
 
 ### POST /mock/sp1/request
 
-Returns a fake `request_id` without submitting anything to the SP1 network. Takes the same payload as `/challenge/sp1/request`. Does not require `SP1_ELF_PATH`. Useful for integration testing.
+Executes the SP1 zkVM program locally on the CPU without submitting to the prover network. Takes the same payload as `/challenge/sp1/request`. Requires `SP1_ELF_PATH` and L1 context (`L1_RPC_URL`, `L1_CONTRACT_ADDR`, `L1_BEACON_URL`).
+
+The endpoint performs the full pipeline: fetches blobs from L1 + Beacon, builds `ClientInput` from L2 RPC, prepares KZG witnesses, and runs the SP1 guest program via CPU executor. Returns synchronously whether execution succeeded or failed.
 
 **Request**
 ```json
@@ -365,38 +366,22 @@ Returns a fake `request_id` without submitting anything to the SP1 network. Take
 }
 ```
 
-**Response**
+**Response (success)** `200 OK`
 ```json
 {
-  "request_id": "0x…"
+  "success": true
 }
 ```
 
----
-
-### POST /mock/sp1/status
-
-Returns a hardcoded `Sp1ProofResponse` regardless of the `request_id` provided. Does not require `SP1_ELF_PATH`.
-
-**Request**
+**Response (failure)** `200 OK`
 ```json
 {
-  "request_id": "0x…"
+  "success": false,
+  "error": "STF execution failed: ..."
 }
 ```
 
-> The `request_id` is accepted but ignored — the response is always the same hardcoded proof.
-
-**Response**
-```json
-{
-  "vk_hash":       "0x282233864d7d8e6f6c3a096b5dcc088d76367e553118e432197d3eb215a2023d",
-  "public_values": "0x…",
-  "proof_bytes":   "0x…"
-}
-```
-
-> **Mock only.** This proof was generated on Fluent Devnet for block 316. Do not use in production.
+> **Note:** CPU execution can take several minutes depending on block complexity.
 
 ---
 

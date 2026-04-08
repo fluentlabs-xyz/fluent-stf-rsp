@@ -18,9 +18,3 @@ fn main() {
         sp1::main();
     }
 }
-
-#[cfg(all(test, feature = "nitro"))]
-mod tests_nitro;
-
-#[cfg(all(test, feature = "sp1"))]
-mod tests_sp1;

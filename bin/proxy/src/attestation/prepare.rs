@@ -1,11 +1,36 @@
 use std::collections::BTreeMap;
 
-use nitro_validator_common::{CertData, GuestInput};
 use p384::ecdsa::{signature::DigestVerifier, Signature, VerifyingKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha384};
 use x509_parser::prelude::*;
+
+/// Pre-parsed certificate data extracted from X.509 DER on the host.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct CertData {
+    #[serde(with = "serde_bytes")]
+    pub tbs: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub pubkey: Vec<u8>,
+}
+
+/// Everything the guest receives from the host.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct GuestInput {
+    pub root_pubkey: Vec<u8>,
+    pub chain: Vec<CertData>,
+    #[serde(with = "serde_bytes")]
+    pub sig_structure: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub cose_signature: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub pcr0: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub user_data: Vec<u8>,
+}
 
 // ─── CBOR structures (parsed only on the host) ─────────────────────────────
 

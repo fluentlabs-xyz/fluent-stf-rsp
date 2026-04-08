@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "bin/host",
-    "bin/eth-proofs",
-    "bin/continuous",       # ← was missing from members!
     "bin/proxy",
     "crates/executor/client",
     "crates/executor/host",

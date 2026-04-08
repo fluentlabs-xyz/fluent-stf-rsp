@@ -16,10 +16,9 @@
 //!
 //! - `POST /retry-attestation`          — retry attestation proof (SP1 + L1)
 //!
-//! ## Mock endpoints (testing, no SP1 network calls)
+//! ## Mock endpoints (testing, local SP1 execution)
 //!
-//! - `POST /mock/sp1/request`         — returns a fake request_id
-//! - `POST /mock/sp1/status`          — returns a hardcoded proof
+//! - `POST /mock/sp1/request`         — execute SP1 locally (CPU), return success/failure
 //!
 //! All endpoints are protected by `x-api-key` header.
 
@@ -47,7 +46,7 @@ use axum::{
     Router, body::Bytes, extract::{DefaultBodyLimit, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Json}, routing::post
 };
 use revm_primitives::{
-    hex::{self, FromHex},
+    hex,
     FixedBytes, B256,
 };
 use rsp_primitives::genesis::Genesis;
@@ -93,6 +92,8 @@ struct AppState {
     api_key: String,
     nitro: Option<NitroState>,
     sp1: Option<LazySp1>,
+    /// Raw SP1 ELF bytes — used by mock endpoint for local CPU execution.
+    sp1_elf_bytes: Option<Arc<Vec<u8>>>,
     /// RPC / chain context — used by challenge endpoints to build ClientInput.
     chain: ChainContext,
     /// L1 context — used by `/sign-batch-root` for blob fetching.
@@ -164,6 +165,13 @@ struct Sp1StatusRequest {
 #[derive(Serialize)]
 struct Sp1RequestResponse {
     request_id: B256,
+}
+
+#[derive(Serialize)]
+struct MockSp1Response {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -539,51 +547,69 @@ async fn retry_attestation(
 // Mock endpoints
 // ===========================================================================
 
-/// `POST /mock/sp1/request` — returns a fake request_id, no SP1 network call.
-/// Unified API: Takes exactly the same input as the real `/challenge/sp1/request`
+/// `POST /mock/sp1/request` — local SP1 zkVM execution, no network call.
+/// Same input as `/challenge/sp1/request`, returns `{ success, error? }`.
 async fn mock_sp1_request(
-    State(_): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<ChallengeSp1Request>,
-) -> Result<Json<Sp1RequestResponse>, HandlerError> {
+) -> Result<Json<MockSp1Response>, HandlerError> {
+    let elf_bytes = state
+        .sp1_elf_bytes
+        .as_ref()
+        .ok_or_else(|| internal("SP1 ELF not configured (set SP1_ELF_PATH)"))?
+        .clone();
+
+    let l1 = require_l1(&state)?;
+
     tracing::info!(
         block_number = ?req.block_number,
         block_hash = ?req.block_hash,
         batch_index = req.batch_index,
-        "Submitting MOCK async SP1 request"
+        "Starting mock SP1 local execution"
     );
 
-    let request_id = B256::from_hex("0x137").unwrap_or_default();
-    Ok(Json(Sp1RequestResponse { request_id }))
-}
+    let raw_blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
+    let client_input = build_client_input(req.block_number, req.block_hash, &state.chain).await?;
+    let block_number = client_input.current_block.header.number;
+    let blob_input = prepare_blob_input(&raw_blobs)?;
 
-/// `POST /mock/sp1/status` — returns hardcoded proof, no SP1 network call.
-/// Unified API: Exact same return schema as `/challenge/sp1/status`
-async fn mock_sp1_status(
-    State(_): State<AppState>,
-    Json(req): Json<Sp1StatusRequest>,
-) -> Result<Json<Sp1ProofResponse>, HandlerError> {
-    tracing::info!(request_id = %hex::encode(req.request_id), "MOCK SP1 proof ready");
+    let mut stdin = SP1Stdin::new();
+    let serialized_input = bincode::serialize(&client_input)
+        .map_err(|e| internal(format!("Failed to serialize client input: {e}")))?;
+    stdin.write_slice(&serialized_input);
+    let serialized_blobs = bincode::serialize(&blob_input)
+        .map_err(|e| internal(format!("Failed to serialize blob input: {e}")))?;
+    stdin.write_slice(&serialized_blobs);
 
-    let vk_hash = FixedBytes::from([
-        0x28, 0x22, 0x33, 0x86, 0x4d, 0x7d, 0x8e, 0x6f, 0x6c, 0x3a, 0x09, 0x6b, 0x5d, 0xcc, 0x08,
-        0x8d, 0x76, 0x36, 0x7e, 0x55, 0x31, 0x18, 0xe4, 0x32, 0x19, 0x7d, 0x3e, 0xb2, 0x15, 0xa2,
-        0x02, 0x3d,
-    ]);
+    info!(block_number, "Executing SP1 program locally (CPU)");
 
-    let public_values: Vec<u8> = vec![
-        32, 0, 0, 0, 0, 0, 0, 0, 74, 83, 97, 75, 68, 56, 138, 56, 236, 130, 218, 34, 205, 168, 105,
-        43, 161, 13, 12, 56, 226, 32, 46, 197, 47, 217, 77, 19, 70, 83, 63, 54, 32, 0, 0, 0, 0, 0,
-        0, 0, 7, 210, 222, 132, 100, 19, 117, 204, 37, 113, 3, 39, 171, 250, 78, 215, 168, 106,
-        124, 254, 181, 96, 97, 157, 8, 202, 72, 66, 224, 205, 211, 213, 32, 0, 0, 0, 0, 0, 0, 0,
-        197, 210, 70, 1, 134, 247, 35, 60, 146, 126, 125, 178, 220, 199, 3, 192, 229, 0, 182, 83,
-        202, 130, 39, 59, 123, 250, 216, 4, 93, 133, 164, 112, 32, 0, 0, 0, 0, 0, 0, 0, 197, 210,
-        70, 1, 134, 247, 35, 60, 146, 126, 125, 178, 220, 199, 3, 192, 229, 0, 182, 83, 202, 130,
-        39, 59, 123, 250, 216, 4, 93, 133, 164, 112,
-    ];
+    let handle = tokio::runtime::Handle::current();
+    let result = tokio::task::spawn_blocking(move || {
+        handle.block_on(async {
+            let client = sp1_sdk::ProverClient::builder().cpu().build().await;
+            client.execute(Elf::from(elf_bytes.as_ref().clone()), stdin).await
+        })
+    })
+    .await
+    .map_err(|e| internal(format!("SP1 execution task panicked: {e}")))?;
 
-    let proof_bytes: Vec<u8> = vec![3, 0, 0, 0];
-
-    Ok(Json(Sp1ProofResponse { vk_hash, public_values, proof_bytes }))
+    match result {
+        Ok((_public_values, report)) => {
+            info!(
+                block_number,
+                total_instructions = report.total_instruction_count(),
+                "Mock SP1 execution succeeded"
+            );
+            Ok(Json(MockSp1Response { success: true, error: None }))
+        }
+        Err(e) => {
+            tracing::warn!(block_number, err = %e, "Mock SP1 execution failed");
+            Ok(Json(MockSp1Response {
+                success: false,
+                error: Some(format!("{e}")),
+            }))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +624,7 @@ async fn main() -> eyre::Result<()> {
     let eif_path = std::env::args().skip_while(|a| a != "--eif_path").nth(1);
 
     // ── SP1 prover (lazy init) ────────────────────────────────────────────
+    let mut sp1_elf_bytes: Option<Arc<Vec<u8>>> = None;
     let sp1: Option<LazySp1> = match std::env::var("SP1_ELF_PATH") {
         Err(_) => {
             info!("SP1_ELF_PATH not set — /challenge/sp1 endpoints disabled");
@@ -606,6 +633,8 @@ async fn main() -> eyre::Result<()> {
         Ok(elf_path) => {
             let elf_bytes = std::fs::read(&elf_path)
                 .map_err(|e| eyre::eyre!("Failed to read SP1 ELF {elf_path}: {e}"))?;
+
+            sp1_elf_bytes = Some(Arc::new(elf_bytes.clone()));
 
             let cell = Arc::new(OnceCell::new());
             let cell_clone = cell.clone();
@@ -702,7 +731,7 @@ async fn main() -> eyre::Result<()> {
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
-    let state = AppState { api_key, nitro, sp1, chain, l1 };
+    let state = AppState { api_key, nitro, sp1, sp1_elf_bytes, chain, l1 };
 
     let app = Router::new()
         // ── Signing (TEE, input from caller) ─────────────
@@ -715,7 +744,6 @@ async fn main() -> eyre::Result<()> {
         .route("/retry-attestation", post(retry_attestation))
         // ── Mock (testing) ───────────────────────────────
         .route("/mock/sp1/request", post(mock_sp1_request))
-        .route("/mock/sp1/status", post(mock_sp1_status))
         .layer(DefaultBodyLimit::max(usize::MAX))
         // ── Auth ─────────────────────────────────────────
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))

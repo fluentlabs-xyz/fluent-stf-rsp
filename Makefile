@@ -12,7 +12,7 @@ EIF          := rsp-client-enclave.eif
 ELF          := rsp-client.elf
 
 # ─── Nitro validator (attestation proving) ────────────────────────────────────
-NITRO_VALIDATOR_DIR := bin/aws-nitro-validator/program
+NITRO_VALIDATOR_DIR := bin/aws-nitro-validator
 NITRO_VALIDATOR_ELF := nitro-validator.elf
 
 # ─── Config (override via env or CLI) ─────────────────────────────────────────
@@ -37,6 +37,7 @@ build-client-docker:
 	cd $(CLIENT_DIR) && cargo prove build \
 		--elf-name $(ELF) \
 		--output-directory ../../ \
+		--workspace-directory ../../ \
 		--docker
 
 # ─── Nitro validator ELF (attestation proving) ───────────────────────────────
@@ -45,13 +46,14 @@ build-client-docker:
 build-nitro-validator:
 	cd $(NITRO_VALIDATOR_DIR) && cargo prove build \
 		--elf-name $(NITRO_VALIDATOR_ELF) \
-		--output-directory ../../../
+		--output-directory ../../
 
 ## Reproducible nitro-validator ELF build via Docker (prod)
 build-nitro-validator-docker:
 	cd $(NITRO_VALIDATOR_DIR) && cargo prove build \
 		--elf-name $(NITRO_VALIDATOR_ELF) \
-		--output-directory ../../../ \
+		--output-directory ../../ \
+		--workspace-directory ../../ \
 		--docker
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────

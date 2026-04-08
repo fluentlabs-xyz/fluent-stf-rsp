@@ -17,7 +17,6 @@ sha3 = "0.10"
 x509-parser = { version = "0.16", default-features = false }
 sp1-zkvm = "6.0.2"
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
-common = {path = "../common"}
 
 [dev-dependencies]
 hex = "0.4"

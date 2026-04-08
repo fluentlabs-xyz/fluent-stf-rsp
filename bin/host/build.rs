@@ -22,7 +22,7 @@ fn main() {
         }
 
         println!("cargo:warning=Building SP1 aws-nitro-validator");
-        // build_program("../aws-nitro-validator/program");
+        // build_program("../aws-nitro-validator");
     }
 }
 
