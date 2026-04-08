@@ -19,21 +19,13 @@ sp1 = [
     "dep:brotli"
 ]
 nitro = [
-    "dep:aws-sdk-kms",
-    "dep:aws-config",
     "dep:vsock",
     "dep:hex",
     "dep:serde_json",
     "dep:serde_bytes",
     "dep:aws-nitro-enclaves-nsm-api",
     "dep:anyhow",
-    "dep:nix",
-    "dep:signature",
-    "dep:rand_core",
-    "dep:p256",
-    "dep:aes-gcm",
     "dep:base64",
-    "dep:rand",
     "dep:chrono",
     "dep:hmac",
     "dep:rustls",
@@ -49,7 +41,6 @@ bincode = "1.3.3"
 serde = { version = "1.0", features = ["derive"] }
 hkdf = "0.12.4"
 k256 = "0.13.4"
-ciborium = "0.2.2"
 
 # Statically turns off logging
 log = { version = "0.4", features = ["max_level_off", "release_max_level_off"] }
@@ -68,19 +59,11 @@ serde_json = { version = "1.0", optional = true }
 serde_bytes = { version = "0.11", optional = true }
 aws-nitro-enclaves-nsm-api = { version = "0.4.0", optional = true }
 anyhow = { version = "1.0", optional = true }
-nix = { version = "0.26.4", optional = true }
-signature = { version = "2.2.0", optional = true }
-rand_core = { version = "0.6.4", optional = true }
-rand = { version = "0.8", optional = true }
-p256 = { version = "0.13", features = ["ecdsa"], optional = true }
-aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 hmac = { version = "0.12", optional = true }
 rustls = { version = "0.21.12", default-features = false, features = ["tls12"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
-aws-sdk-kms = { version = "1", optional = true }
-aws-config = { version = "1", optional = true }
 alloy-eips = "1.7.3"
 alloy-primitives = "1.5.7"
 sha3 = "0.10.8"
@@ -90,7 +73,6 @@ bytes = "1.5"
 brotli = {version = "8.0.2", optional = true }
 
 [profile.release]
-codegen-units = 1
 strip = true
 
 [patch.crates-io]
@@ -100,7 +82,6 @@ sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-
 k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-6.0.0" }
 p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p256-13.2-sp1-6.0.0" }
 secp256k1 = { git = "https://github.com/sp1-patches/rust-secp256k1", tag = "patch-0.30.0-sp1-6.0.0" }
-tiny-keccak = { git = "https://github.com/sp1-patches/tiny-keccak", tag = "patch-2.0.2-sp1-6.0.0" }
 
 # revm patches
 revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }

@@ -9,9 +9,6 @@ use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, Ethereu
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-pub const LINEA_GENESIS_JSON: &str = include_str!("../../../bin/host/genesis/59144.json");
-pub const OP_SEPOLIA_GENESIS_JSON: &str = include_str!("../../../bin/host/genesis/11155420.json");
-
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
@@ -104,7 +101,7 @@ impl TryFrom<&Genesis> for ChainSpec {
                 Ok(sepolia)
             }
             Genesis::OpMainnet => Err(ChainSpecError::InvalidConversion),
-            Genesis::Linea => Ok(ChainSpec::from_genesis(genesis_from_json(LINEA_GENESIS_JSON)?)),
+            Genesis::Linea => unreachable!(),
             Genesis::Fluent => Ok(fluent_genesis::chainspec()),
             Genesis::Custom(config) => {
                 let chain_spec = ChainSpec::from_genesis(alloy_genesis::Genesis {
@@ -276,21 +273,5 @@ pub(crate) mod serde_bincode_compat {
         {
             ChainConfig::deserialize(deserializer).map(Into::into)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use crate::genesis::{genesis_from_json, Genesis, OP_SEPOLIA_GENESIS_JSON};
-
-    #[test]
-    fn test_custom_genesis_bincode_roundtrip() {
-        let alloy_genesis = genesis_from_json(OP_SEPOLIA_GENESIS_JSON).unwrap();
-        let genesis = Genesis::Custom(alloy_genesis.config);
-        let buf = bincode::serialize(&genesis).unwrap();
-        let deserialized = bincode::deserialize::<Genesis>(&buf).unwrap();
-
-        assert_eq!(genesis, deserialized);
     }
 }

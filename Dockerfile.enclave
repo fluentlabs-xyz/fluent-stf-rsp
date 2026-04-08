@@ -11,7 +11,7 @@
 
 FROM rust:1.94.1-alpine3.21 AS builder
 
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev ca-certificates
 
 WORKDIR /build
 

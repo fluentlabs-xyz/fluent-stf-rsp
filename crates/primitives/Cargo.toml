@@ -40,6 +40,6 @@ hex = "0.4"
 alloy-genesis.workspace = true
 reth-chainspec.workspace = true
 reth-primitives.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 directories = "6.0.0"
 flate2 = "1.1.9"
