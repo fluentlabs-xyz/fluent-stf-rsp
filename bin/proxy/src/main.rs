@@ -44,13 +44,7 @@ type LazySp1 = Arc<OnceCell<Sp1State>>;
 
 use alloy_primitives::Address;
 use axum::{
-    body::Bytes,
-    extract::{Request, State},
-    http::{HeaderMap, StatusCode},
-    middleware::{self, Next},
-    response::{IntoResponse, Json},
-    routing::post,
-    Router,
+    Router, body::Bytes, extract::{DefaultBodyLimit, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Json}, routing::post
 };
 use revm_primitives::{
     hex::{self, FromHex},
@@ -103,7 +97,6 @@ struct AppState {
     chain: ChainContext,
     /// L1 context — used by `/sign-batch-root` for blob fetching.
     l1: Option<L1State>,
-    attestation: Option<Arc<attestation::AttestationConfig>>,
 }
 
 #[derive(Clone)]
@@ -520,7 +513,7 @@ async fn challenge_sp1_status(
 /// Without request_id: submit new SP1 proof, return request_id immediately.
 /// With request_id: check SP1 proof status, submit to L1 if ready.
 async fn retry_attestation(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Json(req): Json<RetryAttestationRequest>,
 ) -> Result<Json<RetryAttestationResponse>, HandlerError> {
     let (public_key, attestation) = enclave::load_attestation_artifacts()
@@ -528,10 +521,8 @@ async fn retry_attestation(
 
     let pk_hex = hex::encode(&public_key);
 
-    let config = state
-        .attestation
-        .as_ref()
-        .ok_or_else(|| internal("Attestation proving not configured"))?;
+    let config = enclave::attestation_config()
+        .ok_or_else(|| internal("Attestation prover not configured or still initializing"))?;
 
     let result = attestation::retry(config, &public_key, &attestation, req.request_id)
         .await
@@ -606,19 +597,6 @@ async fn main() -> eyre::Result<()> {
     // ── Nitro enclave ────────────────────────────────────────────────────
     let eif_path = std::env::args().skip_while(|a| a != "--eif_path").nth(1);
 
-    let nitro = match eif_path {
-        None => {
-            info!("--eif_path not provided — signing endpoints disabled");
-            None
-        }
-        Some(ref path) => {
-            let nitro_config = NitroConfig::default();
-            ensure_initialized(&nitro_config).await?;
-            info!("Nitro enclave initialised from {path}");
-            Some(NitroState { config: nitro_config })
-        }
-    };
-
     // ── SP1 prover (lazy init) ────────────────────────────────────────────
     let sp1: Option<LazySp1> = match std::env::var("SP1_ELF_PATH") {
         Err(_) => {
@@ -646,10 +624,6 @@ async fn main() -> eyre::Result<()> {
             Some(cell)
         }
     };
-
-    if nitro.is_none() && sp1.is_none() {
-        eyre::bail!("No backends configured: provide --eif_path and/or SP1_ELF_PATH");
-    }
 
     // ── Chain context (for challenge endpoints) ──────────────────────────
     let genesis = Genesis::Fluent;
@@ -702,36 +676,33 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
-    // ── Attestation config ──────────────────────────────────────────────
-    let attestation_config = {
-        match attestation::AttestationConfig::from_env().await {
-            Ok(cfg) => {
-                info!("Attestation proving enabled");
-                Some(Arc::new(cfg))
-            }
-            Err(e) => {
-                info!("Attestation proving disabled: {e}");
-                None
-            }
+    // ── Attestation config (lazy init) ────────────────────────────────
+    // Kicked off in background; `on_new_attestation` and `/retry-attestation`
+    // will also try to init via the same `OnceCell` if they run first.
+    tokio::spawn(enclave::init_attestation_config());
+    info!("Attestation config initialization started in background");
+
+    let nitro = match eif_path {
+        None => {
+            info!("--eif_path not provided — signing endpoints disabled");
+            None
+        }
+        Some(ref path) => {
+            let nitro_config = NitroConfig::default();
+            ensure_initialized(&nitro_config).await?;
+            info!("Nitro enclave initialised from {path}");
+            Some(NitroState { config: nitro_config })
         }
     };
 
-    #[cfg(feature = "prove-key-attestation")]
-    if let Some(ref att_cfg) = attestation_config {
-        enclave::set_attestation_config(att_cfg.clone());
+    if nitro.is_none() && sp1.is_none() {
+        eyre::bail!("No backends configured: provide --eif_path and/or SP1_ELF_PATH");
     }
 
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
-    let state = AppState {
-        api_key,
-        nitro,
-        sp1,
-        chain,
-        l1,
-        attestation: attestation_config,
-    };
+    let state = AppState { api_key, nitro, sp1, chain, l1 };
 
     let app = Router::new()
         // ── Signing (TEE, input from caller) ─────────────
@@ -745,6 +716,7 @@ async fn main() -> eyre::Result<()> {
         // ── Mock (testing) ───────────────────────────────
         .route("/mock/sp1/request", post(mock_sp1_request))
         .route("/mock/sp1/status", post(mock_sp1_status))
+        .layer(DefaultBodyLimit::max(usize::MAX))
         // ── Auth ─────────────────────────────────────────
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .with_state(state);

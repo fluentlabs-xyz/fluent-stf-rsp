@@ -49,7 +49,8 @@ pub(crate) async fn execute_local(attestation: &[u8]) {
 
     let client = sp1_sdk::ProverClient::builder().cpu().build().await;
     match client.execute(sp1_sdk::Elf::from(elf_bytes), stdin).await {
-        Ok((_public_values, report)) => {
+        Ok((public_values, report)) => {
+            let hex_encoded = revm_primitives::hex::encode(public_values.as_slice());
             info!(
                 total_instructions = report.total_instruction_count(),
                 committed_hex = %hex_encoded,

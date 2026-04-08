@@ -13822,11 +13822,11 @@ dependencies = [
 ]
 
 [[patch.unused]]
-name = "rwasm"
-version = "0.4.3"
-source = "git+https://www.github.com/fluentlabs-xyz/rwasm?tag=v0.4.3#9a6c979595d2170edad39510634e12781ff30af8"
-
-[[patch.unused]]
 name = "substrate-bn"
 version = "0.6.0"
 source = "git+https://github.com/sp1-patches/bn?tag=patch-0.6.0-sp1-5.0.0#e0d67f219b2ad6a1887e3275b7ba09ada4b1afb6"
+
+[[patch.unused]]
+name = "rwasm"
+version = "0.4.3"
+source = "git+https://www.github.com/fluentlabs-xyz/rwasm?tag=v0.4.3#9a6c979595d2170edad39510634e12781ff30af8"
