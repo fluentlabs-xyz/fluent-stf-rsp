@@ -11,7 +11,10 @@ use aws_nitro_enclaves_nsm_api::{
     driver,
 };
 
-use k256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
+use k256::ecdsa::{
+    signature::Signer, signature::Verifier, signature::DigestSigner, RecoveryId, Signature,
+    SigningKey, VerifyingKey,
+};
 use k256::SecretKey;
 
 use alloy_eips::eip2718::Encodable2718;
@@ -249,13 +252,20 @@ fn sign_batch(
     signing_key: &SigningKey,
 ) -> SubmitBatchResponse {
     let encoded = abi_encode_batch(&batch_root, &versioned_hashes);
-    let signing_payload = Sha256::digest(&encoded);
-    let signature: Signature = signing_key.sign(&signing_payload);
+    let digest = Sha256::new_with_prefix(&encoded);
+    let (signature, recid): (Signature, RecoveryId) = signing_key
+        .sign_digest_recoverable(digest)
+        .expect("signing cannot fail with a valid key");
+
+    // Ethereum-compatible 65-byte signature: r (32) || s (32) || v (1)
+    let mut sig_bytes = [0u8; 65];
+    sig_bytes[..64].copy_from_slice(&signature.to_bytes());
+    sig_bytes[64] = recid.to_byte() + 27; // EIP-155: v = recid + 27
 
     SubmitBatchResponse {
         batch_root: batch_root.to_vec(),
         versioned_hashes,
-        signature: signature.to_vec(),
+        signature: sig_bytes.to_vec(),
     }
 }
 
