@@ -222,17 +222,34 @@ fn verify_blobs(blobs: &[Vec<u8>], tx_data_hashes: &[B256]) -> anyhow::Result<Ve
 // ---------------------------------------------------------------------------
 
 /// Signs batch_root and versioned_hashes into a SubmitBatchResponse.
+/// ABI-encode `(bytes32, bytes32[])` matching Solidity's `abi.encode(batchRoot, blobHashes)`.
+fn abi_encode_batch(batch_root: &[u8; 32], hashes: &[B256]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32 + 32 + 32 + hashes.len() * 32);
+    // bytes32 batchRoot
+    buf.extend_from_slice(batch_root);
+    // offset to dynamic array data (0x40 = 64)
+    let mut offset = [0u8; 32];
+    offset[31] = 64;
+    buf.extend_from_slice(&offset);
+    // array length
+    let mut len = [0u8; 32];
+    let len_bytes = (hashes.len() as u64).to_be_bytes();
+    len[24..32].copy_from_slice(&len_bytes);
+    buf.extend_from_slice(&len);
+    // array elements
+    for h in hashes {
+        buf.extend_from_slice(h.as_slice());
+    }
+    buf
+}
+
 fn sign_batch(
     batch_root: [u8; 32],
     versioned_hashes: Vec<B256>,
     signing_key: &SigningKey,
 ) -> SubmitBatchResponse {
-    let mut hasher = Sha256::new();
-    hasher.update(batch_root);
-    for vh in &versioned_hashes {
-        hasher.update(vh.as_slice());
-    }
-    let signing_payload = hasher.finalize();
+    let encoded = abi_encode_batch(&batch_root, &versioned_hashes);
+    let signing_payload = Sha256::digest(&encoded);
     let signature: Signature = signing_key.sign(&signing_payload);
 
     SubmitBatchResponse {
