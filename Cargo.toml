@@ -11,6 +11,8 @@ members = [
     "crates/storage/witness-db","crates/nitro-types",
     "crates/e2e-tests",
     "crates/blob-builder",
+    "crates/witness-orchestrator",
+    "bin/witness-orchestrator",
 ]
 exclude = []
 resolver = "2"
@@ -63,6 +65,29 @@ zstd = "0.13"
 vsock = "0.5.2"
 derive_more = { version = "2.0.1", features = ["full"] }
 
+# --- gRPC ---
+tonic = "0.14.5"
+tonic-prost = "0.14.5"
+prost = "0.14.3"
+
+# --- async extensions ---
+tokio-stream = "0.1.18"
+tokio-util = "0.7"
+async-channel = "2"
+
+# --- persistence ---
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# --- compression ---
+brotlic = "0.8"
+
+# --- signing ---
+alloy-signer = "1.8.1"
+alloy-signer-local = { version = "1.8.1", default-features = false }
+
+# --- misc ---
+bytes = "1.10.1"
+
 # --- workspace crates ---
 rsp-blob-builder = { path = "./crates/blob-builder" }
 rsp-rpc-db = { path = "./crates/storage/rpc-db" }
@@ -73,6 +98,7 @@ rsp-mpt = { path = "./crates/mpt" }
 rsp-primitives = { path = "./crates/primitives" }
 rsp-provider = { path = "./crates/provider" }
 nitro-types = { path = "./crates/nitro-types" }
+witness-orchestrator = { path = "./crates/witness-orchestrator" }
 
 # --- sp1 ---
 sp1-build = "6.0.2"
