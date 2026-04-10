@@ -1,6 +1,6 @@
 [package]
-name = "rsp-primitives"
-description = ""
+name = "fluent-stf-primitives"
+description = "Fluent STF primitives (genesis, account proofs)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,16 +8,12 @@ homepage.workspace = true
 repository.workspace = true
 
 [features]
-default=["testnet"]
-devnet=[]
-testnet=[]
+default = ["mainnet"]
+mainnet = []
+testnet = []
+devnet  = []
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-serde_with.workspace = true
-
 # reth
 reth-primitives-traits.workspace = true
 reth-chainspec.workspace = true
@@ -25,13 +21,8 @@ reth-trie.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
-alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-rpc-types.workspace = true
-alloy-serde.workspace = true
-
-[dev-dependencies]
-bincode.workspace = true
 
 [build-dependencies]
 alloy-primitives = { workspace = true, features = [] }

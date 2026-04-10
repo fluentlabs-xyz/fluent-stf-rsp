@@ -142,7 +142,7 @@ pub fn main() {
     };
 
     let executor = EthClientExecutor::eth(
-        Arc::new((&executor_input.genesis).try_into().expect("Invalid genesis")),
+        Arc::new(fluent_stf_primitives::fluent_chainspec()),
         executor_input.custom_beneficiary,
     );
     let (header, events_hash) = executor.execute(executor_input).expect("STF execution failed");

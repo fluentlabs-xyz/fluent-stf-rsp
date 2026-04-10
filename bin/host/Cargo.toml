@@ -4,9 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["sp1"]
+default = ["sp1", "mainnet"]
 sp1 = ["rsp-host-executor/sp1", "dep:sp1-build", "rsp-client-executor/sp1", "dep:sp1-sdk", "dep:sp1-core-executor", "dep:strum"]
 nitro = ["rsp-host-executor/nitro", "rsp-client-executor/nitro", "dep:cargo_metadata"]
+mainnet = ["rsp-host-executor/mainnet"]
+testnet = ["rsp-host-executor/testnet"]
+devnet  = ["rsp-host-executor/devnet"]
 
 [dependencies]
 tokio.workspace = true
@@ -46,7 +49,7 @@ strum = { workspace = true, optional = true }
 [dev-dependencies]
 alloy-network.workspace = true
 rsp-client-executor.workspace = true
-rsp-primitives.workspace = true
+fluent-stf-primitives = { workspace = true, default-features = false }
 serde_json.workspace = true
 serde.workspace = true
 

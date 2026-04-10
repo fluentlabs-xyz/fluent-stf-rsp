@@ -50,8 +50,8 @@ use axum::{
     routing::post,
     Router,
 };
+use fluent_stf_primitives::fluent_chainspec;
 use revm_primitives::{hex, FixedBytes, B256};
-use rsp_primitives::genesis::Genesis;
 use url::Url;
 
 use serde::{Deserialize, Serialize};
@@ -126,7 +126,6 @@ struct Sp1State {
 #[derive(Clone)]
 struct ChainContext {
     block_execution_strategy_factory: FluentEvmConfig,
-    genesis: Genesis,
     chain_spec: Arc<ChainSpec>,
 }
 
@@ -344,7 +343,7 @@ async fn build_client_input(
         HostExecutor::new(chain.block_execution_strategy_factory.clone(), chain.chain_spec.clone());
 
     host_executor
-        .execute(block_number, &provider, chain.genesis.clone(), None, false)
+        .execute(block_number, &provider, None, false)
         .await
         .map_err(|e| internal(format!("Block execution failed: {e}")))
 }
@@ -658,15 +657,10 @@ async fn main() -> eyre::Result<()> {
     };
 
     // ── Chain context (for challenge endpoints) ──────────────────────────
-    let genesis = Genesis::Fluent;
-    let block_execution_strategy_factory =
-        create_eth_block_execution_strategy_factory(&genesis, None);
-    let chain_spec: Arc<ChainSpec> = Arc::new(
-        ChainSpec::try_from(&genesis)
-            .map_err(|e| eyre::eyre!("Failed to build chain spec: {e}"))?,
-    );
+    let block_execution_strategy_factory = create_eth_block_execution_strategy_factory(None);
+    let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
 
-    let chain = ChainContext { block_execution_strategy_factory, genesis, chain_spec };
+    let chain = ChainContext { block_execution_strategy_factory, chain_spec };
 
     // ── L1 context (for batch metadata lookup in challenge endpoints) ────
     let l1 = match (env::var("L1_RPC_URL"), env::var("L1_CONTRACT_ADDR")) {

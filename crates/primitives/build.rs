@@ -19,8 +19,8 @@ pub const FLUENT_MAINNET_CHAIN_ID: u64 = 25363;
 // ─── network definitions ────────────────────────────────────────────────────
 
 struct NetworkDef {
-    /// Cargo feature name (e.g. "testnet"). None = default (no feature guard).
-    feature: Option<&'static str>,
+    /// Cargo feature name (e.g. "mainnet", "testnet", "devnet").
+    feature: &'static str,
     /// GitHub release tag
     tag: &'static str,
     /// Optional channel for the download URL
@@ -35,22 +35,22 @@ struct NetworkDef {
 fn network_defs() -> Vec<NetworkDef> {
     vec![
         NetworkDef {
-            feature: None, // default = mainnet
-            tag: "v0.6.0", // FLUENT_MAINNET_GENESIS_TAG
+            feature: "mainnet",
+            tag: "v1.0.0", // FLUENT_MAINNET_GENESIS_TAG
             channel: Some("mainnet"),
-            osaka_fork: ForkCondition::Block(0),
+            osaka_fork: ForkCondition::Timestamp(0),
             chain_id: FLUENT_MAINNET_CHAIN_ID,
         },
         NetworkDef {
-            feature: Some("testnet"),
+            feature: "testnet",
             tag: "v0.3.4-dev", // FLUENT_TESTNET_GENESIS_TAG
             channel: None,
             osaka_fork: ForkCondition::Block(21_300_000),
             chain_id: FLUENT_TESTNET_CHAIN_ID,
         },
         NetworkDef {
-            feature: Some("devnet"),
-            tag: "v0.6.0", // FLUENT_DEVNET_GENESIS_TAG
+            feature: "devnet",
+            tag: "v0.5.7", // FLUENT_DEVNET_GENESIS_TAG
             channel: None,
             osaka_fork: ForkCondition::Block(0),
             chain_id: FLUENT_DEVNET_CHAIN_ID,
@@ -318,8 +318,6 @@ fn emit_network(
     genesis_obj: &Genesis,
     hardforks: &ChainHardforks,
     net_def: &NetworkDef,
-    all_features: &[&str],
-    prior_features: &[&str],
 ) {
     let header = make_genesis_header(genesis_obj, hardforks);
     let alloc_map: BTreeMap<String, Value> = json["alloc"]
@@ -328,32 +326,9 @@ fn emit_network(
         .unwrap_or_default();
     let count = alloc_map.len();
 
-    let cfg_attr = match net_def.feature {
-        Some(feat) => {
-            if prior_features.is_empty() {
-                format!("#[cfg(feature = \"{feat}\")]")
-            } else {
-                format!(
-                    "#[cfg(all(feature = \"{feat}\", not(any({}))))]",
-                    prior_features
-                        .iter()
-                        .map(|f| format!("feature = \"{f}\""))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-        }
-        None => format!(
-            "#[cfg(not(any({})))]",
-            all_features
-                .iter()
-                .map(|f| format!("feature = \"{f}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
-
-    let mod_name = net_def.feature.unwrap_or("default");
+    let feat = net_def.feature;
+    let cfg_attr = format!("#[cfg(feature = \"{feat}\")]");
+    let mod_name = feat;
 
     out.push_str(&format!("{cfg_attr}\n"));
     out.push_str(&format!("mod {mod_name}_genesis {{\n    use super::*;\n\n"));
@@ -555,11 +530,10 @@ fn main() {
     fs::create_dir_all(&bin_dir).unwrap();
 
     let networks = network_defs();
-    let all_features: Vec<&str> = networks.iter().filter_map(|n| n.feature).collect();
 
     let mut out = String::new();
     out.push_str("// @generated — do not edit manually\n");
-    out.push_str("#![allow(clippy::all)]\n");
+    out.push_str("#![allow(clippy::all, unused_imports)]\n");
 
     out.push_str("use alloy_primitives::{address, b256, U256, Bytes, Address, Bloom};\n");
     out.push_str("use alloy_genesis::{Genesis, GenesisAccount, ChainConfig};\n");
@@ -600,31 +574,61 @@ pub fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardfor
 "#,
     );
 
-    let mut prior_features = Vec::new();
+    let mut referenced_bins: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for net in &networks {
-        let label = net.feature.unwrap_or("default");
+        let label = net.feature;
         println!("cargo:warning=Processing genesis for network: {label}");
 
         let (json, gz_path) = download_and_cache_genesis(net.tag, net.channel);
         println!("cargo:rerun-if-changed={}", gz_path.display());
 
         let genesis_obj = build_genesis_object(&json, net.chain_id);
-        let hardforks = fluent_default_chain_hardforks(net.osaka_fork.clone());
+        let hardforks = fluent_default_chain_hardforks(net.osaka_fork);
 
-        emit_network(
-            &mut out,
-            &bin_dir,
-            &json,
-            &genesis_obj,
-            &hardforks,
-            net,
-            &all_features,
-            &prior_features,
-        );
+        // Mainnet integrity assertion: freeze the expected genesis identity so any
+        // accidental change to the downloaded blob is caught at build time.
+        if net.feature == "mainnet" {
+            let header = make_genesis_header(&genesis_obj, &hardforks);
+            assert_eq!(
+                header.timestamp, 0x69b8194c,
+                "fluent mainnet genesis timestamp mismatch (expected 0x69b8194c, got {:#x})",
+                header.timestamp
+            );
+            let sealed = reth_primitives::SealedHeader::seal_slow(header);
+            let expected_hash = alloy_primitives::b256!(
+                "0x7dd092d6e2aba158839db2a264d8049e7518540b342929822aac85f550c18465"
+            );
+            assert_eq!(
+                sealed.hash(),
+                expected_hash,
+                "fluent mainnet genesis hash mismatch (expected {expected_hash}, got {})",
+                sealed.hash()
+            );
+        }
 
-        if let Some(f) = net.feature {
-            prior_features.push(f);
+        // Track which code_*.bin files this run references so we can purge stale ones.
+        if let Some(alloc_obj) = json["alloc"].as_object() {
+            for (addr, account) in alloc_obj {
+                if let Some(code_hex) = account["code"].as_str() {
+                    let bytes = Bytes::from_str(code_hex).unwrap_or_default();
+                    if !bytes.is_empty() {
+                        referenced_bins.insert(format!("code_{}.bin", canonical_addr(addr)));
+                    }
+                }
+            }
+        }
+
+        emit_network(&mut out, &bin_dir, &json, &genesis_obj, &hardforks, net);
+    }
+
+    // Orphan-blob cleanup: drop any .bin under fluent_genesis_bin/ no longer referenced.
+    if let Ok(entries) = fs::read_dir(&bin_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".bin") && !referenced_bins.contains(&name) {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 

@@ -11,6 +11,9 @@
 
 FROM rust:1.94.1-alpine3.21 AS builder
 
+# Network feature: mainnet | testnet | devnet (must match fluent-stf-primitives features)
+ARG NETWORK=mainnet
+
 RUN apk add --no-cache musl-dev ca-certificates
 
 WORKDIR /build
@@ -31,8 +34,8 @@ RUN cargo build \
     --release \
     --target x86_64-unknown-linux-musl \
     --manifest-path bin/client/Cargo.toml \
-    --features nitro \
-    --no-default-features
+    --no-default-features \
+    --features "nitro ${NETWORK}"
 
 FROM scratch
 COPY --from=builder /build/bin/client/target/x86_64-unknown-linux-musl/release/rsp-client /rsp-client

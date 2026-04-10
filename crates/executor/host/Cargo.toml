@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [features]
-default = ["sp1", "testnet"]
+default = ["sp1", "mainnet"]
 sp1 = ["dep:sp1-sdk"]
 alerting = ["dep:reqwest"]
 execution-witness = [
@@ -26,8 +26,9 @@ nitro = [
     "rsp-client-executor/nitro",
     "tokio/process",
 ]
-testnet = ["rsp-primitives/testnet"]
-devnet = ["rsp-primitives/devnet"]
+mainnet = ["fluent-stf-primitives/mainnet"]
+testnet = ["fluent-stf-primitives/testnet"]
+devnet  = ["fluent-stf-primitives/devnet"]
 
 [dependencies]
 tokio = { workspace = true, features = ["time", "rt"] }
@@ -49,7 +50,7 @@ nitro-types = { workspace = true, optional = true }
 rsp-rpc-db.workspace = true
 rsp-client-executor = {workspace = true, features =["wasmtime"]}
 rsp-mpt.workspace = true
-rsp-primitives = { workspace = true }
+fluent-stf-primitives = { workspace = true, default-features = false }
 
 # sp1
 sp1-sdk = { workspace = true, optional = true }

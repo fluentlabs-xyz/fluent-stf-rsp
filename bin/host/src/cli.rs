@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use alloy_chains::Chain;
 use alloy_primitives::Address;
 use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
 use clap::Parser;
+use fluent_stf_primitives::FLUENT_CHAIN_ID;
 use rsp_host_executor::Config;
 use url::Url;
 
@@ -77,23 +77,21 @@ impl HostArgs {
             }
         };
 
-        let genesis = chain_id.try_into()?;
+        if chain_id != FLUENT_CHAIN_ID {
+            eyre::bail!(
+                "unsupported chain id {chain_id}: this build of rsp targets Fluent chain id {FLUENT_CHAIN_ID}"
+            );
+        }
 
-        let chain = Chain::from_id(chain_id);
-
-        let config = Config {
-            chain,
-            genesis,
-            rpc_url,
-            cache_dir: self.cache_dir.clone(),
-            custom_beneficiary: self.custom_beneficiary,
-            #[cfg(feature = "sp1")]
-            prove_mode: self.prove.then_some(sp1_sdk::SP1ProofMode::Groth16),
-            skip_client_execution: false,
-            opcode_tracking: self.opcode_tracking,
-            #[cfg(feature = "nitro")]
-            nitro_config: None,
-        };
+        let mut config = Config::fluent();
+        config.rpc_url = rpc_url;
+        config.cache_dir = self.cache_dir.clone();
+        config.custom_beneficiary = self.custom_beneficiary;
+        #[cfg(feature = "sp1")]
+        {
+            config.prove_mode = self.prove.then_some(sp1_sdk::SP1ProofMode::Groth16);
+        }
+        config.opcode_tracking = self.opcode_tracking;
 
         Ok(config)
     }

@@ -12,13 +12,13 @@ use alloy_provider::{
 };
 use alloy_rpc_types::BlockNumberOrTag;
 use async_trait::async_trait;
+use fluent_stf_primitives::account_proof::eip1186_proof_to_account_proof;
 use reth_storage_errors::{db::DatabaseError, provider::ProviderError};
 use revm_database::BundleState;
 use revm_database_interface::DatabaseRef;
 use revm_primitives::{Address, Bytes, B256, KECCAK_EMPTY};
 use revm_state::{AccountInfo, Bytecode};
 use rsp_mpt::EthereumState;
-use rsp_primitives::account_proof::eip1186_proof_to_account_proof;
 use tracing::debug;
 
 use crate::{error::RpcDbError, RpcDb};

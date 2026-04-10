@@ -220,7 +220,7 @@ where
         provider,
         host_executor: HostExecutor::new(
             evm_config,
-            Arc::new(C::try_into_chain_spec(&config.genesis)?),
+            Arc::new(fluent_stf_primitives::fluent_chainspec()),
         ),
         client,
         hooks,
@@ -585,7 +585,7 @@ where
     C::Prover: Prover,
 {
     provider: P,
-    host_executor: HostExecutor<C::EvmConfig, C::ChainSpec>,
+    host_executor: HostExecutor<C::EvmConfig, reth_chainspec::ChainSpec>,
     client: Arc<C::Prover>,
     pk: Arc<<C::Prover as Prover>::ProvingKey>,
     vk: Arc<SP1VerifyingKey>,
@@ -596,7 +596,7 @@ where
 #[cfg(not(feature = "sp1"))]
 pub struct FullExecutor<C: ExecutorComponents, P> {
     provider: P,
-    host_executor: HostExecutor<C::EvmConfig, C::ChainSpec>,
+    host_executor: HostExecutor<C::EvmConfig, reth_chainspec::ChainSpec>,
     client: Arc<C::Prover>,
     hooks: C::Hooks,
     config: Config,
@@ -626,7 +626,7 @@ where
             provider,
             host_executor: HostExecutor::new(
                 evm_config,
-                Arc::new(C::try_into_chain_spec(&config.genesis)?),
+                Arc::new(fluent_stf_primitives::fluent_chainspec()),
             ),
             client,
             pk: Arc::new(pk),
@@ -690,7 +690,7 @@ where
 
 async fn load_client_input_inner<C, P>(
     config: &Config,
-    host_executor: &HostExecutor<C::EvmConfig, C::ChainSpec>,
+    host_executor: &HostExecutor<C::EvmConfig, reth_chainspec::ChainSpec>,
     provider: &P,
     block_number: u64,
 ) -> eyre::Result<ClientExecutorInput<C::Primitives>>
@@ -716,13 +716,7 @@ where
         }
         None => {
             let client_input = host_executor
-                .execute(
-                    block_number,
-                    provider,
-                    config.genesis.clone(),
-                    config.custom_beneficiary,
-                    config.opcode_tracking,
-                )
+                .execute(block_number, provider, config.custom_beneficiary, config.opcode_tracking)
                 .await?;
 
             if let Some(ref cache_dir) = config.cache_dir {

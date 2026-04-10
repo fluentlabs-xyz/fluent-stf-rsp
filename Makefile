@@ -5,15 +5,21 @@
 CLIENT_DIR   := bin/client
 PROXY_DIR    := bin/proxy
 
-# ─── Nitro / enclave ──────────────────────────────────────────────────────────
+# ─── Network (mainnet | testnet | devnet) ────────────────────────────────────
+NETWORK      ?= mainnet
+ifeq ($(filter $(NETWORK),mainnet testnet devnet),)
+$(error NETWORK must be one of: mainnet, testnet, devnet (got '$(NETWORK)'))
+endif
+
+# ─── Nitro / enclave (network-tagged artifacts) ───────────────────────────────
 TARGET       := x86_64-unknown-linux-musl
 BINARY       := rsp-client
-EIF          := rsp-client-enclave.eif
-ELF          := rsp-client.elf
+EIF          := rsp-client-enclave-$(NETWORK).eif
+ELF          := rsp-client-$(NETWORK).elf
 
 # ─── Nitro validator (attestation proving) ────────────────────────────────────
 NITRO_VALIDATOR_DIR := bin/aws-nitro-validator
-NITRO_VALIDATOR_ELF := nitro-validator.elf
+NITRO_VALIDATOR_ELF := nitro-validator-$(NETWORK).elf
 
 # ─── Config (override via env or CLI) ─────────────────────────────────────────
 EIF_PATH     ?= $(EIF)
@@ -30,7 +36,9 @@ RUST_LOG 	 ?= info
 build-client:
 	cd $(CLIENT_DIR) && cargo prove build \
 		--elf-name $(ELF) \
-		--output-directory ../../
+		--output-directory ../../ \
+		--no-default-features \
+		--features "sp1 $(NETWORK)"
 
 ## Reproducible ELF build via Docker (prod)
 build-client-docker:
@@ -38,7 +46,9 @@ build-client-docker:
 		--elf-name $(ELF) \
 		--output-directory ../../ \
 		--workspace-directory ../../ \
-		--docker
+		--docker \
+		--no-default-features \
+		--features "sp1 $(NETWORK)"
 
 # ─── Nitro validator ELF (attestation proving) ───────────────────────────────
 
@@ -46,7 +56,9 @@ build-client-docker:
 build-nitro-validator:
 	cd $(NITRO_VALIDATOR_DIR) && cargo prove build \
 		--elf-name $(NITRO_VALIDATOR_ELF) \
-		--output-directory ../../
+		--output-directory ../../ \
+		--no-default-features \
+		--features $(NETWORK)
 
 ## Reproducible nitro-validator ELF build via Docker (prod)
 build-nitro-validator-docker:
@@ -54,18 +66,29 @@ build-nitro-validator-docker:
 		--elf-name $(NITRO_VALIDATOR_ELF) \
 		--output-directory ../../ \
 		--workspace-directory ../../ \
-		--docker
+		--docker \
+		--no-default-features \
+		--features $(NETWORK)
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────
 
-## Build .eif for AWS Nitro (reproducible)
+## Build .eif for AWS Nitro (reproducible). Rewrites EXPECTED_PCR0 in
+## nitro-validator main.rs with the freshly-built enclave's PCR0.
 build-enclave:
 	SOURCE_DATE_EPOCH=$$(git log -1 --pretty=%ct) \
 	docker buildx build \
 		-f Dockerfile.enclave \
+		--build-arg NETWORK=$(NETWORK) \
 		--output type=docker,rewrite-timestamp=true \
-		-t $(BINARY):latest .
-	nitro-cli build-enclave --docker-uri $(BINARY):latest --output-file $(EIF)
+		-t $(BINARY):$(NETWORK) .
+	nitro-cli build-enclave \
+		--docker-uri $(BINARY):$(NETWORK) \
+		--output-file $(EIF) \
+		> $(EIF).pcrs.json
+	python3 scripts/update_expected_pcr0.py \
+		$(EIF).pcrs.json \
+		$(NITRO_VALIDATOR_DIR)/src/main.rs \
+		$(NETWORK)
 
 ## Run enclave locally (debug)
 run-enclave:
@@ -112,7 +135,8 @@ download-genesis:
 
 clean:
 	cargo clean
-	rm -f $(EIF) $(ELF) $(NITRO_VALIDATOR_ELF)
+	rm -f rsp-client-enclave-*.eif rsp-client-enclave-*.eif.pcrs.json \
+	      rsp-client-*.elf nitro-validator-*.elf
 
 help:
 	@echo "Targets:"
@@ -129,9 +153,15 @@ help:
 	@echo "  clean                         Remove build artifacts"
 	@echo ""
 	@echo "Overrides:"
+	@echo "  NETWORK=$(NETWORK)            (mainnet | testnet | devnet)"
 	@echo "  EIF_PATH=$(EIF_PATH)"
 	@echo "  ELF_PATH=$(ELF_PATH)"
 	@echo "  API_KEY=$(API_KEY)"
 	@echo "  LISTEN_ADDR=$(LISTEN_ADDR)"
 	@echo "  SP1_PROVER=$(SP1_PROVER)"
 	@echo "  TAG=$(TAG)"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make build-client                      # mainnet (default)"
+	@echo "  make build-client NETWORK=testnet      # testnet"
+	@echo "  make build-enclave NETWORK=devnet      # devnet"

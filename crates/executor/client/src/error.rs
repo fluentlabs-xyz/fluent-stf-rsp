@@ -27,10 +27,6 @@ pub enum ClientError {
     BlockExecutionError(#[from] BlockExecutionError),
     #[error("Mpt Error: {}", .0)]
     MptError(#[from] MptError),
-    #[error("Failed to read the genesis file: {}", .0)]
-    FailedToReadGenesisFile(#[from] std::io::Error),
-    #[error("Failed to deserialize the genesis file: {}", .0)]
-    FailedToDeserializeGenesisFile(#[from] serde_json::Error),
     #[error("Failed to serialize withdrawal events: {}", .0)]
     FailedToSerializeWithdrawalEvents(#[from] bincode::Error),
 }

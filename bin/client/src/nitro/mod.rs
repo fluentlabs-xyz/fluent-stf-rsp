@@ -343,10 +343,10 @@ fn run_block(
         B256::from_slice(&Sha256::digest(&tx_data))
     };
 
-    let genesis = (&input.genesis)
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid genesis configuration"))?;
-    let executor = EthClientExecutor::eth(Arc::new(genesis), input.custom_beneficiary);
+    let executor = EthClientExecutor::eth(
+        Arc::new(fluent_stf_primitives::fluent_chainspec()),
+        input.custom_beneficiary,
+    );
     let (header, events_hash) =
         executor.execute(input).map_err(|e| anyhow::anyhow!("Block execution failed: {e:?}"))?;
 

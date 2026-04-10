@@ -8,7 +8,6 @@ use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::NodePrimitives;
 use rsp_client_executor::{evm::FluentEvmConfig, BlockValidator, IntoInput, IntoPrimitives};
-use rsp_primitives::genesis::Genesis;
 use serde::de::DeserializeOwned;
 
 use crate::ExecutionHooks;
@@ -22,15 +21,11 @@ pub trait ExecutorComponents {
         + DeserializeOwned
         + IntoPrimitives<Self::Network>
         + IntoInput
-        + BlockValidator<Self::ChainSpec>;
+        + BlockValidator<ChainSpec>;
 
     type EvmConfig: ConfigureEvm<Primitives = Self::Primitives>;
 
-    type ChainSpec;
-
     type Hooks: ExecutionHooks;
-
-    fn try_into_chain_spec(genesis: &Genesis) -> eyre::Result<Self::ChainSpec>;
 }
 
 #[cfg(feature = "sp1")]
@@ -106,12 +101,5 @@ where
 
     type EvmConfig = FluentEvmConfig;
 
-    type ChainSpec = ChainSpec;
-
     type Hooks = H;
-
-    fn try_into_chain_spec(genesis: &Genesis) -> eyre::Result<ChainSpec> {
-        let spec = genesis.try_into()?;
-        Ok(spec)
-    }
 }

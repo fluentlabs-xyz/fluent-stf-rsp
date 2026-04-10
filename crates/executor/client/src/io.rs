@@ -13,7 +13,6 @@ use revm::{
 };
 use revm_primitives::{keccak256, Address, B256, U256};
 use rsp_mpt::EthereumState;
-use rsp_primitives::genesis::Genesis;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -45,9 +44,7 @@ pub struct ClientExecutorInput<P: NodePrimitives> {
     pub parent_state: EthereumState,
     /// Account bytecodes.
     pub bytecodes: Vec<Bytecode>,
-    /// The genesis block, as a json string.
-    pub genesis: Genesis,
-    /// The genesis block, as a json string.
+    /// Optional custom beneficiary address.
     pub custom_beneficiary: Option<Address>,
     /// Whether to track the cycle count of opcodes.
     pub opcode_tracking: bool,

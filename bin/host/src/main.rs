@@ -47,7 +47,7 @@ async fn main() -> eyre::Result<()> {
     let config = args.as_config().await?;
 
     let block_execution_strategy_factory =
-        create_eth_block_execution_strategy_factory(&config.genesis, config.custom_beneficiary);
+        create_eth_block_execution_strategy_factory(config.custom_beneficiary);
 
     let provider = config.rpc_url.as_ref().map(|url| create_provider(url.clone()));
 

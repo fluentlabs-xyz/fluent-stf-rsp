@@ -7,6 +7,12 @@ edition = "2021"
 
 # NOTE: This is a standalone SP1 zkVM program — NOT part of the main workspace.
 
+[features]
+default = ["mainnet"]
+mainnet = []
+testnet = []
+devnet  = []
+
 [dependencies]
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
 serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }

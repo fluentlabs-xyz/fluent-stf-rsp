@@ -11,7 +11,10 @@ version = "0.1.0"
 [workspace]
 
 [features]
-default = ["sp1"]
+default = ["sp1", "mainnet"]
+mainnet = ["fluent-stf-primitives/mainnet"]
+testnet = ["fluent-stf-primitives/testnet"]
+devnet  = ["fluent-stf-primitives/devnet"]
 sp1 = [
     "dep:sp1-zkvm",
     "rsp-client-executor/sp1",
@@ -48,6 +51,7 @@ log = { version = "0.4", features = ["max_level_off", "release_max_level_off"] }
 tracing = { version = "0.1", features = ["max_level_off", "release_max_level_off"] }
 
 rsp-client-executor = { path = "../../crates/executor/client", features = [] }
+fluent-stf-primitives = { path = "../../crates/primitives", default-features = false }
 nitro-types = { path = "../../crates/nitro-types" }
 # sp1
 sp1-zkvm = { version = "6.0.2", optional = true }
@@ -107,7 +111,7 @@ op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "
 [dev-dependencies]
 rsp-host-executor  = { path = "../../crates/executor/host", default-features = false, features = ["testnet", "sp1"] }
 rsp-blob-builder   = { path = "../../crates/blob-builder" }
-rsp-primitives     = { path = "../../crates/primitives", features = ["testnet"] }
+fluent-stf-primitives     = { path = "../../crates/primitives", default-features = false, features = ["testnet"] }
 reth-chainspec     = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v1.11-patched" }
 tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
 alloy-provider     = { version = "1.8.1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }

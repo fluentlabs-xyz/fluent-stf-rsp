@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use alloy_provider::{network::Ethereum, Network, RootProvider};
+use fluent_stf_primitives::fluent_chainspec;
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use revm_primitives::Address;
@@ -10,31 +11,19 @@ use rsp_client_executor::{
     BlockValidator, FromInput, IntoInput, IntoPrimitives,
 };
 use rsp_host_executor::{EthHostExecutor, HostExecutor};
-use rsp_primitives::genesis::Genesis;
 use serde::{de::DeserializeOwned, Serialize};
 use tracing_subscriber::{
     fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
 use url::Url;
 
-#[ignore]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_ethereum() {
-    run_eth_e2e(&Genesis::Mainnet, "RPC_1", 18884864, None).await;
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_fluent() {
-    run_eth_e2e(&Genesis::Fluent, "http://207.154.218.23:8545", 21846700, None).await;
+    run_eth_e2e("http://207.154.218.23:8545", 21846700, None).await;
 }
 
-async fn run_eth_e2e(
-    genesis: &Genesis,
-    env_var_key: &str,
-    block_number: u64,
-    custom_beneficiary: Option<Address>,
-) {
-    let chain_spec: Arc<ChainSpec> = Arc::new(genesis.try_into().unwrap());
+async fn run_eth_e2e(env_var_key: &str, block_number: u64, custom_beneficiary: Option<Address>) {
+    let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
 
     // Setup the host executor.
     let host_executor = EthHostExecutor::eth(chain_spec.clone(), custom_beneficiary);
@@ -47,7 +36,6 @@ async fn run_eth_e2e(
         client_executor,
         env_var_key,
         block_number,
-        genesis,
         custom_beneficiary,
     )
     .await;
@@ -76,8 +64,7 @@ async fn test_overlay_witness_matches_rpc() {
         .parse()
         .expect("invalid TEST_BLOCK_NUMBER");
 
-    let genesis = Genesis::Fluent;
-    let chain_spec: Arc<ChainSpec> = Arc::new((&genesis).try_into().unwrap());
+    let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
 
     let host_executor = EthHostExecutor::eth(chain_spec.clone(), None);
     let client_executor = EthClientExecutor::eth(chain_spec.clone(), None);
@@ -87,7 +74,7 @@ async fn test_overlay_witness_matches_rpc() {
     // ── Reference: RPC-based execution ────────────────────────────
     tracing::info!(block_number, "Executing block via RPC (reference)");
     let reference_input = host_executor
-        .execute(block_number, &provider, genesis.clone(), None, false)
+        .execute(block_number, &provider, None, false)
         .await
         .expect("RPC execute failed");
 
@@ -104,7 +91,7 @@ async fn test_overlay_witness_matches_rpc() {
     // ── Overlay verification ──────────────────────────────────────
     // Re-execute via RPC to get a fresh input for overlay comparison
     let overlay_input = host_executor
-        .execute(block_number, &provider, genesis.clone(), None, false)
+        .execute(block_number, &provider, None, false)
         .await
         .expect("RPC execute (overlay) failed");
 
@@ -136,7 +123,6 @@ async fn run_e2e<C, CS, N>(
     client_executor: ClientExecutor<C, CS>,
     _env_var_key: &str,
     block_number: u64,
-    genesis: &Genesis,
     custom_beneficiary: Option<Address>,
 ) where
     C: ConfigureEvm,
@@ -163,7 +149,7 @@ async fn run_e2e<C, CS, N>(
 
     // Execute the host.
     let client_input = host_executor
-        .execute(block_number, &provider, genesis.clone(), custom_beneficiary, false)
+        .execute(block_number, &provider, custom_beneficiary, false)
         .await
         .expect("failed to execute host");
 

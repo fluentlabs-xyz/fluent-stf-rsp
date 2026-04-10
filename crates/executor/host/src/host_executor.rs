@@ -17,7 +17,6 @@ use revm_primitives::Address;
 use rsp_client_executor::{
     evm::FluentEvmConfig, io::ClientExecutorInput, BlockValidator, IntoInput, IntoPrimitives,
 };
-use rsp_primitives::genesis::Genesis;
 use rsp_rpc_db::RpcDb;
 
 pub type EthHostExecutor = HostExecutor<FluentEvmConfig, ChainSpec>;
@@ -49,7 +48,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
         &self,
         block_number: u64,
         provider: &P,
-        genesis: Genesis,
         custom_beneficiary: Option<Address>,
         opcode_tracking: bool,
     ) -> Result<ClientExecutorInput<C::Primitives>, HostError>
@@ -164,7 +162,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
             ancestor_headers,
             parent_state: state,
             bytecodes: rpc_db.bytecodes(),
-            genesis,
             custom_beneficiary,
             opcode_tracking,
         };
@@ -178,7 +175,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
         &self,
         block_number: u64,
         provider: P,
-        genesis: Genesis,
         custom_beneficiary: Option<Address>,
     ) -> Result<ClientExecutorInput<C::Primitives>, HostError>
     where
@@ -281,7 +277,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
             ancestor_headers,
             parent_state: state,
             bytecodes: exex_db.bytecodes(),
-            genesis,
             custom_beneficiary,
             opcode_tracking: false, // Use cfg feature for guest, not runtime bool
         };
@@ -308,7 +303,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
         current_block: <C::Primitives as reth_primitives_traits::NodePrimitives>::Block,
         parent_state_root: B256,
         provider: P,
-        genesis: Genesis,
         custom_beneficiary: Option<Address>,
     ) -> Result<ClientExecutorInput<C::Primitives>, HostError>
     where
@@ -402,7 +396,6 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
             ancestor_headers,
             parent_state: state,
             bytecodes: exex_db.bytecodes(),
-            genesis,
             custom_beneficiary,
             opcode_tracking: false,
         };

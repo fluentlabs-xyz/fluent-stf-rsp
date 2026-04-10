@@ -27,7 +27,7 @@ vsock.workspace = true
 # workspace crates
 rsp-provider.workspace = true
 rsp-host-executor = { workspace = true, default-features = false, features = ["devnet"] }
-rsp-primitives = { workspace = true, default-features = false, features=["devnet"] }
+fluent-stf-primitives = { workspace = true, default-features = false, features=["devnet"] }
 rsp-client-executor.workspace = true
 rsp-blob-builder.workspace = true
 l1-rollup-client.workspace = true
@@ -66,7 +66,8 @@ serde_bytes = "0.11.19"
 
 
 [features]
-default=["testnet"]
-devnet  = ["rsp-primitives/devnet"]
-testnet = ["rsp-primitives/testnet"]
+default = ["devnet"]
+mainnet = ["fluent-stf-primitives/mainnet", "rsp-host-executor/mainnet"]
+testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet"]
+devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet"]
 prove-key-attestation = []

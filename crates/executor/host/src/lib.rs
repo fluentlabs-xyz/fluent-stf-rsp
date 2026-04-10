@@ -4,9 +4,8 @@ use rsp_client_executor::evm::FluentEvmConfig;
 
 use alloy_chains::Chain;
 pub use error::Error as HostError;
-use reth_chainspec::ChainSpec;
+use fluent_stf_primitives::fluent_chainspec;
 use revm_primitives::Address;
-use rsp_primitives::genesis::Genesis;
 use std::{path::PathBuf, sync::Arc};
 use url::Url;
 
@@ -34,11 +33,9 @@ mod host_executor;
 pub use host_executor::{EthHostExecutor, HostExecutor};
 
 pub fn create_eth_block_execution_strategy_factory(
-    genesis: &Genesis,
     _custom_beneficiary: Option<Address>,
 ) -> FluentEvmConfig {
-    let chain_spec: Arc<ChainSpec> = Arc::new(genesis.try_into().unwrap());
-    FluentEvmConfig::new_with_default_factory(chain_spec)
+    FluentEvmConfig::new_with_default_factory(Arc::new(fluent_chainspec()))
 }
 
 #[cfg(feature = "nitro")]
@@ -58,7 +55,6 @@ impl Default for NitroConfig {
 #[derive(Debug)]
 pub struct Config {
     pub chain: Chain,
-    pub genesis: Genesis,
     pub rpc_url: Option<Url>,
     pub cache_dir: Option<PathBuf>,
     pub custom_beneficiary: Option<Address>,
@@ -71,10 +67,9 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn mainnet() -> Self {
+    pub fn fluent() -> Self {
         Self {
-            chain: Chain::mainnet(),
-            genesis: Genesis::Mainnet,
+            chain: Chain::from_id(fluent_stf_primitives::FLUENT_CHAIN_ID),
             rpc_url: None,
             cache_dir: None,
             custom_beneficiary: None,

@@ -23,7 +23,7 @@ tracing.workspace = true
 async-trait.workspace = true
 
 rsp-mpt.workspace = true
-rsp-primitives.workspace = true
+fluent-stf-primitives = { workspace = true, default-features = false }
 
 # reth
 reth-storage-errors.workspace = true

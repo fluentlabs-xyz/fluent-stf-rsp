@@ -47,9 +47,9 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_network::Ethereum;
 use alloy_primitives::Address;
 use alloy_provider::Provider;
+use fluent_stf_primitives::fluent_chainspec;
 use rsp_client_executor::{evm::FluentEvmConfig, io::ClientExecutorInput};
 use rsp_host_executor::HostExecutor;
-use rsp_primitives::genesis::Genesis;
 use rsp_provider::create_provider;
 
 /// 512 MB — generous headroom for the largest witnesses while preventing
@@ -1363,15 +1363,8 @@ async fn generate_fallback_payload<P: Provider + Clone + 'static>(
     block_number: u64,
     config: &OrchestratorConfig<P>,
 ) -> Option<Vec<u8>> {
-    let genesis = Genesis::Fluent;
-    let chain_spec = match reth_chainspec::ChainSpec::try_from(&genesis) {
-        Ok(cs) => std::sync::Arc::new(cs),
-        Err(e) => {
-            error!(block_number, err = %e, "Failed to build ChainSpec");
-            return None;
-        }
-    };
-    let evm_config = rsp_host_executor::create_eth_block_execution_strategy_factory(&genesis, None);
+    let chain_spec = std::sync::Arc::new(fluent_chainspec());
+    let evm_config = rsp_host_executor::create_eth_block_execution_strategy_factory(None);
     let executor = HostExecutor::new(evm_config, chain_spec);
 
     let mut input: Option<FallbackInput> = None;
@@ -1381,8 +1374,7 @@ async fn generate_fallback_payload<P: Provider + Clone + 'static>(
         match url::Url::parse(url_str) {
             Ok(url) => {
                 let provider = create_provider::<Ethereum>(url);
-                match executor.execute(block_number, &provider, genesis.clone(), None, false).await
-                {
+                match executor.execute(block_number, &provider, None, false).await {
                     Ok(res) => {
                         info!(block_number, "L3 fallback succeeded");
                         input = Some(res);
@@ -1400,10 +1392,7 @@ async fn generate_fallback_payload<P: Provider + Clone + 'static>(
             match url::Url::parse(url_str) {
                 Ok(url) => {
                     let provider = create_provider::<Ethereum>(url);
-                    match executor
-                        .execute(block_number, &provider, genesis.clone(), None, false)
-                        .await
-                    {
+                    match executor.execute(block_number, &provider, None, false).await {
                         Ok(res) => {
                             info!(block_number, "L4 fallback succeeded");
                             input = Some(res);
