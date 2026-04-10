@@ -172,8 +172,8 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
                     }
                 } else if topic == rollback_topic {
                     if log.data.data.len() >= ROLLBACK_EVENT_MESSAGE_HASH_OFFSET + 32 {
-                        let hash: [u8; 32] = log.data.data[ROLLBACK_EVENT_MESSAGE_HASH_OFFSET..
-                            ROLLBACK_EVENT_MESSAGE_HASH_OFFSET + 32]
+                        let hash: [u8; 32] = log.data.data[ROLLBACK_EVENT_MESSAGE_HASH_OFFSET
+                            ..ROLLBACK_EVENT_MESSAGE_HASH_OFFSET + 32]
                             .try_into()
                             .unwrap();
                         Some(B256::from(hash))

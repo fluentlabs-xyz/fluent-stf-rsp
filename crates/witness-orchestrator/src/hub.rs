@@ -56,7 +56,9 @@ async fn run_cold_writer(
 
         let compressed = match tokio::task::spawn_blocking(move || {
             zstd::encode_all(payload.as_slice(), 3)
-        }).await {
+        })
+        .await
+        {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
                 error!(block_number, err = %e, "Cold tier: Zstd compression failed");
@@ -95,12 +97,22 @@ async fn run_cold_writer(
                                         warn!(oldest_block, err = %e, "Cold eviction: remove failed");
                                         break;
                                     }
-                                    index.write().unwrap_or_else(|e| e.into_inner()).remove(&oldest_block);
+                                    index
+                                        .write()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .remove(&oldest_block);
                                     current_dir_bytes.fetch_sub(file_size, Relaxed);
-                                    info!(oldest_block, freed_bytes = file_size, "Cold: evicted oldest");
+                                    info!(
+                                        oldest_block,
+                                        freed_bytes = file_size,
+                                        "Cold: evicted oldest"
+                                    );
                                 }
                                 Err(_) => {
-                                    index.write().unwrap_or_else(|e| e.into_inner()).remove(&oldest_block);
+                                    index
+                                        .write()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .remove(&oldest_block);
                                     break;
                                 }
                             }
@@ -124,12 +136,22 @@ async fn run_cold_writer(
                                         warn!(oldest_block, err = %e, "Cold age eviction: remove failed");
                                         break;
                                     }
-                                    index.write().unwrap_or_else(|e| e.into_inner()).remove(&oldest_block);
+                                    index
+                                        .write()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .remove(&oldest_block);
                                     current_dir_bytes.fetch_sub(file_size, Relaxed);
-                                    info!(oldest_block, age = block_number - oldest_block, "Cold: age-evicted");
+                                    info!(
+                                        oldest_block,
+                                        age = block_number - oldest_block,
+                                        "Cold: age-evicted"
+                                    );
                                 }
                                 Err(_) => {
-                                    index.write().unwrap_or_else(|e| e.into_inner()).remove(&oldest_block);
+                                    index
+                                        .write()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .remove(&oldest_block);
                                     break;
                                 }
                             }
@@ -168,11 +190,7 @@ struct RingBuffer {
 
 impl RingBuffer {
     fn new(max_bytes: usize) -> Self {
-        Self {
-            entries: VecDeque::new(),
-            total_bytes: 0,
-            max_bytes,
-        }
+        Self { entries: VecDeque::new(), total_bytes: 0, max_bytes }
     }
 
     /// Push a new entry, evicting oldest entries until the byte limit is satisfied.
@@ -198,11 +216,7 @@ impl RingBuffer {
 
     /// Return all entries with `block_number >= from_block`.
     fn snapshot_from(&self, from_block: u64) -> Vec<SharedProveRequest> {
-        self.entries
-            .iter()
-            .filter(|r| r.block_number >= from_block)
-            .cloned()
-            .collect()
+        self.entries.iter().filter(|r| r.block_number >= from_block).cloned().collect()
     }
 
     /// Returns the block number of the oldest entry, if any.
@@ -222,8 +236,7 @@ impl WitnessHub {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
 
         let cold = cold_dir.map(|dir| {
-            std::fs::create_dir_all(&dir)
-                .expect("failed to create cold witness directory");
+            std::fs::create_dir_all(&dir).expect("failed to create cold witness directory");
 
             // Clean up leftover .tmp files from previous crash.
             // Populate index from complete .bin files only (skip empty/corrupt).
@@ -237,16 +250,15 @@ impl WitnessHub {
                         let _ = std::fs::remove_file(entry.path());
                         continue;
                     }
-                    if let Some(n) = name
-                        .strip_suffix(".bin")
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
+                    if let Some(n) = name.strip_suffix(".bin").and_then(|s| s.parse::<u64>().ok()) {
                         match entry.metadata() {
                             Ok(m) if m.len() > 0 => {
                                 initial_bytes += m.len();
                                 existing.insert(n);
                             }
-                            _ => { let _ = std::fs::remove_file(entry.path()); }
+                            _ => {
+                                let _ = std::fs::remove_file(entry.path());
+                            }
                         }
                     }
                 }
@@ -266,11 +278,7 @@ impl WitnessHub {
             ColdTier { dir, index, tx: cold_tx, max_dir_bytes: max_cold_bytes, current_dir_bytes }
         });
 
-        Self {
-            tx,
-            buffer: RwLock::new(RingBuffer::new(max_bytes)),
-            cold,
-        }
+        Self { tx, buffer: RwLock::new(RingBuffer::new(max_bytes)), cold }
     }
 
     /// Push a new witness into the buffer and broadcast it to live subscribers.
@@ -332,7 +340,9 @@ impl WitnessHub {
     /// Returns sorted block numbers in [from, to) that have cold-tier files.
     /// Does NOT load payloads — callers read one file at a time via `read_cold_block`.
     pub fn cold_blocks_in_range(&self, from: u64, to: u64) -> Vec<u64> {
-        let Some(cold) = &self.cold else { return vec![]; };
+        let Some(cold) = &self.cold else {
+            return vec![];
+        };
         let idx = cold.index.read().unwrap_or_else(|e| e.into_inner());
         idx.range(from..to).copied().collect()
     }
@@ -343,9 +353,9 @@ impl WitnessHub {
         let path = cold.dir.join(format!("{block_number}.bin"));
         match tokio::fs::read(&path).await {
             Ok(compressed) => {
-                match tokio::task::spawn_blocking(move || {
-                    zstd::decode_all(compressed.as_slice())
-                }).await {
+                match tokio::task::spawn_blocking(move || zstd::decode_all(compressed.as_slice()))
+                    .await
+                {
                     Ok(Ok(payload)) => Some(Arc::new(ProveRequest { block_number, payload })),
                     Ok(Err(e)) => {
                         use std::sync::atomic::Ordering::Relaxed;
@@ -380,10 +390,7 @@ impl WitnessHub {
     /// Get a single block witness from hot buffer by block number.
     pub async fn get_block(&self, block_number: u64) -> Option<SharedProveRequest> {
         let buf = self.buffer.read().await;
-        buf.entries
-            .iter()
-            .find(|r| r.block_number == block_number)
-            .cloned()
+        buf.entries.iter().find(|r| r.block_number == block_number).cloned()
     }
 
     /// Get a single witness by block number: tries hot buffer first, then cold tier.
@@ -396,7 +403,9 @@ impl WitnessHub {
 
     /// Delete cold-tier files for the given block numbers.
     async fn delete_cold_blocks(&self, blocks: Vec<u64>) {
-        let Some(cold) = &self.cold else { return; };
+        let Some(cold) = &self.cold else {
+            return;
+        };
         use std::sync::atomic::Ordering::Relaxed;
 
         for block_number in blocks {
@@ -406,7 +415,10 @@ impl WitnessHub {
                     let file_size = m.len();
                     match tokio::fs::remove_file(&path).await {
                         Ok(()) => {
-                            cold.index.write().unwrap_or_else(|e| e.into_inner()).remove(&block_number);
+                            cold.index
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&block_number);
                             cold.current_dir_bytes.fetch_sub(file_size, Relaxed);
                         }
                         Err(e) => warn!(block_number, err = %e, "Failed to delete cold witness"),
@@ -422,9 +434,18 @@ impl WitnessHub {
 
     /// Deletes cold-tier files for blocks in [from_block, to_block].
     pub async fn acknowledge_range(&self, from_block: u64, to_block: u64) {
-        let blocks = self.cold.as_ref().map(|c| {
-            c.index.read().unwrap_or_else(|e| e.into_inner()).range(from_block..=to_block).copied().collect()
-        }).unwrap_or_default();
+        let blocks = self
+            .cold
+            .as_ref()
+            .map(|c| {
+                c.index
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .range(from_block..=to_block)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
         self.delete_cold_blocks(blocks).await;
         info!(from_block, to_block, "Cold witnesses acknowledged (range)");
     }
@@ -432,9 +453,18 @@ impl WitnessHub {
     /// Called by the courier (via gRPC) after checkpoint advances.
     /// Deletes all cold-tier files with block_number <= up_to_block.
     pub async fn acknowledge(&self, up_to_block: u64) {
-        let blocks = self.cold.as_ref().map(|c| {
-            c.index.read().unwrap_or_else(|e| e.into_inner()).range(..=up_to_block).copied().collect()
-        }).unwrap_or_default();
+        let blocks = self
+            .cold
+            .as_ref()
+            .map(|c| {
+                c.index
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .range(..=up_to_block)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
         self.delete_cold_blocks(blocks).await;
         info!(up_to_block, "Cold witnesses acknowledged");
     }
@@ -453,10 +483,7 @@ mod tests {
     const TEST_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
     fn make_req(block_number: u64, size: usize) -> Arc<ProveRequest> {
-        Arc::new(ProveRequest {
-            block_number,
-            payload: vec![0u8; size],
-        })
+        Arc::new(ProveRequest { block_number, payload: vec![0u8; size] })
     }
 
     #[test]

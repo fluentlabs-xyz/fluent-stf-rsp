@@ -1,5 +1,5 @@
 [package]
-name = "rsp-blob-builder"
+name = "l1-rollup-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,10 +10,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-alloy-eips.workspace = true
+alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types.workspace = true
-brotlic.workspace = true
+alloy-sol-types.workspace = true
 eyre.workspace = true
-futures.workspace = true
+tokio.workspace = true
 tracing.workspace = true

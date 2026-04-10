@@ -2,7 +2,6 @@ use std::{future::Future, time::Duration};
 
 use alloy_consensus::Block;
 use reth_primitives_traits::NodePrimitives;
-use sp1_sdk::{ExecutionReport, SP1VerifyingKey};
 
 pub trait ExecutionHooks: Send {
     fn on_execution_start(
@@ -12,10 +11,11 @@ pub trait ExecutionHooks: Send {
         async { Ok(()) }
     }
 
+    #[cfg(feature = "sp1")]
     fn on_execution_end<P: NodePrimitives>(
         &self,
         _executed_block: &Block<P::SignedTx>,
-        _execution_report: &ExecutionReport,
+        _execution_report: &sp1_sdk::ExecutionReport,
     ) -> impl Future<Output = eyre::Result<()>> {
         async { Ok(()) }
     }
@@ -24,11 +24,12 @@ pub trait ExecutionHooks: Send {
         async { Ok(()) }
     }
 
+    #[cfg(feature = "sp1")]
     fn on_proving_end(
         &self,
         _block_number: u64,
         _proof_bytes: &[u8],
-        _vk: &SP1VerifyingKey,
+        _vk: &sp1_sdk::SP1VerifyingKey,
         _cycle_count: Option<u64>,
         _proving_duration: Duration,
     ) -> impl Future<Output = eyre::Result<()>> {

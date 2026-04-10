@@ -1,17 +1,12 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-use hex as _;
 use rsp_client_executor::evm::FluentEvmConfig;
-use serde_json as _;
 
 use alloy_chains::Chain;
 pub use error::Error as HostError;
 use reth_chainspec::ChainSpec;
-// use reth_optimism_chainspec::OpChainSpec;
-// use reth_optimism_evm::OpEvmConfig;
 use revm_primitives::Address;
 use rsp_primitives::genesis::Genesis;
-use sp1_sdk::SP1ProofMode;
 use std::{path::PathBuf, sync::Arc};
 use url::Url;
 
@@ -21,6 +16,8 @@ pub mod alerting;
 mod error;
 
 mod executor_components;
+#[cfg(feature = "sp1")]
+pub use executor_components::MaybeProveWithCycles;
 pub use executor_components::{EthExecutorComponents, ExecutorComponents};
 
 mod full_executor;
@@ -44,11 +41,6 @@ pub fn create_eth_block_execution_strategy_factory(
     FluentEvmConfig::new_with_default_factory(chain_spec)
 }
 
-// pub fn create_op_block_execution_strategy_factory(genesis: &Genesis) -> OpEvmConfig {
-//     let chain_spec: Arc<OpChainSpec> = Arc::new(genesis.try_into().unwrap());
-//
-//     OpEvmConfig::optimism(chain_spec)
-// }
 #[cfg(feature = "nitro")]
 #[derive(Debug, Clone, Copy)]
 pub struct NitroConfig {
@@ -70,7 +62,8 @@ pub struct Config {
     pub rpc_url: Option<Url>,
     pub cache_dir: Option<PathBuf>,
     pub custom_beneficiary: Option<Address>,
-    pub prove_mode: Option<SP1ProofMode>,
+    #[cfg(feature = "sp1")]
+    pub prove_mode: Option<sp1_sdk::SP1ProofMode>,
     pub skip_client_execution: bool,
     pub opcode_tracking: bool,
     #[cfg(feature = "nitro")]
@@ -85,6 +78,7 @@ impl Config {
             rpc_url: None,
             cache_dir: None,
             custom_beneficiary: None,
+            #[cfg(feature = "sp1")]
             prove_mode: None,
             skip_client_execution: false,
             opcode_tracking: false,

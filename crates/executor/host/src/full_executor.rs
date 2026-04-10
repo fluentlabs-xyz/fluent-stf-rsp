@@ -3,7 +3,6 @@ use either::Either;
 use reth_primitives_traits::NodePrimitives;
 use rsp_client_executor::io::ClientExecutorInput;
 use serde::de::DeserializeOwned;
-use sp1_sdk::{Elf, ProvingKey};
 use std::{
     fmt::{Debug, Formatter},
     path::{Path, PathBuf},
@@ -13,18 +12,17 @@ use std::{
 use tokio::time::sleep;
 use tracing::warn;
 
-use sp1_sdk::Prover;
-
-use crate::executor_components::MaybeProveWithCycles;
-
 #[cfg(feature = "sp1")]
 use {
     alloy_primitives::B256,
     eyre::bail,
-    sp1_sdk::{SP1Stdin, SP1VerifyingKey},
+    sp1_sdk::{Elf, Prover, ProvingKey, SP1Stdin, SP1VerifyingKey},
     std::time::Instant,
     tracing::info,
 };
+
+#[cfg(feature = "sp1")]
+use crate::executor_components::MaybeProveWithCycles;
 
 #[cfg(all(feature = "nitro", not(feature = "sp1")))]
 use tracing::info;
@@ -37,14 +35,29 @@ use crate::HostError;
 #[cfg(feature = "nitro")]
 use {
     crate::NitroConfig,
-    rsp_client_executor::nitro::{AwsCredentials, EnclaveRequest, EnclaveResponse},
+    nitro_types::{EnclaveResponse, EthExecutionResponse},
     serde::Deserialize,
     std::fs,
     std::io::{Read, Write},
     tokio::process::Command as TokioCommand,
-    vsock::SockAddr,
+    vsock::VsockAddr,
     vsock::VsockStream,
 };
+
+#[cfg(feature = "nitro")]
+#[derive(Debug, serde::Serialize)]
+struct AwsCredentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+}
+
+#[cfg(feature = "nitro")]
+#[derive(Debug, serde::Serialize)]
+struct EnclaveRequest {
+    credentials: AwsCredentials,
+    encrypted_data_key: Option<Vec<u8>>,
+}
 
 pub type EitherExecutor<C, P> = Either<FullExecutor<C, P>, CachedExecutor<C>>;
 
@@ -59,6 +72,7 @@ pub async fn build_executor<C, P>(
 ) -> eyre::Result<EitherExecutor<C, P>>
 where
     C: ExecutorComponents,
+    C::Prover: Prover + MaybeProveWithCycles,
     P: Provider<C::Network> + Clone + std::fmt::Debug,
 {
     if let Some(provider) = provider {
@@ -221,181 +235,158 @@ pub trait BlockExecutor<C: ExecutorComponents> {
     fn client(&self) -> Arc<C::Prover>;
 
     #[cfg(feature = "sp1")]
-    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey>;
+    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey>
+    where
+        C::Prover: Prover;
 
     #[cfg(feature = "sp1")]
-    fn vk(&self) -> Arc<SP1VerifyingKey>;
+    fn vk(&self) -> Arc<SP1VerifyingKey>
+    where
+        C::Prover: Prover;
 
     fn config(&self) -> &Config;
+}
 
-    #[allow(async_fn_in_trait)]
-    async fn process_client(
-        &self,
-        client_input: ClientExecutorInput<C::Primitives>,
-        hooks: &C::Hooks,
-    ) -> eyre::Result<()> {
-        // Generate the proof.
-        // Execute the block inside the zkVM.
-        let mut stdin = SP1Stdin::new();
+#[cfg(feature = "sp1")]
+async fn process_client<C: ExecutorComponents>(
+    client: &Arc<C::Prover>,
+    config: &Config,
+    client_input: ClientExecutorInput<C::Primitives>,
+    hooks: &C::Hooks,
+    pk: &Arc<<C::Prover as Prover>::ProvingKey>,
+    vk: &Arc<SP1VerifyingKey>,
+) -> eyre::Result<()>
+where
+    C::Prover: Prover + MaybeProveWithCycles,
+{
+    let mut stdin = SP1Stdin::new();
+    let buffer = bincode::serialize(&client_input).unwrap();
+    stdin.write_vec(buffer);
 
-        let buffer = bincode::serialize(&client_input).unwrap();
+    if config.skip_client_execution {
+        info!("Client execution skipped");
+    } else {
+        let elf = pk.elf().clone();
 
-        stdin.write_vec(buffer);
+        let (mut public_values, execution_report) =
+            client.execute(elf, stdin.clone()).await.map_err(|err| eyre::eyre!("{err}"))?;
 
-        if self.config().skip_client_execution {
-            info!("Client execution skipped");
-        } else {
-            // Only execute the program.
-            let elf = self.pk().elf().clone();
-
-            let (mut public_values, execution_report) = self
-                .client()
-                .execute(elf, stdin.clone())
-                .await
-                .map_err(|err| eyre::eyre!("{err}"))?;
-
-            // Read the block header.
-            let parent_hash = public_values.read::<B256>();
-            let block_hash = public_values.read::<B256>();
-            let input_block_hash = client_input.current_block.header.hash_slow();
-
-            if input_block_hash != block_hash {
-                return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?;
-            }
-
-            if client_input.current_block.header.parent_hash != parent_hash {
-                return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?;
-            }
-
-            info!(?block_hash, "Execution successful");
-
-            hooks
-                .on_execution_end::<C::Primitives>(&client_input.current_block, &execution_report)
-                .await?;
-        }
-
-        if let Some(prove_mode) = self.config().prove_mode {
-            info!("Starting proof generation");
-
-            let proving_start = Instant::now();
-            hooks.on_proving_start(client_input.current_block.number).await?;
-            let client = self.client();
-            let pk = self.pk();
-
-            let (proof, cycle_count) = client
-                .prove_with_cycles(pk.as_ref(), stdin, prove_mode)
-                .await
-                .map_err(|err| eyre::eyre!("{err}"))?;
-
-            let proving_duration = proving_start.elapsed();
-            let proof_bytes = bincode::serialize(&proof.proof).unwrap();
-
-            hooks
-                .on_proving_end(
-                    client_input.current_block.number,
-                    &proof_bytes,
-                    self.vk().as_ref(),
-                    cycle_count,
-                    proving_duration,
-                )
-                .await?;
-
-            info!("Proof successfully generated!");
-        }
-
-        Ok(())
-    }
-
-    #[cfg(feature = "nitro")]
-    #[allow(async_fn_in_trait)]
-    async fn process_nitro_client(
-        &self,
-        client_input: ClientExecutorInput<C::Primitives>,
-        _hooks: &C::Hooks,
-    ) -> eyre::Result<()> {
-        // Get enclave CID and port from config or use defaults
-
-        use rsp_client_executor::nitro::EthExecutionResponse;
-
-        let nitro_config = self.config().nitro_config.as_ref().cloned().unwrap_or_default();
-        let enclave_cid = nitro_config.enclave_cid;
-        let enclave_port = nitro_config.enclave_port;
-
-        info!("Connecting to Nitro enclave at CID={} PORT={}", enclave_cid, enclave_port);
-
-        let payload = bincode::serialize(&client_input)?;
-        info!("Serialized input: {} bytes", payload.len());
-
-        let response = task::spawn_blocking(move || -> eyre::Result<EthExecutionResponse> {
-            const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
-            let addr = SockAddr::new_vsock(enclave_cid, enclave_port);
-            let mut stream = VsockStream::connect(&addr).map_err(|e| {
-                eyre::eyre!("Failed to connect to VSOCK {}:{}: {}", enclave_cid, enclave_port, e)
-            })?;
-
-            let req_len: u32 = payload
-                .len()
-                .try_into()
-                .map_err(|_| eyre::eyre!("Payload too large: {} bytes", payload.len()))?;
-            stream
-                .write_all(&req_len.to_be_bytes())
-                .map_err(|e| eyre::eyre!("Failed to write request length to enclave: {}", e))?;
-            stream
-                .write_all(&payload)
-                .map_err(|e| eyre::eyre!("Failed to write payload to enclave: {}", e))?;
-            stream.flush().map_err(|e| eyre::eyre!("Failed to flush stream: {}", e))?;
-
-            info!("Sent {} bytes to enclave", payload.len());
-
-            let mut resp_len_buf = [0u8; 4];
-            stream
-                .read_exact(&mut resp_len_buf)
-                .map_err(|e| eyre::eyre!("Failed to read response length from enclave: {}", e))?;
-            let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
-            if resp_len > MAX_FRAME_SIZE {
-                return Err(eyre::eyre!(
-                    "Response frame too large: {} bytes (cap {})",
-                    resp_len,
-                    MAX_FRAME_SIZE
-                ));
-            }
-            let mut resp_buf = vec![0u8; resp_len];
-            stream
-                .read_exact(&mut resp_buf)
-                .map_err(|e| eyre::eyre!("Failed to read response body from enclave: {}", e))?;
-
-            let resp_text = String::from_utf8_lossy(&resp_buf);
-            info!("Received response ({} bytes): {}", resp_buf.len(), resp_text);
-
-            let parsed: EthExecutionResponse = bincode::deserialize(&resp_buf)
-                .map_err(|e| eyre::eyre!("Failed to parse response from enclave: {}", e))?;
-
-            Ok(parsed)
-        })
-        .await
-        .map_err(|e| eyre::eyre!("Task join error: {}", e))??;
-
+        let parent_hash = public_values.read::<B256>();
+        let block_hash = public_values.read::<B256>();
         let input_block_hash = client_input.current_block.header.hash_slow();
 
-        if input_block_hash != response.block_hash {
-            return Err(eyre::eyre!(
-                "Block hash mismatch: expected {}, got {}",
-                hex::encode(AsRef::<[u8]>::as_ref(&input_block_hash)),
-                hex::encode(AsRef::<[u8]>::as_ref(&response.block_hash))
-            ));
+        if input_block_hash != block_hash {
+            return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?;
         }
 
-        if client_input.current_block.header.parent_hash != response.parent_hash {
-            return Err(eyre::eyre!(
-                "Parent hash mismatch: expected {}, got {}",
-                hex::encode(AsRef::<[u8]>::as_ref(&client_input.current_block.header.parent_hash)),
-                hex::encode(AsRef::<[u8]>::as_ref(&response.parent_hash))
-            ));
+        if client_input.current_block.header.parent_hash != parent_hash {
+            return Err(HostError::HeaderMismatch(block_hash, input_block_hash))?;
         }
 
-        info!("Nitro enclave execution successful");
-        Ok(())
+        info!(?block_hash, "Execution successful");
+
+        hooks
+            .on_execution_end::<C::Primitives>(&client_input.current_block, &execution_report)
+            .await?;
     }
+
+    if let Some(prove_mode) = config.prove_mode {
+        info!("Starting proof generation");
+
+        let proving_start = Instant::now();
+        hooks.on_proving_start(client_input.current_block.number).await?;
+
+        let (proof, cycle_count) = client
+            .prove_with_cycles(pk.as_ref(), stdin, prove_mode)
+            .await
+            .map_err(|err| eyre::eyre!("{err}"))?;
+
+        let proving_duration = proving_start.elapsed();
+        let proof_bytes = bincode::serialize(&proof.proof).unwrap();
+
+        hooks
+            .on_proving_end(
+                client_input.current_block.number,
+                &proof_bytes,
+                vk.as_ref(),
+                cycle_count,
+                proving_duration,
+            )
+            .await?;
+
+        info!("Proof successfully generated!");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "nitro")]
+async fn process_nitro_client<C: ExecutorComponents>(
+    config: &Config,
+    client_input: ClientExecutorInput<C::Primitives>,
+    _hooks: &C::Hooks,
+) -> eyre::Result<()> {
+    let nitro_config = config.nitro_config.as_ref().cloned().unwrap_or_default();
+    let enclave_cid = nitro_config.enclave_cid;
+    let enclave_port = nitro_config.enclave_port;
+
+    info!("Connecting to Nitro enclave at CID={} PORT={}", enclave_cid, enclave_port);
+
+    let payload = bincode::serialize(&client_input)?;
+    info!("Serialized input: {} bytes", payload.len());
+
+    let response = tokio::task::spawn_blocking(move || -> eyre::Result<EthExecutionResponse> {
+        const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+        let addr = VsockAddr::new(enclave_cid, enclave_port);
+        let mut stream = VsockStream::connect(&addr).map_err(|e| {
+            eyre::eyre!("Failed to connect to VSOCK {}:{}: {}", enclave_cid, enclave_port, e)
+        })?;
+
+        let req_len: u32 = payload
+            .len()
+            .try_into()
+            .map_err(|_| eyre::eyre!("Payload too large: {} bytes", payload.len()))?;
+        stream
+            .write_all(&req_len.to_be_bytes())
+            .map_err(|e| eyre::eyre!("Failed to write request length to enclave: {}", e))?;
+        stream
+            .write_all(&payload)
+            .map_err(|e| eyre::eyre!("Failed to write payload to enclave: {}", e))?;
+        stream.flush().map_err(|e| eyre::eyre!("Failed to flush stream: {}", e))?;
+
+        info!("Sent {} bytes to enclave", payload.len());
+
+        let mut resp_len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut resp_len_buf)
+            .map_err(|e| eyre::eyre!("Failed to read response length from enclave: {}", e))?;
+        let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+        if resp_len > MAX_FRAME_SIZE {
+            return Err(eyre::eyre!(
+                "Response frame too large: {} bytes (cap {})",
+                resp_len,
+                MAX_FRAME_SIZE
+            ));
+        }
+        let mut resp_buf = vec![0u8; resp_len];
+        stream
+            .read_exact(&mut resp_buf)
+            .map_err(|e| eyre::eyre!("Failed to read response body from enclave: {}", e))?;
+
+        let resp_text = String::from_utf8_lossy(&resp_buf);
+        info!("Received response ({} bytes): {}", resp_buf.len(), resp_text);
+
+        let parsed: EthExecutionResponse = bincode::deserialize(&resp_buf)
+            .map_err(|e| eyre::eyre!("Failed to parse response from enclave: {}", e))?;
+
+        Ok(parsed)
+    })
+    .await
+    .map_err(|e| eyre::eyre!("Task join error: {}", e))??;
+
+    // TODO: verify response.leaf against client_input block hashes
+    info!(block_number = response.block_number, "Nitro enclave execution successful");
+    Ok(())
 }
 #[cfg(feature = "nitro")]
 fn aws_access_key_id() -> String {
@@ -452,29 +443,18 @@ async fn initialize_enclave_key(nitro_config: NitroConfig) -> eyre::Result<()> {
             .await?;
 
     match resp {
-        Some(EnclaveResponse::EncryptedDataKey {
-            encrypted_signing_key,
-            public_key,
-            attestation,
-        }) => {
-            if encrypted_dek.as_deref() != Some(encrypted_signing_key.as_slice()) {
-                let data_key_path = data_key_storage();
-                if let Some(parent) = Path::new(&data_key_path).parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&data_key_path, &encrypted_signing_key)?;
-                info!("Encrypted data key updated");
-
-                let attestation_path = attestation_storage();
-                if let Some(parent) = Path::new(&attestation_path).parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&attestation_path, &attestation)?;
-                info!("Attestation updated");
-            } else {
-                info!("Encrypted data key unchanged");
+        Some(EnclaveResponse::KeyGenerated { public_key, attestation }) => {
+            let attestation_path = attestation_storage();
+            if let Some(parent) = Path::new(&attestation_path).parent() {
+                fs::create_dir_all(parent)?;
             }
+            fs::write(&attestation_path, &attestation)?;
+            info!("Attestation saved");
             info!("public_key: {:?}", hex::encode(&public_key));
+            Ok(())
+        }
+        Some(EnclaveResponse::AlreadyInitialized { public_key, .. }) => {
+            info!("Enclave already initialized, public_key: {:?}", hex::encode(&public_key));
             Ok(())
         }
         Some(EnclaveResponse::Error(e)) => Err(eyre::eyre!("Key management failed: {}", e)),
@@ -493,7 +473,7 @@ async fn handle_key_management_request(
     info!("Handling key management request: {:?}", req);
 
     const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
-    let addr = SockAddr::new_vsock(enclave_cid, enclave_port);
+    let addr = VsockAddr::new(enclave_cid, enclave_port);
     let mut stream = VsockStream::connect(&addr)
         .map_err(|e| eyre::eyre!("Failed to connect to enclave for key management: {}", e))?;
 
@@ -550,9 +530,11 @@ where
     Ok(alloy_primitives::B256::from(arr))
 }
 
+#[cfg(feature = "sp1")]
 impl<C, P> BlockExecutor<C> for EitherExecutor<C, P>
 where
     C: ExecutorComponents,
+    C::Prover: Prover + MaybeProveWithCycles,
     P: Provider<C::Network> + Clone + std::fmt::Debug,
 {
     async fn execute(&self, block_number: u64) -> eyre::Result<()> {
@@ -569,16 +551,20 @@ where
         }
     }
 
-    #[cfg(feature = "sp1")]
-    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey> {
+    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey>
+    where
+        C::Prover: Prover,
+    {
         match self {
             Either::Left(ref executor) => executor.pk.clone(),
             Either::Right(ref executor) => executor.pk.clone(),
         }
     }
 
-    #[cfg(feature = "sp1")]
-    fn vk(&self) -> Arc<SP1VerifyingKey> {
+    fn vk(&self) -> Arc<SP1VerifyingKey>
+    where
+        C::Prover: Prover,
+    {
         match self {
             Either::Left(ref executor) => executor.vk.clone(),
             Either::Right(ref executor) => executor.vk.clone(),
@@ -587,31 +573,40 @@ where
 
     fn config(&self) -> &Config {
         match self {
-            Either::Left(executor) => executor.config(),
-            Either::Right(executor) => executor.config(),
+            Either::Left(executor) => &executor.config,
+            Either::Right(executor) => &executor.config,
         }
     }
 }
 
-pub struct FullExecutor<C, P>
+#[cfg(feature = "sp1")]
+pub struct FullExecutor<C: ExecutorComponents, P>
 where
-    C: ExecutorComponents,
-    P: Provider<C::Network> + Clone + std::fmt::Debug,
+    C::Prover: Prover,
 {
     provider: P,
     host_executor: HostExecutor<C::EvmConfig, C::ChainSpec>,
     client: Arc<C::Prover>,
-    #[cfg(feature = "sp1")]
     pk: Arc<<C::Prover as Prover>::ProvingKey>,
-    #[cfg(feature = "sp1")]
     vk: Arc<SP1VerifyingKey>,
     hooks: C::Hooks,
     config: Config,
 }
 
+#[cfg(not(feature = "sp1"))]
+pub struct FullExecutor<C: ExecutorComponents, P> {
+    provider: P,
+    host_executor: HostExecutor<C::EvmConfig, C::ChainSpec>,
+    client: Arc<C::Prover>,
+    hooks: C::Hooks,
+    config: Config,
+}
+
+#[cfg(feature = "sp1")]
 impl<C, P> FullExecutor<C, P>
 where
     C: ExecutorComponents,
+    C::Prover: Prover,
     P: Provider<C::Network> + Clone + std::fmt::Debug,
 {
     pub async fn try_new(
@@ -649,8 +644,146 @@ where
         }
         Ok(())
     }
+
+    async fn load_client_input(
+        &self,
+        block_number: u64,
+    ) -> eyre::Result<ClientExecutorInput<C::Primitives>> {
+        load_client_input_inner::<C, P>(
+            &self.config,
+            &self.host_executor,
+            &self.provider,
+            block_number,
+        )
+        .await
+    }
 }
 
+#[cfg(not(feature = "sp1"))]
+impl<C, P> FullExecutor<C, P>
+where
+    C: ExecutorComponents,
+    P: Provider<C::Network> + Clone + std::fmt::Debug,
+{
+    pub async fn wait_for_block(&self, block_number: u64) -> eyre::Result<()> {
+        let block_number = block_number.into();
+
+        while self.provider.get_block_by_number(block_number).await?.is_none() {
+            sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+
+    async fn load_client_input(
+        &self,
+        block_number: u64,
+    ) -> eyre::Result<ClientExecutorInput<C::Primitives>> {
+        load_client_input_inner::<C, P>(
+            &self.config,
+            &self.host_executor,
+            &self.provider,
+            block_number,
+        )
+        .await
+    }
+}
+
+async fn load_client_input_inner<C, P>(
+    config: &Config,
+    host_executor: &HostExecutor<C::EvmConfig, C::ChainSpec>,
+    provider: &P,
+    block_number: u64,
+) -> eyre::Result<ClientExecutorInput<C::Primitives>>
+where
+    C: ExecutorComponents,
+    P: Provider<C::Network> + Clone + std::fmt::Debug,
+{
+    let client_input_from_cache = config.cache_dir.as_ref().and_then(|cache_dir| {
+        match try_load_input_from_cache::<C::Primitives>(cache_dir, config.chain.id(), block_number)
+        {
+            Ok(client_input) => client_input,
+            Err(e) => {
+                warn!("Failed to load input from cache: {}", e);
+                None
+            }
+        }
+    });
+
+    match client_input_from_cache {
+        Some(mut client_input_from_cache) => {
+            client_input_from_cache.opcode_tracking = config.opcode_tracking;
+            Ok(client_input_from_cache)
+        }
+        None => {
+            let client_input = host_executor
+                .execute(
+                    block_number,
+                    provider,
+                    config.genesis.clone(),
+                    config.custom_beneficiary,
+                    config.opcode_tracking,
+                )
+                .await?;
+
+            if let Some(ref cache_dir) = config.cache_dir {
+                let input_folder = cache_dir.join(format!("input/{}", config.chain.id()));
+                if !input_folder.exists() {
+                    std::fs::create_dir_all(&input_folder)?;
+                }
+
+                let input_path = input_folder.join(format!("{block_number}.bin"));
+                let mut cache_file = std::fs::File::create(input_path)?;
+
+                bincode::serialize_into(&mut cache_file, &client_input)?;
+            }
+
+            Ok(client_input)
+        }
+    }
+}
+
+#[cfg(feature = "sp1")]
+impl<C, P> BlockExecutor<C> for FullExecutor<C, P>
+where
+    C: ExecutorComponents,
+    C::Prover: Prover + MaybeProveWithCycles,
+    P: Provider<C::Network> + Clone + std::fmt::Debug,
+{
+    async fn execute(&self, block_number: u64) -> eyre::Result<()> {
+        self.hooks.on_execution_start(block_number).await?;
+        let client_input = self.load_client_input(block_number).await?;
+        process_client::<C>(
+            &self.client,
+            &self.config,
+            client_input,
+            &self.hooks,
+            &self.pk,
+            &self.vk,
+        )
+        .await
+    }
+
+    fn client(&self) -> Arc<C::Prover> {
+        self.client.clone()
+    }
+    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey>
+    where
+        C::Prover: Prover,
+    {
+        self.pk.clone()
+    }
+    fn vk(&self) -> Arc<SP1VerifyingKey>
+    where
+        C::Prover: Prover,
+    {
+        self.vk.clone()
+    }
+    fn config(&self) -> &Config {
+        &self.config
+    }
+}
+
+#[cfg(all(feature = "nitro", not(feature = "sp1")))]
 impl<C, P> BlockExecutor<C> for FullExecutor<C, P>
 where
     C: ExecutorComponents,
@@ -658,88 +791,31 @@ where
 {
     async fn execute(&self, block_number: u64) -> eyre::Result<()> {
         self.hooks.on_execution_start(block_number).await?;
-
-        let client_input_from_cache = self.config.cache_dir.as_ref().and_then(|cache_dir| {
-            match try_load_input_from_cache::<C::Primitives>(
-                cache_dir,
-                self.config.chain.id(),
-                block_number,
-            ) {
-                Ok(client_input) => client_input,
-                Err(e) => {
-                    warn!("Failed to load input from cache: {}", e);
-                    None
-                }
-            }
-        });
-
-        let client_input = match client_input_from_cache {
-            Some(mut client_input_from_cache) => {
-                // Override opcode tracking from cache by the setting provided by the user
-                client_input_from_cache.opcode_tracking = self.config.opcode_tracking;
-                client_input_from_cache
-            }
-            None => {
-                // Execute the host.
-                let client_input = self
-                    .host_executor
-                    .execute(
-                        block_number,
-                        &self.provider,
-                        self.config.genesis.clone(),
-                        self.config.custom_beneficiary,
-                        self.config.opcode_tracking,
-                    )
-                    .await?;
-
-                if let Some(ref cache_dir) = self.config.cache_dir {
-                    let input_folder = cache_dir.join(format!("input/{}", self.config.chain.id()));
-                    if !input_folder.exists() {
-                        std::fs::create_dir_all(&input_folder)?;
-                    }
-
-                    let input_path = input_folder.join(format!("{block_number}.bin"));
-                    let mut cache_file = std::fs::File::create(input_path)?;
-
-                    bincode::serialize_into(&mut cache_file, &client_input)?;
-                }
-
-                client_input
-            }
-        };
-
-        if cfg!(feature = "sp1") {
-            #[cfg(feature = "sp1")]
-            self.process_client(client_input, &self.hooks).await?;
-        } else if cfg!(feature = "nitro") {
-            #[cfg(feature = "nitro")]
-            self.process_nitro_client(client_input, &self.hooks).await?;
-        } else {
-            return Err(eyre::eyre!("No features of proving engine enabled"));
-        }
-
-        Ok(())
+        let client_input = self.load_client_input(block_number).await?;
+        process_nitro_client::<C>(&self.config, client_input, &self.hooks).await
     }
 
     fn client(&self) -> Arc<C::Prover> {
         self.client.clone()
     }
-
-    #[cfg(feature = "sp1")]
-    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey> {
-        self.pk.clone()
-    }
-
-    #[cfg(feature = "sp1")]
-    fn vk(&self) -> Arc<SP1VerifyingKey> {
-        self.vk.clone()
-    }
-
     fn config(&self) -> &Config {
         &self.config
     }
 }
 
+#[cfg(feature = "sp1")]
+impl<C, P> Debug for FullExecutor<C, P>
+where
+    C: ExecutorComponents,
+    C::Prover: Prover,
+    P: Provider<C::Network> + Clone + std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullExecutor").field("config", &self.config).finish()
+    }
+}
+
+#[cfg(not(feature = "sp1"))]
 impl<C, P> Debug for FullExecutor<C, P>
 where
     C: ExecutorComponents,
@@ -750,23 +826,36 @@ where
     }
 }
 
+#[cfg(feature = "sp1")]
+pub struct CachedExecutor<C>
+where
+    C: ExecutorComponents,
+    C::Prover: Prover,
+{
+    cache_dir: PathBuf,
+    client: Arc<C::Prover>,
+    pk: Arc<<C::Prover as Prover>::ProvingKey>,
+    vk: Arc<SP1VerifyingKey>,
+    hooks: C::Hooks,
+    config: Config,
+}
+
+#[cfg(not(feature = "sp1"))]
 pub struct CachedExecutor<C>
 where
     C: ExecutorComponents,
 {
     cache_dir: PathBuf,
     client: Arc<C::Prover>,
-    #[cfg(feature = "sp1")]
-    pk: Arc<<C::Prover as Prover>::ProvingKey>,
-    #[cfg(feature = "sp1")]
-    vk: Arc<SP1VerifyingKey>,
     hooks: C::Hooks,
     config: Config,
 }
 
+#[cfg(feature = "sp1")]
 impl<C> CachedExecutor<C>
 where
     C: ExecutorComponents,
+    C::Prover: Prover,
 {
     pub async fn try_new(
         elf: Vec<u8>,
@@ -784,9 +873,11 @@ where
     }
 }
 
+#[cfg(feature = "sp1")]
 impl<C> BlockExecutor<C> for CachedExecutor<C>
 where
     C: ExecutorComponents,
+    C::Prover: Prover + MaybeProveWithCycles,
 {
     async fn execute(&self, block_number: u64) -> eyre::Result<()> {
         let client_input = try_load_input_from_cache::<C::Primitives>(
@@ -796,38 +887,49 @@ where
         )?
         .ok_or(eyre::eyre!("No cached input found"))?;
 
-        if cfg!(feature = "sp1") {
-            #[cfg(feature = "sp1")]
-            self.process_client(client_input, &self.hooks).await?;
-        } else if cfg!(feature = "nitro") {
-            #[cfg(feature = "nitro")]
-            self.process_nitro_client(client_input, &self.hooks).await?;
-        } else {
-            return Err(eyre::eyre!("No features of proving engine enabled"));
-        }
-
-        Ok(())
+        process_client::<C>(
+            &self.client,
+            &self.config,
+            client_input,
+            &self.hooks,
+            &self.pk,
+            &self.vk,
+        )
+        .await
     }
 
     fn client(&self) -> Arc<C::Prover> {
         self.client.clone()
     }
-
-    #[cfg(feature = "sp1")]
-    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey> {
+    fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey>
+    where
+        C::Prover: Prover,
+    {
         self.pk.clone()
     }
-
-    #[cfg(feature = "sp1")]
-    fn vk(&self) -> Arc<SP1VerifyingKey> {
+    fn vk(&self) -> Arc<SP1VerifyingKey>
+    where
+        C::Prover: Prover,
+    {
         self.vk.clone()
     }
-
     fn config(&self) -> &Config {
         &self.config
     }
 }
 
+#[cfg(feature = "sp1")]
+impl<C> Debug for CachedExecutor<C>
+where
+    C: ExecutorComponents,
+    C::Prover: Prover,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedExecutor").field("cache_dir", &self.cache_dir).finish()
+    }
+}
+
+#[cfg(not(feature = "sp1"))]
 impl<C> Debug for CachedExecutor<C>
 where
     C: ExecutorComponents,

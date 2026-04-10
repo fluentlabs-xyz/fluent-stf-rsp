@@ -22,7 +22,6 @@
 //!
 //! All endpoints are protected by `x-api-key` header.
 
-mod blob;
 mod enclave;
 mod types;
 
@@ -43,12 +42,15 @@ type LazySp1 = Arc<OnceCell<Sp1State>>;
 
 use alloy_primitives::Address;
 use axum::{
-    Router, body::Bytes, extract::{DefaultBodyLimit, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Json}, routing::post
+    body::Bytes,
+    extract::{DefaultBodyLimit, Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Json},
+    routing::post,
+    Router,
 };
-use revm_primitives::{
-    hex,
-    FixedBytes, B256,
-};
+use revm_primitives::{hex, FixedBytes, B256};
 use rsp_primitives::genesis::Genesis;
 use url::Url;
 
@@ -102,12 +104,12 @@ struct AppState {
 
 #[derive(Clone)]
 struct L1State {
-    provider: RootProvider,
+    /// L1 RPC provider (rollup contract reads).
+    l1_provider: RootProvider,
+    /// Rollup contract address on L1.
     contract_addr: Address,
-    beacon_urls: Vec<String>,
-    beacon_genesis_timestamp: u64,
-    contract_deploy_block: u64,
-    http_client: reqwest::Client,
+    /// L1 block where the rollup contract was deployed (lower bound for log scans).
+    deploy_block: u64,
 }
 
 #[derive(Clone)]
@@ -132,12 +134,7 @@ struct ChainContext {
 // Request / response types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Debug)]
-pub struct BlobVerificationInput {
-    pub blobs: Vec<Vec<u8>>,
-    pub commitments: Vec<Vec<u8>>,
-    pub proofs: Vec<Vec<u8>>,
-}
+use nitro_types::BlobVerificationInput;
 
 /// `POST /challenge/sp1/request` — block ref + batch index for blob fetching.
 #[derive(Deserialize)]
@@ -252,9 +249,10 @@ async fn require_sp1(state: &AppState) -> Result<&Sp1State, HandlerError> {
 }
 
 fn require_l1(state: &AppState) -> Result<&L1State, HandlerError> {
-    state.l1.as_ref().ok_or_else(|| {
-        internal("L1 not configured (set L1_RPC_URL, L1_CONTRACT_ADDR, L1_BEACON_URL)")
-    })
+    state
+        .l1
+        .as_ref()
+        .ok_or_else(|| internal("L1 not configured (set L1_RPC_URL, L1_CONTRACT_ADDR)"))
 }
 
 /// Generates KZG commitments and proofs on the host using Fiat-Shamir.
@@ -289,22 +287,30 @@ fn prepare_blob_input(raw_blobs: &[Vec<u8>]) -> Result<BlobVerificationInput, Ha
     Ok(BlobVerificationInput { blobs: raw_blobs.to_vec(), commitments, proofs })
 }
 
-/// Fetch blobs for a challenge endpoint using L1 + Beacon API.
+/// Fetch blobs for a challenge endpoint by reconstructing them from L2 tx data.
+///
+/// Resolves the batch's L2 block range via an L1 `acceptNextBatch` calldata
+/// lookup, then rebuilds the canonical blobs from L2 RPC — no Beacon API.
 async fn fetch_challenge_blobs(
     l1: &L1State,
     batch_index: u64,
 ) -> Result<Vec<Vec<u8>>, HandlerError> {
-    blob::fetch_blobs_for_batch(
-        &l1.provider,
-        &l1.beacon_urls,
-        &l1.http_client,
+    let l2_url = Url::parse(&rpc_url()).map_err(|e| internal(format!("Invalid rpc_url: {e}")))?;
+    let l2_provider: RootProvider = create_provider(l2_url);
+
+    let (from_block, to_block) = l1_rollup_client::fetch_batch_range(
+        &l1.l1_provider,
+        &l2_provider,
         l1.contract_addr,
         batch_index,
-        l1.beacon_genesis_timestamp,
-        l1.contract_deploy_block,
+        l1.deploy_block,
     )
     .await
-    .map_err(|e| internal(format!("Blob fetching failed: {e}")))
+    .map_err(|e| internal(format!("Batch range lookup failed: {e}")))?;
+
+    rsp_blob_builder::build_blobs_from_l2(&l2_provider, from_block, to_block)
+        .await
+        .map_err(|e| internal(format!("Blob construction failed: {e}")))
 }
 
 /// Resolves a block number from either `block_number` or `block_hash`,
@@ -604,10 +610,7 @@ async fn mock_sp1_request(
         }
         Err(e) => {
             tracing::warn!(block_number, err = %e, "Mock SP1 execution failed");
-            Ok(Json(MockSp1Response {
-                success: false,
-                error: Some(format!("{e}")),
-            }))
+            Ok(Json(MockSp1Response { success: false, error: Some(format!("{e}")) }))
         }
     }
 }
@@ -665,42 +668,27 @@ async fn main() -> eyre::Result<()> {
 
     let chain = ChainContext { block_execution_strategy_factory, genesis, chain_spec };
 
-    // ── L1 context (for blob fetching in /sign-batch-root) ────────────
-    let l1 = match (env::var("L1_RPC_URL"), env::var("L1_CONTRACT_ADDR"), env::var("L1_BEACON_URL"))
-    {
-        (Ok(l1_rpc), Ok(l1_addr), Ok(beacon)) => {
+    // ── L1 context (for batch metadata lookup in challenge endpoints) ────
+    let l1 = match (env::var("L1_RPC_URL"), env::var("L1_CONTRACT_ADDR")) {
+        (Ok(l1_rpc), Ok(l1_addr)) => {
             let l1_url = Url::parse(&l1_rpc).map_err(|e| eyre::eyre!("Invalid L1_RPC_URL: {e}"))?;
             let l1_provider: RootProvider = create_provider(l1_url);
             let contract_addr: Address =
                 l1_addr.parse().map_err(|e| eyre::eyre!("Invalid L1_CONTRACT_ADDR: {e}"))?;
-            let beacon_genesis_timestamp: u64 = env::var("BEACON_GENESIS_TIMESTAMP")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1606824023); // Mainnet beacon genesis
-            let contract_deploy_block: u64 =
+            let deploy_block: u64 =
                 env::var("L1_CONTRACT_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let beacon_urls: Vec<String> =
-                beacon.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-            let http_client = reqwest::Client::new();
 
             info!(
                 l1_rpc = %l1_rpc,
                 contract_addr = %l1_addr,
-                ?beacon_urls,
-                "L1 context initialized for blob fetching"
+                deploy_block,
+                "L1 context initialized for batch metadata lookup"
             );
 
-            Some(L1State {
-                provider: l1_provider,
-                contract_addr,
-                beacon_urls,
-                beacon_genesis_timestamp,
-                contract_deploy_block,
-                http_client,
-            })
+            Some(L1State { l1_provider, contract_addr, deploy_block })
         }
         _ => {
-            info!("L1_RPC_URL/L1_CONTRACT_ADDR/L1_BEACON_URL not all set — blob fetching disabled");
+            info!("L1_RPC_URL/L1_CONTRACT_ADDR not set — challenge endpoints disabled");
             None
         }
     };

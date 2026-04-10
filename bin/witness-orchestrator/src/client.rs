@@ -38,7 +38,7 @@ use tracing::{error, info, warn};
 use crate::accumulator::BatchAccumulator;
 use crate::db::Db;
 use crate::l1_listener::L1Event;
-use crate::l1_submitter;
+use l1_rollup_client::{is_key_registered, submit_preconfirmation};
 use witness_orchestrator::proto::witness_service_client::WitnessServiceClient;
 use witness_orchestrator::proto::SubscribeRequest;
 use witness_orchestrator::types::{EthExecutionResponse, SubmitBatchResponse};
@@ -106,29 +106,20 @@ enum SignOutcome {
     /// Batch signed and persisted to DB.
     Signed { response: SubmitBatchResponse },
     /// Enclave key rotated — these blocks need re-execution.
-    InvalidSignatures {
-        invalid_blocks: Vec<u64>,
-        enclave_address: Address,
-    },
+    InvalidSignatures { invalid_blocks: Vec<u64>, enclave_address: Address },
 }
 
 /// Result of an L1 dispatch attempt.
 enum DispatchOutcome {
     /// TX included in L1 block — awaiting finalization.
-    Submitted {
-        tx_hash: alloy_primitives::B256,
-        l1_block: u64,
-    },
+    Submitted { tx_hash: alloy_primitives::B256, l1_block: u64 },
     /// L1 transaction failed — will retry with backoff.
     Failed,
 }
 
 /// Error from `/sign-batch-root` call.
 enum SignBatchError {
-    InvalidSignatures {
-        invalid_blocks: Vec<u64>,
-        enclave_address: Address,
-    },
+    InvalidSignatures { invalid_blocks: Vec<u64>, enclave_address: Address },
     Other(eyre::Report),
 }
 
@@ -176,24 +167,43 @@ async fn execution_worker(
             Some(p) => p,
             None => {
                 // JIT fetch — only allocates memory when a worker is ready
-                match witness_client.get_witness(
-                    witness_orchestrator::proto::GetWitnessRequest { block_number: task.block_number }
-                ).await {
+                match witness_client
+                    .get_witness(witness_orchestrator::proto::GetWitnessRequest {
+                        block_number: task.block_number,
+                    })
+                    .await
+                {
                     Ok(resp) => {
                         let w: witness_orchestrator::proto::GetWitnessResponse = resp.into_inner();
                         if w.found && !w.data.is_empty() {
                             w.data
                         } else {
-                            warn!(worker_id, block = task.block_number, "Lazy fetch: witness not found in hub — dispatching to fallback");
-                            if fallback_tx.send(FallbackTask { block_number: task.block_number }).await.is_err() {
-                                warn!(worker_id, block = task.block_number, "Fallback channel closed");
+                            warn!(
+                                worker_id,
+                                block = task.block_number,
+                                "Lazy fetch: witness not found in hub — dispatching to fallback"
+                            );
+                            if fallback_tx
+                                .send(FallbackTask { block_number: task.block_number })
+                                .await
+                                .is_err()
+                            {
+                                warn!(
+                                    worker_id,
+                                    block = task.block_number,
+                                    "Fallback channel closed"
+                                );
                             }
                             continue;
                         }
                     }
                     Err(e) => {
                         warn!(worker_id, block = task.block_number, err = %e, "Lazy fetch: gRPC GetWitness failed — dispatching to fallback");
-                        if fallback_tx.send(FallbackTask { block_number: task.block_number }).await.is_err() {
+                        if fallback_tx
+                            .send(FallbackTask { block_number: task.block_number })
+                            .await
+                            .is_err()
+                        {
                             warn!(worker_id, block = task.block_number, "Fallback channel closed");
                         }
                         continue;
@@ -208,12 +218,24 @@ async fn execution_worker(
         let started = tokio::time::Instant::now();
         loop {
             attempts += 1;
-            match send_block_request(&http_client, &proxy_url, &api_key, task.block_number, payload.clone()).await {
+            match send_block_request(
+                &http_client,
+                &proxy_url,
+                &api_key,
+                task.block_number,
+                payload.clone(),
+            )
+            .await
+            {
                 Ok(response) => {
                     if attempts > 1 {
                         info!(worker_id, block = task.block_number, attempts, elapsed = ?started.elapsed(), "Block succeeded after retries");
                     }
-                    if result_tx.send(BlockResult { block_number: task.block_number, response }).await.is_err() {
+                    if result_tx
+                        .send(BlockResult { block_number: task.block_number, response })
+                        .await
+                        .is_err()
+                    {
                         warn!(worker_id, block = task.block_number, "Result channel closed");
                     }
                     break;
@@ -269,9 +291,10 @@ async fn fallback_worker(
         let block_number = task.block_number;
 
         // L2: try GetWitness from hub (hot buffer + cold tier)
-        let hub_payload = match witness_client.get_witness(
-            witness_orchestrator::proto::GetWitnessRequest { block_number }
-        ).await {
+        let hub_payload = match witness_client
+            .get_witness(witness_orchestrator::proto::GetWitnessRequest { block_number })
+            .await
+        {
             Ok(resp) => {
                 let w: witness_orchestrator::proto::GetWitnessResponse = resp.into_inner();
                 if w.found && !w.data.is_empty() {
@@ -297,7 +320,11 @@ async fn fallback_worker(
         match payload {
             Some(payload) => {
                 info!(worker_id, block_number, "Fallback success — prioritizing execution");
-                if high_tx.send(ExecutionTask { block_number, payload: Some(payload) }).await.is_err() {
+                if high_tx
+                    .send(ExecutionTask { block_number, payload: Some(payload) })
+                    .await
+                    .is_err()
+                {
                     warn!(worker_id, block_number, "High-priority channel closed");
                 }
                 if fallback_done_tx.send((block_number, true)).await.is_err() {
@@ -331,8 +358,9 @@ pub async fn run<P: Provider + Clone + 'static>(
     let mut backoff = INITIAL_BACKOFF;
 
     let mut next_batch_from_block: Option<u64> =
-        accumulator.max_to_block().map(|e| e + 1)
-            .or_else(|| db.lock().unwrap_or_else(|e| e.into_inner()).get_last_batch_end().map(|e| e + 1));
+        accumulator.max_to_block().map(|e| e + 1).or_else(|| {
+            db.lock().unwrap_or_else(|e| e.into_inner()).get_last_batch_end().map(|e| e + 1)
+        });
 
     // Check dispatched batches from previous run
     if accumulator.has_dispatched() {
@@ -474,7 +502,11 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
 
         // Ignore stale results (e.g. from orphaned tasks after reconnect)
         if block_number <= self.checkpoint {
-            warn!(block_number, checkpoint = self.checkpoint, "Ignoring stale block result (orphaned task)");
+            warn!(
+                block_number,
+                checkpoint = self.checkpoint,
+                "Ignoring stale block result (orphaned task)"
+            );
             return;
         }
 
@@ -492,7 +524,9 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
             let cp = self.checkpoint;
             if let Err(e) = tokio::task::spawn_blocking(move || {
                 db.lock().unwrap_or_else(|e| e.into_inner()).save_checkpoint(cp);
-            }).await {
+            })
+            .await
+            {
                 warn!(cp, err = %e, "save_checkpoint: spawn_blocking failed");
             }
         }
@@ -538,7 +572,9 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
                 let db = Arc::clone(&self.db);
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     db.lock().unwrap_or_else(|e| e.into_inner()).save_l1_checkpoint(l1_block);
-                }).await {
+                })
+                .await
+                {
                     warn!(l1_block, err = %e, "save_l1_checkpoint: spawn_blocking failed");
                 }
             }
@@ -632,10 +668,17 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
         let l2_provider = cfg.l2_provider.clone();
         tokio::spawn(async move {
             let outcome = sign_batch_io(
-                &cfg.http_client, &cfg.proxy_url, &cfg.api_key,
-                batch_index, from_block, to_block, responses, db,
+                &cfg.http_client,
+                &cfg.proxy_url,
+                &cfg.api_key,
+                batch_index,
+                from_block,
+                to_block,
+                responses,
+                db,
                 &l2_provider,
-            ).await;
+            )
+            .await;
             if tx.send((batch_index, outcome)).await.is_err() {
                 warn!(batch_index, "Sign done channel closed");
             }
@@ -666,12 +709,15 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
                         let mut backoff = Duration::from_secs(1);
                         const MAX_ACK_RETRIES: u32 = 10;
                         for attempt in 1..=MAX_ACK_RETRIES {
-                            match ack.acknowledge_range(
-                                witness_orchestrator::proto::AcknowledgeRangeRequest {
-                                    from_block: fb,
-                                    to_block: tb,
-                                }
-                            ).await {
+                            match ack
+                                .acknowledge_range(
+                                    witness_orchestrator::proto::AcknowledgeRangeRequest {
+                                        from_block: fb,
+                                        to_block: tb,
+                                    },
+                                )
+                                .await
+                            {
                                 Ok(_) => break,
                                 Err(e) => {
                                     if attempt == MAX_ACK_RETRIES {
@@ -721,9 +767,7 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
             if let Some(d) = delay {
                 tokio::time::sleep(d).await;
             }
-            let ok = l1_submitter::is_key_registered(&provider, verifier, addr)
-                .await
-                .unwrap_or(false);
+            let ok = is_key_registered(&provider, verifier, addr).await.unwrap_or(false);
             if tx.send((addr, ok)).await.is_err() {
                 warn!(%addr, "Key check channel closed");
             }
@@ -759,18 +803,19 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
         let tx = self.dispatch_done_tx.clone();
 
         tokio::spawn(async move {
-            let outcome = match l1_submitter::submit_preconfirmation(
-                &provider, contract, verifier, batch_index, signature,
-            ).await {
-                Ok(receipt) => DispatchOutcome::Submitted {
-                    tx_hash: receipt.tx_hash,
-                    l1_block: receipt.l1_block,
-                },
-                Err(e) => {
-                    error!(batch_index, err = %e, "preconfirmBatch failed — will retry");
-                    DispatchOutcome::Failed
-                }
-            };
+            let outcome =
+                match submit_preconfirmation(&provider, contract, verifier, batch_index, signature)
+                    .await
+                {
+                    Ok(receipt) => DispatchOutcome::Submitted {
+                        tx_hash: receipt.tx_hash,
+                        l1_block: receipt.l1_block,
+                    },
+                    Err(e) => {
+                        error!(batch_index, err = %e, "preconfirmBatch failed — will retry");
+                        DispatchOutcome::Failed
+                    }
+                };
             if tx.send((batch_index, outcome)).await.is_err() {
                 warn!(batch_index, "Dispatch done channel closed");
             }
@@ -805,9 +850,8 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
             DispatchOutcome::Failed => {
                 self.global_dispatch_attempts += 1;
                 let delay_secs = (10u64 * self.global_dispatch_attempts as u64).min(300);
-                self.global_next_dispatch_allowed = Some(
-                    tokio::time::Instant::now() + Duration::from_secs(delay_secs)
-                );
+                self.global_next_dispatch_allowed =
+                    Some(tokio::time::Instant::now() + Duration::from_secs(delay_secs));
                 warn!(
                     batch_index,
                     attempts = self.global_dispatch_attempts,
@@ -820,20 +864,20 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
 
     /// Check finalized batches and process results.
     async fn on_finalization_tick(&mut self, accumulator: &mut BatchAccumulator) {
-        let (changed, finalized_ranges) = check_finalized_batches(
-            &self.config.l1_provider, &self.db, accumulator,
-        ).await;
+        let (changed, finalized_ranges) =
+            check_finalized_batches(&self.config.l1_provider, &self.db, accumulator).await;
 
         // Safety net: acknowledge cold files for finalized batches
         for (fb, tb) in finalized_ranges {
             let mut ack = self.ack_client.clone();
             tokio::spawn(async move {
-                if let Err(e) = ack.acknowledge_range(
-                    witness_orchestrator::proto::AcknowledgeRangeRequest {
+                if let Err(e) = ack
+                    .acknowledge_range(witness_orchestrator::proto::AcknowledgeRangeRequest {
                         from_block: fb,
                         to_block: tb,
-                    }
-                ).await {
+                    })
+                    .await
+                {
                     warn!(fb, tb, err = %e, "Safety-net acknowledge_range failed");
                 }
             });
@@ -857,10 +901,7 @@ async fn check_finalized_batches<P: Provider + Clone + 'static>(
         return (false, vec![]);
     }
 
-    let finalized_block = match provider
-        .get_block_by_number(BlockNumberOrTag::Finalized)
-        .await
-    {
+    let finalized_block = match provider.get_block_by_number(BlockNumberOrTag::Finalized).await {
         Ok(Some(block)) => block.header.number,
         Ok(None) => {
             warn!("Finalized block not available from RPC");
@@ -895,7 +936,9 @@ async fn check_finalized_batches<P: Provider + Clone + 'static>(
                     let block = dispatched.to_block;
                     if let Err(e) = tokio::task::spawn_blocking(move || {
                         db.lock().unwrap_or_else(|e| e.into_inner()).save_last_batch_end(block);
-                    }).await {
+                    })
+                    .await
+                    {
                         warn!(block, err = %e, "save_last_batch_end: spawn_blocking failed");
                     }
                 }
@@ -1094,7 +1137,8 @@ async fn run_stream<P: Provider + Clone + 'static>(
                     state.on_finalization_tick(accumulator).await,
             }
         }
-    }.await;
+    }
+    .await;
 
     // Cancel the gRPC reader task for this session
     session_token.cancel();
@@ -1126,7 +1170,9 @@ async fn sign_batch_io(
         let db_check = Arc::clone(&db);
         let sig = tokio::task::spawn_blocking(move || {
             db_check.lock().unwrap_or_else(|e| e.into_inner()).get_batch_signature(batch_index)
-        }).await.unwrap_or(None);
+        })
+        .await
+        .unwrap_or(None);
         if let Some(resp) = sig {
             info!(batch_index, "Batch already signed (cached) — skipping /sign-batch-root");
             return SignOutcome::Signed { response: resp };
@@ -1139,7 +1185,7 @@ async fn sign_batch_io(
     let blobs = {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match crate::blob_builder::build_blobs_from_l2(l2_provider, from_block, to_block).await {
+            match rsp_blob_builder::build_blobs_from_l2(l2_provider, from_block, to_block).await {
                 Ok(blobs) => break blobs,
                 Err(e) => {
                     warn!(batch_index, err = %e, ?backoff, "Blob construction failed — retrying");
@@ -1155,14 +1201,27 @@ async fn sign_batch_io(
     let mut backoff = Duration::from_secs(1);
     loop {
         match call_sign_batch_root(
-            http_client, proxy_url, api_key, from_block, to_block, batch_index, &responses, &blobs,
-        ).await {
+            http_client,
+            proxy_url,
+            api_key,
+            from_block,
+            to_block,
+            batch_index,
+            &responses,
+            &blobs,
+        )
+        .await
+        {
             Ok(resp) => {
                 let db = Arc::clone(&db);
                 let resp_clone = resp.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
-                    db.lock().unwrap_or_else(|e| e.into_inner()).save_batch_signature(batch_index, &resp_clone);
-                }).await {
+                    db.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .save_batch_signature(batch_index, &resp_clone);
+                })
+                .await
+                {
                     warn!(batch_index, err = %e, "save_batch_signature: spawn_blocking failed");
                 }
                 info!(batch_index, "Batch root signed and persisted");
@@ -1207,33 +1266,28 @@ async fn call_sign_batch_root(
         "blobs": blobs,
     });
 
-    let resp = http_client
-        .post(&url)
-        .header("x-api-key", api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            use std::error::Error;
-            let kind = if e.is_connect() {
-                "connect"
-            } else if e.is_timeout() {
-                "timeout"
-            } else if e.is_request() {
-                "request"
-            } else {
-                "unknown"
-            };
-            let mut chain = format!("{e}");
-            let mut source = e.source();
-            while let Some(cause) = source {
-                chain.push_str(&format!(" → {cause}"));
-                source = cause.source();
-            }
-            SignBatchError::Other(eyre::eyre!(
-                "sign-batch-root failed ({kind}): {chain}"
-            ))
-        })?;
+    let resp =
+        http_client.post(&url).header("x-api-key", api_key).json(&body).send().await.map_err(
+            |e| {
+                use std::error::Error;
+                let kind = if e.is_connect() {
+                    "connect"
+                } else if e.is_timeout() {
+                    "timeout"
+                } else if e.is_request() {
+                    "request"
+                } else {
+                    "unknown"
+                };
+                let mut chain = format!("{e}");
+                let mut source = e.source();
+                while let Some(cause) = source {
+                    chain.push_str(&format!(" → {cause}"));
+                    source = cause.source();
+                }
+                SignBatchError::Other(eyre::eyre!("sign-batch-root failed ({kind}): {chain}"))
+            },
+        )?;
 
     let status = resp.status();
 
@@ -1251,7 +1305,9 @@ async fn call_sign_batch_root(
 
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(SignBatchError::Other(eyre::eyre!("sign-batch-root returned {status}: {text}")));
+        return Err(SignBatchError::Other(eyre::eyre!(
+            "sign-batch-root returned {status}: {text}"
+        )));
     }
 
     resp.json::<SubmitBatchResponse>()
@@ -1325,7 +1381,8 @@ async fn generate_fallback_payload<P: Provider + Clone + 'static>(
         match url::Url::parse(url_str) {
             Ok(url) => {
                 let provider = create_provider::<Ethereum>(url);
-                match executor.execute(block_number, &provider, genesis.clone(), None, false).await {
+                match executor.execute(block_number, &provider, genesis.clone(), None, false).await
+                {
                     Ok(res) => {
                         info!(block_number, "L3 fallback succeeded");
                         input = Some(res);
@@ -1343,7 +1400,10 @@ async fn generate_fallback_payload<P: Provider + Clone + 'static>(
             match url::Url::parse(url_str) {
                 Ok(url) => {
                     let provider = create_provider::<Ethereum>(url);
-                    match executor.execute(block_number, &provider, genesis.clone(), None, false).await {
+                    match executor
+                        .execute(block_number, &provider, genesis.clone(), None, false)
+                        .await
+                    {
                         Ok(res) => {
                             info!(block_number, "L4 fallback succeeded");
                             input = Some(res);

@@ -5,8 +5,8 @@ edition.workspace = true
 
 [features]
 default = ["sp1"]
-sp1 = ["rsp-host-executor/sp1", "dep:sp1-build", "rsp-client-executor/sp1"]
-nitro = ["rsp-host-executor/nitro", "rsp-client-executor/nitro"]
+sp1 = ["rsp-host-executor/sp1", "dep:sp1-build", "rsp-client-executor/sp1", "dep:sp1-sdk", "dep:sp1-core-executor", "dep:strum"]
+nitro = ["rsp-host-executor/nitro", "rsp-client-executor/nitro", "dep:cargo_metadata"]
 
 [dependencies]
 tokio.workspace = true
@@ -35,9 +35,9 @@ reth-primitives-traits.workspace = true
 revm-bytecode.workspace = true
 
 # sp1
-sp1-sdk.workspace = true
-sp1-core-executor.workspace = true
-strum = "0.27"
+sp1-sdk = { workspace = true, optional = true }
+sp1-core-executor = { workspace = true, optional = true }
+strum = { workspace = true, optional = true }
 
 
 
@@ -49,9 +49,7 @@ rsp-client-executor.workspace = true
 rsp-primitives.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-thousands = "0.2.0"
-madato = "0.7.0"
 
 [build-dependencies]
 sp1-build = { workspace = true, optional = true }
-cargo_metadata = "0.18.1"
+cargo_metadata = { version = "0.18.1", optional = true }

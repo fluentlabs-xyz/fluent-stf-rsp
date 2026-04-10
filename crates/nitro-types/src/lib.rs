@@ -17,6 +17,15 @@ pub struct EthExecutionResponse {
     pub signature: Vec<u8>,
 }
 
+/// Host-prepared KZG witness consumed by the SP1 guest. Wire-compat via
+/// bincode — proxy serializes, SP1 ELF deserializes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlobVerificationInput {
+    pub blobs: Vec<Vec<u8>>,
+    pub commitments: Vec<Vec<u8>>,
+    pub proofs: Vec<Vec<u8>>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SubmitBatchResponse {
     pub batch_root: Vec<u8>,
@@ -28,12 +37,7 @@ pub struct SubmitBatchResponse {
 pub enum EnclaveIncoming {
     Handshake { credentials: AwsCredentials },
     ExecuteBlock { input: EthClientExecutorInput },
-    SubmitBatch {
-        from: u64,
-        to: u64,
-        responses: Vec<EthExecutionResponse>,
-        blobs: Vec<Vec<u8>>,
-    },
+    SubmitBatch { from: u64, to: u64, responses: Vec<EthExecutionResponse>, blobs: Vec<Vec<u8>> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -39,9 +39,7 @@ static ATTESTATION_PROVING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 /// Try to initialize attestation config. Called from background task in main().
 /// If `on_new_attestation` already triggered init, this is a no-op.
 pub(crate) async fn init_attestation_config() {
-    match ATTESTATION_CONFIG
-        .get_or_try_init(crate::attestation::AttestationConfig::from_env)
-        .await
+    match ATTESTATION_CONFIG.get_or_try_init(crate::attestation::AttestationConfig::from_env).await
     {
         Ok(_) => info!("Attestation config ready"),
         Err(e) => info!("Attestation proving disabled: {e}"),
@@ -222,9 +220,7 @@ async fn on_new_attestation(public_key: &[u8], attestation: &[u8]) -> eyre::Resu
                 .await
             {
                 Ok(config) => {
-                    if let Err(e) =
-                        crate::attestation::prove_and_submit(config, &pk, &att).await
-                    {
+                    if let Err(e) = crate::attestation::prove_and_submit(config, &pk, &att).await {
                         tracing::error!("Background attestation proving failed: {e}");
                     }
                 }

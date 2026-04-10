@@ -3,18 +3,20 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use execute::PersistExecutionReport;
-use rsp_host_executor::{
-    build_executor, create_eth_block_execution_strategy_factory, BlockExecutor,
-    EthExecutorComponents,
-};
+use rsp_host_executor::{create_eth_block_execution_strategy_factory, EthExecutorComponents};
 use rsp_provider::create_provider;
-use sp1_sdk::env::EnvProver;
 use tracing_subscriber::{
     filter::EnvFilter, fmt, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
 };
 
+#[cfg(feature = "sp1")]
 mod execute;
+
+#[cfg(feature = "sp1")]
+use execute::PersistExecutionReport;
+
+#[cfg(feature = "sp1")]
+use rsp_host_executor::{build_executor, BlockExecutor};
 
 mod cli;
 use cli::HostArgs;
@@ -42,16 +44,7 @@ async fn main() -> eyre::Result<()> {
     // Parse the command line arguments.
     let args = HostArgs::parse();
     let block_number = args.block_number;
-    let report_path = args.report_path.clone();
     let config = args.as_config().await?;
-    let persist_execution_report = PersistExecutionReport::new(
-        config.chain.id(),
-        report_path,
-        args.precompile_tracking,
-        args.opcode_tracking,
-    );
-
-    let prover_client = Arc::new(EnvProver::new().await);
 
     let block_execution_strategy_factory =
         create_eth_block_execution_strategy_factory(&config.genesis, config.custom_beneficiary);
@@ -63,9 +56,19 @@ async fn main() -> eyre::Result<()> {
 
     #[cfg(feature = "sp1")]
     {
-        use sp1_sdk::include_elf;
+        use sp1_sdk::{env::EnvProver, include_elf};
 
-        let executor = build_executor::<EthExecutorComponents<_>, _>(
+        let report_path = args.report_path.clone();
+        let persist_execution_report = PersistExecutionReport::new(
+            config.chain.id(),
+            report_path,
+            args.precompile_tracking,
+            args.opcode_tracking,
+        );
+
+        let prover_client = Arc::new(EnvProver::new().await);
+
+        let executor = build_executor::<EthExecutorComponents<_, EnvProver>, _>(
             include_elf!("rsp-client").to_vec(),
             provider,
             block_execution_strategy_factory,
@@ -79,19 +82,21 @@ async fn main() -> eyre::Result<()> {
 
     #[cfg(feature = "nitro")]
     {
+        use rsp_host_executor::{build_executor_with_nitro, BlockExecutor};
         use std::path::PathBuf;
+
         let client_path = if let Ok(client_path) = std::env::var("NITRO_CLIENT") {
             client_path
         } else {
             "./bin/client/target/x86_64-unknown-linux-musl/release/rsp-client".to_string()
         };
 
-        let executor = build_executor_with_nitro::<EthExecutorComponents<_>, _>(
+        let executor = build_executor_with_nitro::<EthExecutorComponents<()>, _>(
             PathBuf::from(client_path),
             provider,
             block_execution_strategy_factory,
-            prover_client,
-            persist_execution_report,
+            Arc::new(()),
+            (),
             config,
         )
         .await?;

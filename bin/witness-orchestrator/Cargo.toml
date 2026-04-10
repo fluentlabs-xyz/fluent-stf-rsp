@@ -11,7 +11,6 @@ path = "src/main.rs"
 witness-orchestrator.workspace = true
 
 tokio = { workspace = true, features = ["full"] }
-tokio-stream.workspace = true
 tokio-util.workspace = true
 async-channel.workspace = true
 bincode.workspace = true
@@ -23,9 +22,8 @@ tonic.workspace = true
 tonic-prost.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-zstd.workspace = true
 bytes.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["json"] }
 url.workspace = true
 rusqlite.workspace = true
 futures.workspace = true
@@ -41,17 +39,18 @@ alloy-signer-local.workspace = true
 alloy-eips.workspace = true
 alloy-consensus.workspace = true
 
-# blob construction
-brotlic.workspace = true
-sha2 = "0.10"
-
 # workspace crates
-rsp-host-executor = { workspace = true, features = ["testnet", "sp1"] }
+rsp-blob-builder.workspace = true
+l1-rollup-client.workspace = true
+rsp-host-executor = { workspace = true, default-features = false, features = ["testnet"] }
 rsp-client-executor.workspace = true
 rsp-provider.workspace = true
 rsp-primitives = { workspace = true, features = ["testnet"] }
 reth-chainspec.workspace = true
 reth-evm.workspace = true
+
+[dev-dependencies]
+alloy-rpc-client.workspace = true
 
 [lints]
 workspace = true

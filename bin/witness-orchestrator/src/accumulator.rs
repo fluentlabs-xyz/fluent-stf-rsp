@@ -65,7 +65,9 @@ impl BatchAccumulator {
             let db = Arc::clone(db);
             if let Err(e) = tokio::task::spawn_blocking(move || {
                 f(&mut db.lock().unwrap_or_else(|e| e.into_inner()));
-            }).await {
+            })
+            .await
+            {
                 warn!(err = %e, "persist: spawn_blocking failed");
             }
         }
@@ -85,20 +87,12 @@ impl BatchAccumulator {
     /// Create accumulator backed by a DB. Loads all state from DB on construction.
     pub fn with_db(db: Arc<Mutex<Db>>) -> Self {
         let guard = db.lock().unwrap_or_else(|e| e.into_inner());
-        let responses: HashMap<u64, EthExecutionResponse> = guard
-            .load_responses()
-            .into_iter()
-            .map(|r| (r.block_number, r))
-            .collect();
-        let batches: BTreeMap<u64, PendingBatch> = guard
-            .load_batches()
-            .into_iter()
-            .map(|b| (b.batch_index, b))
-            .collect();
-        let pending_blobs_accepted: HashSet<u64> = guard
-            .load_pending_blobs_accepted()
-            .into_iter()
-            .collect();
+        let responses: HashMap<u64, EthExecutionResponse> =
+            guard.load_responses().into_iter().map(|r| (r.block_number, r)).collect();
+        let batches: BTreeMap<u64, PendingBatch> =
+            guard.load_batches().into_iter().map(|b| (b.batch_index, b)).collect();
+        let pending_blobs_accepted: HashSet<u64> =
+            guard.load_pending_blobs_accepted().into_iter().collect();
         let signatures: HashMap<u64, SubmitBatchResponse> = {
             let mut map = HashMap::new();
             for batch in batches.values() {
@@ -113,28 +107,28 @@ impl BatchAccumulator {
             .into_iter()
             .filter_map(|(bi, fb, tb, tx_hash_bytes, l1b)| {
                 let tx_hash = B256::try_from(tx_hash_bytes.as_slice()).ok().or_else(|| {
-                    error!(batch_index = bi, len = tx_hash_bytes.len(), "Corrupt tx_hash in dispatched_batches — skipping");
+                    error!(
+                        batch_index = bi,
+                        len = tx_hash_bytes.len(),
+                        "Corrupt tx_hash in dispatched_batches — skipping"
+                    );
                     None
                 })?;
-                Some((bi, DispatchedBatch {
-                    batch_index: bi,
-                    from_block: fb,
-                    to_block: tb,
-                    tx_hash,
-                    l1_block: l1b,
-                }))
+                Some((
+                    bi,
+                    DispatchedBatch {
+                        batch_index: bi,
+                        from_block: fb,
+                        to_block: tb,
+                        tx_hash,
+                        l1_block: l1b,
+                    },
+                ))
             })
             .collect();
         drop(guard);
 
-        Self {
-            batches,
-            responses,
-            pending_blobs_accepted,
-            db: Some(db),
-            signatures,
-            dispatched,
-        }
+        Self { batches, responses, pending_blobs_accepted, db: Some(db), signatures, dispatched }
     }
 
     /// Register a new batch from `BatchHeadersSubmitted` event.
@@ -145,9 +139,7 @@ impl BatchAccumulator {
             self.persist(move |db| db.delete_pending_blobs_accepted(batch_index)).await;
         }
 
-        let already = (from_block..=to_block)
-            .filter(|b| self.responses.contains_key(b))
-            .count();
+        let already = (from_block..=to_block).filter(|b| self.responses.contains_key(b)).count();
         info!(
             batch_index,
             from_block,
@@ -157,17 +149,11 @@ impl BatchAccumulator {
             blobs_already_accepted = blobs_accepted,
             "New batch registered"
         );
-        let batch = PendingBatch {
-            batch_index,
-            from_block,
-            to_block,
-            blobs_accepted,
-        };
+        let batch = PendingBatch { batch_index, from_block, to_block, blobs_accepted };
         self.persist(move |db| {
-            db.save_batch(&PendingBatch {
-                batch_index, from_block, to_block, blobs_accepted,
-            });
-        }).await;
+            db.save_batch(&PendingBatch { batch_index, from_block, to_block, blobs_accepted });
+        })
+        .await;
         self.batches.insert(batch_index, batch);
     }
 
@@ -193,15 +179,11 @@ impl BatchAccumulator {
 
     fn is_batch_ready(&self, batch: &PendingBatch) -> bool {
         batch.blobs_accepted
-            && (batch.from_block..=batch.to_block)
-                .all(|b| self.responses.contains_key(&b))
+            && (batch.from_block..=batch.to_block).all(|b| self.responses.contains_key(&b))
     }
 
     pub fn first_ready(&self) -> Option<u64> {
-        self.batches
-            .values()
-            .find(|b| self.is_batch_ready(b))
-            .map(|b| b.batch_index)
+        self.batches.values().find(|b| self.is_batch_ready(b)).map(|b| b.batch_index)
     }
 
     /// Returns the first ready batch (in BTreeMap order) that does NOT have
@@ -260,9 +242,7 @@ impl BatchAccumulator {
 
     /// Returns cloned responses for blocks in [from, to].
     pub fn get_responses(&self, from: u64, to: u64) -> Vec<EthExecutionResponse> {
-        (from..=to)
-            .filter_map(|b| self.responses.get(&b).cloned())
-            .collect()
+        (from..=to).filter_map(|b| self.responses.get(&b).cloned()).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -271,12 +251,7 @@ impl BatchAccumulator {
 
     /// Move a batch from pending to dispatched state.
     /// Removes from `batches` and `signatures`, inserts into `dispatched`.
-    pub async fn mark_dispatched(
-        &mut self,
-        batch_index: u64,
-        tx_hash: B256,
-        l1_block: u64,
-    ) {
+    pub async fn mark_dispatched(&mut self, batch_index: u64, tx_hash: B256, l1_block: u64) {
         let Some(batch) = self.batches.remove(&batch_index) else { return };
         self.signatures.remove(&batch_index);
 
@@ -461,7 +436,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("courier_test_{id}_{}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("courier_test_{id}_{}.db", std::process::id()));
         let db = Db::open(&path).unwrap();
         Arc::new(Mutex::new(db))
     }

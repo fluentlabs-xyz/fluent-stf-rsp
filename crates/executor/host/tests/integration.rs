@@ -109,9 +109,8 @@ async fn test_overlay_witness_matches_rpc() {
         .expect("RPC execute (overlay) failed");
 
     // Verify overlay input also passes client execution
-    let (overlay_header, _) = client_executor
-        .execute(overlay_input.clone())
-        .expect("Overlay client execution failed");
+    let (overlay_header, _) =
+        client_executor.execute(overlay_input.clone()).expect("Overlay client execution failed");
 
     assert_eq!(
         ref_header.state_root, overlay_header.state_root,

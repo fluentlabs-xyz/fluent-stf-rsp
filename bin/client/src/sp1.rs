@@ -18,13 +18,7 @@ use std::sync::Arc;
 use kzg_rs::{Blob, Bytes48, KzgProof, KzgSettings};
 
 use crate::blob;
-
-#[derive(serde::Deserialize)]
-pub struct BlobVerificationInput {
-    pub blobs: Vec<Vec<u8>>,
-    pub commitments: Vec<Vec<u8>>,
-    pub proofs: Vec<Vec<u8>>,
-}
+use nitro_types::BlobVerificationInput;
 
 /// O(1) Memory Data Sink for alloy_rlp.
 /// Internal buffer lives on the stack. Large slices are streamed directly to SHA256 precompile.

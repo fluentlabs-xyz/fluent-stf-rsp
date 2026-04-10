@@ -5,50 +5,19 @@
 //! - `BatchAccepted(batchIndex)` — all blobs submitted for the batch
 //!
 //! Events are sent to the orchestrator via an mpsc channel.
+//!
+//! Contract ABI + stateless decode helpers live in `l1-rollup-client`.
 
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types::{Filter, TransactionTrait};
-use alloy_sol_types::{sol, SolEvent};
+use alloy_rpc_types::Filter;
+use alloy_sol_types::SolEvent;
 use eyre::{eyre, Result};
+use l1_rollup_client::{
+    fetch_block_count_from_tx, BatchAccepted, BatchHeadersSubmitted, BatchPreconfirmed,
+};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-
-// ---------------------------------------------------------------------------
-// L1 contract ABI (minimal)
-// ---------------------------------------------------------------------------
-
-sol! {
-    /// Emitted by `acceptNextBatch` — declares a new batch with its block range.
-    event BatchHeadersSubmitted(
-        uint256 indexed batchIndex,
-        bytes32 batchRoot,
-        uint256 expectedBlobsCount
-    );
-
-    /// Emitted when all blobs for a batch have been submitted via `submitBlobs`.
-    event BatchAccepted(uint256 indexed batchIndex);
-
-    /// Emitted when `preconfirmBatch` succeeds.
-    event BatchPreconfirmed(
-        uint256 indexed batchIndex,
-        address indexed verifierContract,
-        address indexed verifier
-    );
-
-    /// L2 block header committed in `acceptNextBatch` calldata.
-    struct L2BlockHeader {
-        bytes32 previousBlockHash;
-        bytes32 blockHash;
-        bytes32 withdrawalRoot;
-        bytes32 depositRoot;
-        uint256 depositCount;
-    }
-
-    /// Function ABI for calldata decoding.
-    function acceptNextBatch(L2BlockHeader[] calldata blockHeaders, uint256 expectedBlobsCount) external;
-}
-
 
 // ---------------------------------------------------------------------------
 // Event types sent to orchestrator
@@ -69,11 +38,7 @@ pub enum L1Event {
     /// All blobs for the batch have been accepted.
     BlobsAccepted { batch_index: u64 },
     /// Batch was preconfirmed on L1 — carries the real tx_hash and l1_block.
-    Preconfirmed {
-        batch_index: u64,
-        tx_hash: B256,
-        l1_block: u64,
-    },
+    Preconfirmed { batch_index: u64, tx_hash: B256, l1_block: u64 },
     /// All events up to this L1 block have been sent.
     /// Orchestrator persists this as the L1 checkpoint.
     Checkpoint(u64),
@@ -176,10 +141,8 @@ async fn poll_once(
     from_block: u64,
     tx: &mpsc::Sender<L1Event>,
 ) -> Result<PollOutcome> {
-    let raw_latest = provider
-        .get_block_number()
-        .await
-        .map_err(|e| eyre!("Failed to get latest block: {e}"))?;
+    let raw_latest =
+        provider.get_block_number().await.map_err(|e| eyre!("Failed to get latest block: {e}"))?;
     let latest_block = raw_latest.saturating_sub(L1_SAFE_BLOCKS);
 
     if from_block > latest_block {
@@ -234,14 +197,18 @@ async fn process_page(
         if topic0 == BatchHeadersSubmitted::SIGNATURE_HASH {
             match BatchHeadersSubmitted::decode_log_data(&log.inner.data) {
                 Ok(event) => {
-                    let batch_index: u64 = event.batchIndex.try_into()
+                    let batch_index: u64 = event
+                        .batchIndex
+                        .try_into()
                         .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-                    let expected_blobs: u64 = event.expectedBlobsCount.try_into()
-                        .map_err(|_| eyre!("expectedBlobsCount overflow: {}", event.expectedBlobsCount))?;
+                    let expected_blobs: u64 =
+                        event.expectedBlobsCount.try_into().map_err(|_| {
+                            eyre!("expectedBlobsCount overflow: {}", event.expectedBlobsCount)
+                        })?;
 
-                    let num_blocks = retry_fetch_block_count(
-                        provider, log.transaction_hash, batch_index,
-                    ).await?;
+                    let num_blocks =
+                        retry_fetch_block_count(provider, log.transaction_hash, batch_index)
+                            .await?;
 
                     info!(batch_index, expected_blobs, num_blocks, "BatchHeadersSubmitted event");
 
@@ -263,7 +230,9 @@ async fn process_page(
         } else if topic0 == BatchAccepted::SIGNATURE_HASH {
             match BatchAccepted::decode_log_data(&log.inner.data) {
                 Ok(event) => {
-                    let batch_index: u64 = event.batchIndex.try_into()
+                    let batch_index: u64 = event
+                        .batchIndex
+                        .try_into()
                         .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
                     info!(batch_index, "BatchAccepted event");
                     if tx.send(L1Event::BlobsAccepted { batch_index }).await.is_err() {
@@ -275,14 +244,22 @@ async fn process_page(
         } else if topic0 == BatchPreconfirmed::SIGNATURE_HASH {
             match BatchPreconfirmed::decode_log_data(&log.inner.data) {
                 Ok(event) => {
-                    let batch_index: u64 = event.batchIndex.try_into()
+                    let batch_index: u64 = event
+                        .batchIndex
+                        .try_into()
                         .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-                    let tx_hash = log.transaction_hash
+                    let tx_hash = log
+                        .transaction_hash
                         .ok_or_else(|| eyre!("BatchPreconfirmed log missing transaction_hash"))?;
-                    let l1_block = log.block_number
+                    let l1_block = log
+                        .block_number
                         .ok_or_else(|| eyre!("BatchPreconfirmed log missing block_number"))?;
                     info!(batch_index, %tx_hash, l1_block, "BatchPreconfirmed event");
-                    if tx.send(L1Event::Preconfirmed { batch_index, tx_hash, l1_block }).await.is_err() {
+                    if tx
+                        .send(L1Event::Preconfirmed { batch_index, tx_hash, l1_block })
+                        .await
+                        .is_err()
+                    {
                         warn!(batch_index, "L1 event channel closed");
                     }
                 }
@@ -292,164 +269,4 @@ async fn process_page(
     }
 
     Ok(())
-}
-
-/// Decode `acceptNextBatch` calldata from a transaction hash.
-///
-/// Returns the decoded call struct containing all block headers.
-/// The caller decides whether to retry or abort on error.
-pub async fn decode_accept_next_batch(
-    provider: &RootProvider,
-    tx_hash: Option<B256>,
-) -> eyre::Result<acceptNextBatchCall> {
-    use alloy_sol_types::SolCall;
-
-    let hash = tx_hash.ok_or_else(|| eyre::eyre!("log has no transaction hash"))?;
-
-    let tx = provider
-        .get_transaction_by_hash(hash)
-        .await
-        .map_err(|e| eyre::eyre!("get_transaction_by_hash failed: {e}"))?
-        .ok_or_else(|| eyre::eyre!("transaction {hash} not found"))?;
-
-    let input = tx.input();
-
-    acceptNextBatchCall::abi_decode(input)
-        .map_err(|e| eyre::eyre!("Failed to decode acceptNextBatch calldata: {e}"))
-}
-
-/// Attempt to determine the number of block headers from the `acceptNextBatch`
-/// transaction calldata.
-///
-/// Returns `Err` on network failure or malformed calldata.
-/// The caller decides whether to retry or abort.
-pub async fn fetch_block_count_from_tx(
-    provider: &RootProvider,
-    tx_hash: Option<B256>,
-) -> eyre::Result<u64> {
-    Ok(decode_accept_next_batch(provider, tx_hash).await?.blockHeaders.len() as u64)
-}
-
-// ---------------------------------------------------------------------------
-// Startup: resolve L2 checkpoint from batch ID
-// ---------------------------------------------------------------------------
-
-/// Resolve the L2 starting block for a given `batch_id` by looking up the
-/// `acceptNextBatch` calldata on L1 and then querying the L2 node for the
-/// block number corresponding to `blockHeaders[0].previousBlockHash`.
-///
-/// Returns `(l2_from_block, l1_event_block)`:
-/// - `l2_from_block`: first L2 block in the batch
-/// - `l1_event_block`: L1 block containing the `BatchHeadersSubmitted` event
-pub async fn resolve_l2_start_checkpoint(
-    l1_provider: &RootProvider,
-    l2_provider: &RootProvider,
-    contract_addr: Address,
-    batch_id: u64,
-    l1_deploy_block: u64,
-) -> eyre::Result<(u64, u64)> {
-    use alloy_primitives::U256;
-
-    let latest = l1_provider
-        .get_block_number()
-        .await
-        .map_err(|e| eyre!("Failed to get latest L1 block: {e}"))?;
-
-    let batch_topic = B256::from(U256::from(batch_id));
-
-    // Find the BatchHeadersSubmitted log for the target batch.
-    // Try full-range first; fall back to paginated scan if the RPC rejects
-    // a wide block range (Infura/Alchemy cap ~10k blocks per query).
-    let log = find_batch_log(l1_provider, contract_addr, batch_topic, l1_deploy_block, latest)
-        .await?
-        .ok_or_else(|| eyre!(
-            "BatchHeadersSubmitted for batch {batch_id} not found in L1 blocks \
-             [{l1_deploy_block}..{latest}]. \
-             Ensure FLUENT_L1_DEPLOY_BLOCK is ≤ the block where batch 0 was submitted, \
-             and that L1_RPC_URL is correct."
-        ))?;
-
-    let l1_block = log
-        .block_number
-        .ok_or_else(|| eyre!("BatchHeadersSubmitted log missing block_number"))?;
-
-    let decoded = decode_accept_next_batch(l1_provider, log.transaction_hash)
-        .await
-        .map_err(|e| eyre!("Failed to decode calldata for batch {batch_id}: {e}"))?;
-
-    let num_blocks = decoded.blockHeaders.len() as u64;
-
-    // Batch 0 always starts at L2 block 1 (genesis).
-    let l2_from_block = if batch_id == 0 {
-        1
-    } else {
-        let prev_hash = decoded.blockHeaders[0].previousBlockHash;
-        let block = l2_provider
-            .get_block_by_hash(prev_hash)
-            .await
-            .map_err(|e| eyre!("L2 eth_getBlockByHash({prev_hash}) failed: {e}"))?
-            .ok_or_else(|| eyre!(
-                "L2 block with hash {prev_hash} not found — \
-                 is the L2 RPC (FLUENT_FALLBACK_LOCAL_RPC) synced?"
-            ))?;
-        block.header.number + 1
-    };
-
-    info!(
-        batch_id,
-        l2_from_block,
-        num_blocks,
-        l1_block,
-        "Resolved L2 start checkpoint from L1 calldata + L2 block lookup"
-    );
-
-    Ok((l2_from_block, l1_block))
-}
-
-/// Find the `BatchHeadersSubmitted` log for a specific batch index.
-///
-/// Tries a single full-range query first. If the RPC rejects it (rate limit
-/// or block range cap), falls back to a paginated scan with 50k-block pages.
-async fn find_batch_log(
-    provider: &RootProvider,
-    contract_addr: Address,
-    batch_topic: B256,
-    from: u64,
-    to: u64,
-) -> eyre::Result<Option<alloy_rpc_types::Log>> {
-    let make_filter = |f: u64, t: u64| {
-        Filter::new()
-            .address(contract_addr)
-            .event_signature(BatchHeadersSubmitted::SIGNATURE_HASH)
-            .topic1(batch_topic)
-            .from_block(f)
-            .to_block(t)
-    };
-
-    // Fast path: single query.
-    match provider.get_logs(&make_filter(from, to)).await {
-        Ok(logs) => return Ok(logs.into_iter().next()),
-        Err(e) => warn!(err = %e, "Full-range eth_getLogs failed — falling back to paginated scan"),
-    }
-
-    // Slow path: paginated with throttle to avoid rate limiting.
-    const PAGE: u64 = 50_000;
-    const SCAN_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
-    let mut current = from;
-    while current <= to {
-        let page_end = (current + PAGE - 1).min(to);
-        let logs = provider
-            .get_logs(&make_filter(current, page_end))
-            .await
-            .map_err(|e| eyre!("eth_getLogs [{current}..{page_end}] failed: {e}"))?;
-        if let Some(log) = logs.into_iter().next() {
-            return Ok(Some(log));
-        }
-        current = page_end + 1;
-        if current <= to {
-            tokio::time::sleep(SCAN_DELAY).await;
-        }
-    }
-
-    Ok(None)
 }

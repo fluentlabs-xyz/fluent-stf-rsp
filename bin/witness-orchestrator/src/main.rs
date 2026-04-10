@@ -38,19 +38,17 @@
 //! | `FLUENT_START_BATCH_ID`   | —  | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
 //! | `FLUENT_L1_DEPLOY_BLOCK`  | `0` | L1 block where Rollup contract was deployed — lower bound for startup scan |
 
-mod client;
 mod accumulator;
-mod blob_builder;
+mod client;
 mod db;
 mod l1_listener;
-mod l1_submitter;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+use alloy_network::EthereumWallet;
 use alloy_primitives::Address;
 use alloy_provider::{ProviderBuilder, RootProvider};
-use alloy_network::EthereumWallet;
 use alloy_signer_local::PrivateKeySigner;
 use tracing::info;
 
@@ -67,11 +65,9 @@ async fn main() {
 
     let server_addr =
         std::env::var("FLUENT_WITNESS_ADDR").unwrap_or_else(|_| DEFAULT_SERVER_ADDR.into());
-    let proxy_url =
-        std::env::var("FLUENT_PROXY_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.into());
-    let db_path = PathBuf::from(
-        std::env::var("FLUENT_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.into()),
-    );
+    let proxy_url = std::env::var("FLUENT_PROXY_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.into());
+    let db_path =
+        PathBuf::from(std::env::var("FLUENT_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.into()));
     let http_timeout_secs: u64 = std::env::var("FLUENT_HTTP_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -88,17 +84,12 @@ async fn main() {
         .expect("NITRO_VERIFIER_ADDR is required")
         .parse()
         .expect("Invalid NITRO_VERIFIER_ADDR");
-    let l1_start_block: u64 = std::env::var("L1_START_BLOCK")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let start_batch_id: Option<u64> = std::env::var("FLUENT_START_BATCH_ID")
-        .ok()
-        .and_then(|s| s.parse().ok());
-    let l1_deploy_block: u64 = std::env::var("FLUENT_L1_DEPLOY_BLOCK")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let l1_start_block: u64 =
+        std::env::var("L1_START_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let start_batch_id: Option<u64> =
+        std::env::var("FLUENT_START_BATCH_ID").ok().and_then(|s| s.parse().ok());
+    let l1_deploy_block: u64 =
+        std::env::var("FLUENT_L1_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let api_key = std::env::var("FLUENT_API_KEY").unwrap_or_default();
     let fallback_local_rpc = std::env::var("FLUENT_FALLBACK_LOCAL_RPC").ok();
     let fallback_remote_rpc = std::env::var("FLUENT_FALLBACK_REMOTE_RPC").ok();
@@ -119,28 +110,33 @@ async fn main() {
 
     // ── Startup: resolve L2 checkpoint from START_BATCH_ID ───────────────────────
     let listener_from_block: u64 = {
-        let db_startup = crate::db::Db::open(&db_path)
-            .expect("Failed to open DB for startup");
+        let db_startup = crate::db::Db::open(&db_path).expect("Failed to open DB for startup");
 
         if let Some(batch_id) = start_batch_id {
             if db_startup.get_checkpoint() == 0 {
                 let l2_rpc_url: url::Url = fallback_local_rpc
                     .as_deref()
-                    .expect("FLUENT_FALLBACK_LOCAL_RPC is required when FLUENT_START_BATCH_ID is set")
+                    .expect(
+                        "FLUENT_FALLBACK_LOCAL_RPC is required when FLUENT_START_BATCH_ID is set",
+                    )
                     .parse()
                     .expect("Invalid FLUENT_FALLBACK_LOCAL_RPC URL");
                 let l2_provider: RootProvider = rsp_provider::create_provider(l2_rpc_url);
 
-                info!(batch_id, "FLUENT_START_BATCH_ID set — resolving L2 start checkpoint from L1");
-                let (l2_from_block, l1_event_block) = l1_listener::resolve_l2_start_checkpoint(
-                    &l1_read_provider,
-                    &l2_provider,
-                    l1_contract_addr,
+                info!(
                     batch_id,
-                    l1_deploy_block,
-                )
-                .await
-                .expect("Fatal: failed to resolve L2 start checkpoint from L1");
+                    "FLUENT_START_BATCH_ID set — resolving L2 start checkpoint from L1"
+                );
+                let (l2_from_block, l1_event_block, _num_blocks) =
+                    l1_rollup_client::resolve_l2_start_checkpoint(
+                        &l1_read_provider,
+                        &l2_provider,
+                        l1_contract_addr,
+                        batch_id,
+                        l1_deploy_block,
+                    )
+                    .await
+                    .expect("Fatal: failed to resolve L2 start checkpoint from L1");
 
                 let l2_checkpoint = l2_from_block.saturating_sub(1);
                 db_startup.save_checkpoint(l2_checkpoint);
@@ -191,22 +187,13 @@ async fn main() {
     );
 
     // Build L1 provider for writing (preconfirmBatch)
-    let signer: PrivateKeySigner = l1_submitter_key
-        .parse()
-        .expect("Invalid L1_SUBMITTER_KEY");
+    let signer: PrivateKeySigner = l1_submitter_key.parse().expect("Invalid L1_SUBMITTER_KEY");
     let wallet = EthereumWallet::from(signer);
-    let l1_write_provider = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_http(l1_rpc_url_parsed);
+    let l1_write_provider = ProviderBuilder::new().wallet(wallet).connect_http(l1_rpc_url_parsed);
 
     // Start L1 event listener
     let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(l1_listener::run(
-        l1_read_provider,
-        l1_contract_addr,
-        listener_from_block,
-        l1_tx,
-    ));
+    tokio::spawn(l1_listener::run(l1_read_provider, l1_contract_addr, listener_from_block, l1_tx));
 
     // Build L2 provider for blob construction
     let l2_provider: RootProvider = {

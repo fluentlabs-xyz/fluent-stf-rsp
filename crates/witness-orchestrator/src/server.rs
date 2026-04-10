@@ -68,32 +68,36 @@ impl WitnessService for WitnessGrpcService {
             let cold_blocks = hub.cold_blocks_in_range(from_block, hot_start);
 
             for block_number in cold_blocks {
-                let Some(req) = hub.read_cold_block(block_number).await else { continue; };
-                let msg = proto::WitnessMessage {
-                    content: Some(proto::witness_message::Content::Witness(
-                        proto::WitnessData {
-                            block_number: req.block_number,
-                            data: req.payload.clone(),
-                        },
-                    )),
+                let Some(req) = hub.read_cold_block(block_number).await else {
+                    continue;
                 };
-                if tx.send(Ok(msg)).await.is_err() { return; }
+                let msg = proto::WitnessMessage {
+                    content: Some(proto::witness_message::Content::Witness(proto::WitnessData {
+                        block_number: req.block_number,
+                        data: req.payload.clone(),
+                    })),
+                };
+                if tx.send(Ok(msg)).await.is_err() {
+                    return;
+                }
                 last_sent = req.block_number;
             }
             // req dropped here — cold file data freed before reading the next file.
 
             // ── Step 3: Send pre-captured hot snapshot ────────────────────────
             for req in replay {
-                if req.block_number <= last_sent { continue; } // dedup cold/hot overlap
+                if req.block_number <= last_sent {
+                    continue;
+                } // dedup cold/hot overlap
                 let msg = proto::WitnessMessage {
-                    content: Some(proto::witness_message::Content::Witness(
-                        proto::WitnessData {
-                            block_number: req.block_number,
-                            data: req.payload.clone(),
-                        },
-                    )),
+                    content: Some(proto::witness_message::Content::Witness(proto::WitnessData {
+                        block_number: req.block_number,
+                        data: req.payload.clone(),
+                    })),
                 };
-                if tx.send(Ok(msg)).await.is_err() { return; }
+                if tx.send(Ok(msg)).await.is_err() {
+                    return;
+                }
                 last_sent = req.block_number;
             }
 
@@ -120,7 +124,11 @@ impl WitnessService for WitnessGrpcService {
                         last_sent = req.block_number;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(skipped = n, last_sent, "Courier subscriber lagged — terminating stream to force cold replay");
+                        warn!(
+                            skipped = n,
+                            last_sent,
+                            "Courier subscriber lagged — terminating stream to force cold replay"
+                        );
                         return; // closes the gRPC stream; courier reconnects from checkpoint
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -150,10 +158,7 @@ impl WitnessService for WitnessGrpcService {
                 data: req.payload.clone(),
                 found: true,
             })),
-            None => Ok(Response::new(proto::GetWitnessResponse {
-                data: vec![],
-                found: false,
-            })),
+            None => Ok(Response::new(proto::GetWitnessResponse { data: vec![], found: false })),
         }
     }
 

@@ -76,7 +76,11 @@ mod tests {
 
         let input = result.unwrap();
         println!("pcr0 (len={}): {:?}", input.pcr0.len(), input.pcr0);
-        println!("cose_signature (len={}): {:?}", input.cose_signature.len(), &input.cose_signature[..8]);
+        println!(
+            "cose_signature (len={}): {:?}",
+            input.cose_signature.len(),
+            &input.cose_signature[..8]
+        );
         println!("user_data (len={}): {:?}", input.user_data.len(), &input.user_data[..4]);
         assert!(!input.chain.is_empty(), "certificate chain should not be empty");
         assert!(!input.sig_structure.is_empty(), "sig_structure should not be empty");

@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = ["sp1", "testnet"]
-sp1 = []
+sp1 = ["dep:sp1-sdk"]
 alerting = ["dep:reqwest"]
 execution-witness = [
     "rsp-mpt/execution-witness",
@@ -21,6 +21,10 @@ execution-witness = [
 nitro = [
     "dep:vsock",
     "dep:anyhow",
+    "dep:hex",
+    "dep:nitro-types",
+    "rsp-client-executor/nitro",
+    "tokio/process",
 ]
 testnet = ["rsp-primitives/testnet"]
 devnet = ["rsp-primitives/devnet"]
@@ -30,16 +34,16 @@ tokio = { workspace = true, features = ["time", "rt"] }
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 url.workspace = true
 eyre.workspace = true
 bincode.workspace = true
 either.workspace = true
-hex.workspace = true
+hex = { workspace = true, optional = true }
 
 reqwest = { workspace = true, features = ["json"], optional = true }
 vsock = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
+nitro-types = { workspace = true, optional = true }
 
 # workspace crates
 rsp-rpc-db.workspace = true
@@ -48,7 +52,7 @@ rsp-mpt.workspace = true
 rsp-primitives = { workspace = true }
 
 # sp1
-sp1-sdk.workspace = true
+sp1-sdk = { workspace = true, optional = true }
 
 # reth
 reth-evm.workspace = true

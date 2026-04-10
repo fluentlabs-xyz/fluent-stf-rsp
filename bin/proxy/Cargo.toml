@@ -20,15 +20,17 @@ tracing-subscriber.workspace = true
 eyre.workspace = true
 url.workspace = true
 bincode.workspace = true
-sha2 = "0.10.9"  # direct dep, not going through workspace patch
+sha2 = "0.10"
 axum.workspace = true
 vsock.workspace = true
 
 # workspace crates
 rsp-provider.workspace = true
-rsp-host-executor = { workspace = true, features = ["sp1"] }
+rsp-host-executor = { workspace = true, default-features = false, features = ["devnet"] }
 rsp-primitives = { workspace = true, default-features = false, features=["devnet"] }
 rsp-client-executor.workspace = true
+rsp-blob-builder.workspace = true
+l1-rollup-client.workspace = true
 nitro-types.workspace = true
 
 # alloy
@@ -36,7 +38,6 @@ alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types.workspace = true
 alloy-sol-types.workspace = true
-alloy-signer = "1.8.1"
 alloy-signer-local = "1.8.1"
 alloy-network.workspace = true
 revm-primitives.workspace = true

@@ -1,88 +1,102 @@
-//! Build EIP-4844 blobs from raw data with KZG commitments and proofs.
+//! Build EIP-4844 blobs from L2 block transactions fetched via RPC.
 //!
-//! Used by the e2e test driver to populate the fake beacon with blob sidecars
-//! that the proxy can fetch via `blob::fetch_blobs_for_batch`.
+//! Pipeline: fetch blocks → encode payload → brotli compress → canonicalize.
 //!
-//! Canonical encoding (matches `bin/client/src/nitro/mod.rs::decanonicalize`):
-//!   raw bytes → split into 31-byte chunks
-//!   each chunk → `[0x00, chunk[0..31]]` (32 bytes, high byte is always 0x00)
-//!   last chunk → zero-padded to 31 bytes before prefixing
+//! Uses `brotlic` (C reference libbrotli) for byte-identity with the Go
+//! sequencer. The pure-Rust `brotli` crate produces different output on real
+//! transaction data and would break the SP1 verifier's versioned-hash check.
 
-use alloy_primitives::B256;
-use c_kzg::{Blob, KzgSettings, BYTES_PER_BLOB};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_provider::{Provider, RootProvider};
+use brotlic::{BrotliEncoderOptions, CompressorWriter, Quality, WindowSize};
 use eyre::{eyre, Result};
-use sha2::{Digest, Sha256};
-use std::io::Cursor;
-use std::sync::LazyLock;
+use std::io::Write;
+use tracing::info;
 
-// ---------------------------------------------------------------------------
-// KZG trusted setup
-// ---------------------------------------------------------------------------
+/// EIP-4844 blob size: 4096 field elements × 32 bytes = 131072 bytes.
+const BYTES_PER_BLOB: usize = 131_072;
 
-const TRUSTED_SETUP_BYTES: &[u8] = include_bytes!("../../../bin/client/trusted_setup.txt");
-
-static KZG_SETTINGS: LazyLock<KzgSettings> = LazyLock::new(|| {
-    let setup_str =
-        std::str::from_utf8(TRUSTED_SETUP_BYTES).expect("trusted setup is not valid UTF-8");
-    KzgSettings::parse_kzg_trusted_setup(setup_str, 0).expect("failed to load KZG trusted setup")
-});
-
-// ---------------------------------------------------------------------------
-// Encoding constants (must match mod.rs)
-// ---------------------------------------------------------------------------
-
-/// Usable raw bytes per field element (one byte reserved for the 0x00 high byte).
 const BYTES_PER_FIELD_ELEMENT: usize = 31;
 const FIELD_ELEMENTS_PER_BLOB: usize = BYTES_PER_BLOB / 32;
-/// Maximum raw (uncanonicalised) bytes that fit in one blob.
-pub const MAX_RAW_BYTES_PER_BLOB: usize = FIELD_ELEMENTS_PER_BLOB * BYTES_PER_FIELD_ELEMENT;
+const MAX_RAW_BYTES_PER_BLOB: usize = FIELD_ELEMENTS_PER_BLOB * BYTES_PER_FIELD_ELEMENT;
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/// A fully built blob with its KZG commitment, proof, and versioned hash.
-#[derive(Clone, Debug)]
-pub struct BuiltBlob {
-    /// Canonical blob bytes (131072 bytes).
-    pub blob: Vec<u8>,
-    /// KZG commitment (48 bytes).
-    pub commitment: Vec<u8>,
-    /// KZG proof (48 bytes).
-    pub proof: Vec<u8>,
-    /// EIP-4844 versioned hash: `0x01 || SHA256(commitment)[1..]`.
-    pub versioned_hash: B256,
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Build blobs from per-block raw transaction data.
+/// Fetch L2 blocks and build canonical EIP-4844 blobs.
 ///
-/// `from_block`: block number of the first block in the batch.
-/// `tx_data_per_block`: EIP-2718 encoded transactions concatenated per block.
-///
-/// Returns one or more `BuiltBlob`s (payload split across blobs if needed).
-pub fn build_blobs_from_blocks(
+/// Returns `Vec<Vec<u8>>` where each inner Vec is exactly BYTES_PER_BLOB (131072) bytes.
+pub async fn build_blobs_from_l2(
+    provider: &RootProvider,
     from_block: u64,
-    tx_data_per_block: &[Vec<u8>],
-) -> Result<Vec<BuiltBlob>> {
-    let payload = encode_blob_payload(from_block, tx_data_per_block);
+    to_block: u64,
+) -> Result<Vec<Vec<u8>>> {
+    let tx_data_per_block = fetch_tx_data_batched(provider, from_block, to_block).await?;
+    let payload = encode_blob_payload(from_block, &tx_data_per_block);
     let compressed = brotli_compress(&payload)?;
+
+    info!(
+        from_block,
+        to_block,
+        raw_size = payload.len(),
+        compressed_size = compressed.len(),
+        "Blob payload compressed"
+    );
+
     if compressed.is_empty() {
-        return build_blob(&[0u8]).map(|b| vec![b]);
+        return build_single_blob(&[0u8][..]).map(|b| vec![b]);
     }
-    compressed.chunks(MAX_RAW_BYTES_PER_BLOB).map(build_blob).collect()
+
+    compressed.chunks(MAX_RAW_BYTES_PER_BLOB).map(build_single_blob).collect()
 }
 
-/// Encode per-block transaction data into the canonical blob payload format.
+/// Fetch raw EIP-2718 tx data for a range of blocks using concurrent batching.
 ///
-/// Layout (all big-endian):
-///   `from_block (8)` | `to_block (8)` | `num_blocks (4)`
-///   | `tx_len[0] (4)` | … | `tx_len[N-1] (4)`
-///   | `tx_data[0]` | … | `tx_data[N-1]`
-pub fn encode_blob_payload(from_block: u64, tx_data_per_block: &[Vec<u8>]) -> Vec<u8> {
+/// Returns one `Vec<u8>` per block: all transactions concatenated in block body order.
+async fn fetch_tx_data_batched(
+    provider: &RootProvider,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<Vec<u8>>> {
+    let mut result = Vec::with_capacity((to_block - from_block + 1) as usize);
+
+    const BATCH_SIZE: u64 = 100;
+    let mut current = from_block;
+
+    while current <= to_block {
+        let batch_end = (current + BATCH_SIZE - 1).min(to_block);
+
+        let futs: Vec<_> = (current..=batch_end)
+            .map(|bn| {
+                let provider = provider.clone();
+                async move {
+                    let block = provider
+                        .get_block_by_number(bn.into())
+                        .full()
+                        .await
+                        .map_err(|e| eyre!("get_block_by_number({bn}) failed: {e}"))?
+                        .ok_or_else(|| eyre!("L2 block {bn} not found"))?;
+
+                    let mut tx_data = Vec::new();
+                    for tx in block.transactions.txns() {
+                        tx_data.extend_from_slice(&tx.inner.encoded_2718());
+                    }
+                    Ok::<(u64, Vec<u8>), eyre::Report>((bn, tx_data))
+                }
+            })
+            .collect();
+
+        let results = futures::future::try_join_all(futs).await?;
+
+        for (_bn, tx_data) in results {
+            result.push(tx_data);
+        }
+
+        current = batch_end + 1;
+    }
+
+    Ok(result)
+}
+
+/// Encode per-block tx data into the blob payload format (before compression).
+fn encode_blob_payload(from_block: u64, tx_data_per_block: &[Vec<u8>]) -> Vec<u8> {
     let num_blocks = tx_data_per_block.len() as u32;
     let to_block = from_block + num_blocks as u64 - 1;
 
@@ -99,75 +113,48 @@ pub fn encode_blob_payload(from_block: u64, tx_data_per_block: &[Vec<u8>]) -> Ve
     payload
 }
 
-/// Build a single blob from at most `MAX_RAW_BYTES_PER_BLOB` raw bytes.
-pub fn build_blob(raw: &[u8]) -> Result<BuiltBlob> {
+/// Brotli compress via C reference libbrotli (quality=6, lgwin=22, mode=Generic).
+///
+/// Uses `brotlic` which compiles the C reference libbrotli from source, guaranteeing
+/// byte-identical output with the Go sequencer (andybalholm/brotli is a c2go
+/// translation of the same C reference). The pure-Rust brotli crate produces
+/// different output on real transaction data.
+fn brotli_compress(data: &[u8]) -> Result<Vec<u8>> {
+    let encoder = BrotliEncoderOptions::new()
+        .quality(Quality::new(6).map_err(|e| eyre!("invalid quality: {e}"))?)
+        .window_size(WindowSize::new(22).map_err(|e| eyre!("invalid window size: {e}"))?)
+        .build()
+        .map_err(|e| eyre!("encoder build failed: {e}"))?;
+
+    let mut writer = CompressorWriter::with_encoder(encoder, Vec::new());
+    writer.write_all(data).map_err(|e| eyre!("brotli compress failed: {e}"))?;
+    let compressed = writer.into_inner().map_err(|e| eyre!("brotli finalize failed: {e}"))?;
+    Ok(compressed)
+}
+
+/// Canonicalize raw bytes and build a blob buffer.
+fn build_single_blob(raw: &[u8]) -> Result<Vec<u8>> {
     if raw.len() > MAX_RAW_BYTES_PER_BLOB {
         return Err(eyre!(
             "data ({} bytes) exceeds blob capacity ({MAX_RAW_BYTES_PER_BLOB})",
             raw.len()
         ));
     }
-
-    let blob_bytes: [u8; BYTES_PER_BLOB] = canonicalize(raw).try_into().unwrap();
-    let blob = Blob::new(blob_bytes);
-
-    let commitment = KZG_SETTINGS
-        .blob_to_kzg_commitment(&blob)
-        .map_err(|e| eyre!("KZG commitment failed: {e}"))?;
-
-    let commitment_bytes = commitment.to_bytes();
-
-    let proof = KZG_SETTINGS
-        .compute_blob_kzg_proof(&blob, &commitment_bytes)
-        .map_err(|e| eyre!("KZG proof failed: {e}"))?;
-
-    let versioned_hash = versioned_hash_from_commitment(commitment_bytes.as_ref());
-
-    Ok(BuiltBlob {
-        blob: blob_bytes.to_vec(),
-        commitment: commitment_bytes.to_vec(),
-        proof: proof.to_bytes().to_vec(),
-        versioned_hash,
-    })
+    Ok(canonicalize(raw))
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Brotli compress with quality=6 to match production Go sequencer.
-fn brotli_compress(data: &[u8]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    let params = brotli::enc::BrotliEncoderParams { quality: 6, ..Default::default() };
-    brotli::BrotliCompress(&mut Cursor::new(data), &mut output, &params)
-        .map_err(|e| eyre!("brotli compression failed: {e}"))?;
-    Ok(output)
-}
-
-/// Canonicalise `raw` bytes into a full `BYTES_PER_BLOB`-length buffer.
-///
-/// Each 32-byte field element has `0x00` as its high byte followed by 31 raw bytes.
-/// This matches what `mod.rs::decanonicalize` expects.
+/// Canonicalize raw bytes into BYTES_PER_BLOB-length buffer.
+/// Each 32-byte field element: [0x00, raw[0..31]].
 fn canonicalize(raw: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; BYTES_PER_BLOB];
     let mut src_off = 0;
     let mut dst_off = 0;
     while src_off < raw.len() {
-        // dst_off is the 0x00 high byte — already zeroed; skip it.
-        dst_off += 1;
+        dst_off += 1; // skip 0x00 high byte
         let take = BYTES_PER_FIELD_ELEMENT.min(raw.len() - src_off);
         out[dst_off..dst_off + take].copy_from_slice(&raw[src_off..src_off + take]);
         src_off += take;
         dst_off += BYTES_PER_FIELD_ELEMENT;
     }
     out
-}
-
-/// EIP-4844 versioned hash: `0x01 || SHA256(commitment)[1..]`.
-fn versioned_hash_from_commitment(commitment: &[u8]) -> B256 {
-    let hash = Sha256::digest(commitment);
-    let mut h = B256::default();
-    h[0] = 0x01;
-    h[1..].copy_from_slice(&hash[1..]);
-    h
 }

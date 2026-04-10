@@ -129,44 +129,6 @@ RUN cp /app/target/release/proxy /app/proxy
 
 ###############################################################################
 #                                                                             #
-#                           Fake Beacon Builder                               #
-#                                                                             #
-###############################################################################
-FROM builder as fake-beacon-builder
-
-COPY . .
-RUN cargo build --profile release --locked --bin fake-beacon
-
-RUN cp /app/target/release/fake-beacon /app/fake-beacon
-
-###############################################################################
-#                                                                             #
-#                        MockRollup Deployer Builder                         #
-#                                                                             #
-###############################################################################
-FROM builder as mock-rollup-deployer-builder
-
-COPY . .
-RUN cargo build --profile release --locked --bin deploy-mock-rollup
-
-RUN cp /app/target/release/deploy-mock-rollup /app/deploy-mock-rollup
-
-###############################################################################
-#                                                                             #
-#                        MockRollup Deployer Runtime                         #
-#                                                                             #
-###############################################################################
-FROM ubuntu AS rsp-mock-rollup-deployer
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-
-COPY --from=mock-rollup-deployer-builder /app/deploy-mock-rollup /usr/local/bin
-
-ENTRYPOINT ["/usr/local/bin/deploy-mock-rollup"]
-
-###############################################################################
-#                                                                             #
 #                              Proxy Runtime                                  #
 #                                                                             #
 ###############################################################################
@@ -178,27 +140,3 @@ RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib
 COPY --from=proxy-builder /app/proxy /usr/local/bin
 
 ENTRYPOINT ["/usr/local/bin/proxy"]
-
-###############################################################################
-#                                                                             #
-#                          Fake Beacon Runtime                                #
-#                                                                             #
-###############################################################################
-FROM ubuntu AS rsp-fake-beacon
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
-
-COPY --from=fake-beacon-builder /app/fake-beacon /usr/local/bin
-
-ENTRYPOINT ["/usr/local/bin/fake-beacon"]
-
-###############################################################################
-#                                                                             #
-#                           E2E Driver Runtime                                #
-#                                                                             #
-###############################################################################
-FROM builder AS rsp-e2e-driver
-COPY . .
-RUN cargo test --no-run -p e2e-tests --test full_pipeline
-CMD ["cargo", "test", "-p", "e2e-tests", "--test", "full_pipeline", "--", "--nocapture"]

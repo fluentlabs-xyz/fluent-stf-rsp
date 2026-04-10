@@ -1,12 +1,14 @@
 // @generated — do not edit manually
 #![allow(clippy::all)]
-use alloy_primitives::{address, b256, U256, Bytes, Address, Bloom};
-use alloy_genesis::{Genesis, GenesisAccount, ChainConfig};
+use alloy_genesis::{ChainConfig, Genesis, GenesisAccount};
+use alloy_primitives::{address, b256, Address, Bloom, Bytes, U256};
+use reth_chainspec::{
+    BaseFeeParams, BaseFeeParamsKind, ChainHardforks, ChainSpec, EthereumHardfork, ForkCondition,
+    Hardfork,
+};
 use reth_primitives_traits::Header;
-use reth_chainspec::{ChainSpec, ChainHardforks, EthereumHardfork, ForkCondition, BaseFeeParamsKind, BaseFeeParams, Hardfork};
 use reth_primitives_traits::SealedHeader;
 use std::collections::BTreeMap;
-
 
 pub fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardforks {
     ChainHardforks::new(vec![
@@ -43,36 +45,393 @@ mod default_genesis {
 
     pub fn genesis_alloc() -> [(Address, GenesisAccount); ALLOC_LEN] {
         [
-            (address!("0000000000000000000000000000000000000001"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000001.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000002"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000002.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000003"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000003.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000004"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000004.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000005"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000005.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000006"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000006.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000007"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000007.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000008"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000008.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000009"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000009.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000a"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000a.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000b"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000b.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000c"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000c.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000d"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000d.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000e"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000e.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000f"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000f.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000010"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000010.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000011"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000011.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000100"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000100.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520001"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520001.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520005"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520005.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520006"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520006.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520007"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520007.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520008"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520008.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520009"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520009.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520010"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520010.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520fee"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520fee.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000f90827f1c53a10cb7a02335b175320002935"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000f90827f1c53a10cb7a02335b175320002935.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("3fab184622dc19b6109349b94811493bf2a45362"), GenesisAccount { balance: U256::ZERO, code: None, nonce: Some(1u64), storage: None, private_key: None }),
-            (address!("482582979c9125abab5a06f0e196e8f4015bf77a"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,138,199,35,4,137,232,0,0]), code: None, nonce: None, storage: None, private_key: None }),
-            (address!("4e59b44847b379578588920ca78fbf26c0b4956c"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_4e59b44847b379578588920ca78fbf26c0b4956c.bin")))), nonce: None, storage: None, private_key: None }),
+            (
+                address!("0000000000000000000000000000000000000001"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000001.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000002"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000002.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000003"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000003.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000004"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000004.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000005"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000005.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000006"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000006.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000007"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000007.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000008"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000008.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000009"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000009.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000a"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000a.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000b"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000b.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000c"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000c.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000d"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000d.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000e"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000e.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000f"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000f.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000010"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000010.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000011"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000011.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000100"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000100.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520001"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520001.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520005"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520005.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520006"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520006.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520007"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520007.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520008"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520008.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520009"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520009.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520010"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520010.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520fee"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520fee.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000f90827f1c53a10cb7a02335b175320002935"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000f90827f1c53a10cb7a02335b175320002935.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("3fab184622dc19b6109349b94811493bf2a45362"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: None,
+                    nonce: Some(1u64),
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("482582979c9125abab5a06f0e196e8f4015bf77a"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        138, 199, 35, 4, 137, 232, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("4e59b44847b379578588920ca78fbf26c0b4956c"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_4e59b44847b379578588920ca78fbf26c0b4956c.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
         ]
     }
 
@@ -126,8 +485,12 @@ mod default_genesis {
             ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
             beneficiary: address!("0000000000000000000000000000000000000000"),
             state_root: b256!("614bdcf9de0237ffb767340a0cd7621ecad7ee067be0d2081facc3beee71339c"),
-            transactions_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
-            receipts_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+            transactions_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
+            receipts_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
             logs_bloom: Bloom::ZERO,
             difficulty: U256::ZERO,
             number: 0u64,
@@ -138,11 +501,17 @@ mod default_genesis {
             mix_hash: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
             nonce: 0x0000000000000000u64.into(),
             base_fee_per_gas: Some(1000000000u64),
-            withdrawals_root: Some(b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")),
+            withdrawals_root: Some(b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            )),
             blob_gas_used: Some(0u64),
             excess_blob_gas: Some(0u64),
-            parent_beacon_block_root: Some(b256!("0000000000000000000000000000000000000000000000000000000000000000")),
-            requests_hash: Some(b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")),
+            parent_beacon_block_root: Some(b256!(
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )),
+            requests_hash: Some(b256!(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )),
         }
     }
 
@@ -173,37 +542,409 @@ mod testnet_genesis {
 
     pub fn genesis_alloc() -> [(Address, GenesisAccount); ALLOC_LEN] {
         [
-            (address!("0000000000000000000000000000000000000001"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000001.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000002"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000002.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000003"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000003.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000004"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000004.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000005"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000005.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000006"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000006.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000007"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000007.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000008"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000008.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000009"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000009.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000a"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000a.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000b"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000b.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000c"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000c.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000d"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000d.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000e"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000e.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000f"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000f.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000010"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000010.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000011"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000011.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000005202"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000005202.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520001"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520001.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520005"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520005.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520006"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520006.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520007"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520007.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520008"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520008.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520009"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520009.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000f90827f1c53a10cb7a02335b175320002935"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000f90827f1c53a10cb7a02335b175320002935.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("33a831e42b24d19bf57df73682b9a3780a0435ba"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,12,159,44,156,208,70,116,237,234,64,0,0,0]), code: None, nonce: None, storage: None, private_key: None }),
-            (address!("390a4cedbb65be7511d9e1a35b115376f39dbdf3"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,12,159,44,156,208,70,116,237,234,64,0,0,0]), code: None, nonce: None, storage: None, private_key: None }),
-            (address!("52206e61746976650000000000000000ac9650d8"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_52206e61746976650000000000000000ac9650d8.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("b72988b6ddc94e577e98c5565e0e11e688537e73"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,12,159,44,156,208,70,116,237,234,64,0,0,0]), code: None, nonce: None, storage: None, private_key: None }),
-            (address!("c1202e7d42655f23097476f6d48006fe56d38d4f"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,12,159,44,156,208,70,116,237,234,64,0,0,0]), code: None, nonce: None, storage: None, private_key: None }),
-            (address!("e92c16763ba7f73a2218a5416aaa493a1f038bef"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,12,159,44,156,208,70,116,237,234,64,0,0,0]), code: None, nonce: None, storage: None, private_key: None }),
+            (
+                address!("0000000000000000000000000000000000000001"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000001.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000002"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000002.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000003"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000003.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000004"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000004.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000005"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000005.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000006"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000006.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000007"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000007.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000008"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000008.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000009"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000009.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000a"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000a.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000b"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000b.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000c"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000c.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000d"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000d.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000e"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000e.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000f"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000f.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000010"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000010.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000011"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000011.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000005202"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000005202.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520001"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520001.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520005"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520005.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520006"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520006.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520007"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520007.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520008"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520008.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520009"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520009.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000f90827f1c53a10cb7a02335b175320002935"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000f90827f1c53a10cb7a02335b175320002935.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("33a831e42b24d19bf57df73682b9a3780a0435ba"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 159, 44, 156,
+                        208, 70, 116, 237, 234, 64, 0, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("390a4cedbb65be7511d9e1a35b115376f39dbdf3"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 159, 44, 156,
+                        208, 70, 116, 237, 234, 64, 0, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("52206e61746976650000000000000000ac9650d8"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_52206e61746976650000000000000000ac9650d8.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("b72988b6ddc94e577e98c5565e0e11e688537e73"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 159, 44, 156,
+                        208, 70, 116, 237, 234, 64, 0, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("c1202e7d42655f23097476f6d48006fe56d38d4f"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 159, 44, 156,
+                        208, 70, 116, 237, 234, 64, 0, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("e92c16763ba7f73a2218a5416aaa493a1f038bef"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 159, 44, 156,
+                        208, 70, 116, 237, 234, 64, 0, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
         ]
     }
 
@@ -257,8 +998,12 @@ mod testnet_genesis {
             ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
             beneficiary: address!("0000000000000000000000000000000000000000"),
             state_root: b256!("ae371f85d48ef3213ceb5739ec3b3a4f9c3cbfcbfd83dad8c83a4f53e862644a"),
-            transactions_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
-            receipts_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+            transactions_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
+            receipts_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
             logs_bloom: Bloom::ZERO,
             difficulty: U256::ZERO,
             number: 0u64,
@@ -269,11 +1014,17 @@ mod testnet_genesis {
             mix_hash: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
             nonce: 0x0000000000000000u64.into(),
             base_fee_per_gas: Some(1000000000u64),
-            withdrawals_root: Some(b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")),
+            withdrawals_root: Some(b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            )),
             blob_gas_used: Some(0u64),
             excess_blob_gas: Some(0u64),
-            parent_beacon_block_root: Some(b256!("0000000000000000000000000000000000000000000000000000000000000000")),
-            requests_hash: Some(b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")),
+            parent_beacon_block_root: Some(b256!(
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )),
+            requests_hash: Some(b256!(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )),
         }
     }
 
@@ -304,39 +1055,432 @@ mod devnet_genesis {
 
     pub fn genesis_alloc() -> [(Address, GenesisAccount); ALLOC_LEN] {
         [
-            (address!("0000000000000000000000000000000000000001"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000001.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000002"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000002.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000003"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000003.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000004"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000004.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000005"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000005.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000006"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000006.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000007"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000007.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000008"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000008.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000009"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000009.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000a"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000a.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000b"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000b.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000c"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000c.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000d"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000d.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000e"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000e.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("000000000000000000000000000000000000000f"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000f.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000010"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000010.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000011"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000011.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000000100"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000100.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520001"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520001.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520005"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520005.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520006"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520006.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520007"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520007.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520008"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520008.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520009"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520009.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520010"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520010.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000000000000000000000000000000000520fee"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520fee.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("0000f90827f1c53a10cb7a02335b175320002935"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_0000f90827f1c53a10cb7a02335b175320002935.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("33a831e42b24d19bf57df73682b9a3780a0435ba"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,12,159,44,156,208,70,116,237,234,64,0,0,0]), code: None, nonce: None, storage: None, private_key: None }),
-            (address!("390a4cedbb65be7511d9e1a35b115376f39dbdf3"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,12,159,44,156,208,70,116,237,234,64,0,0,0]), code: None, nonce: None, storage: None, private_key: None }),
-            (address!("3fab184622dc19b6109349b94811493bf2a45362"), GenesisAccount { balance: U256::ZERO, code: None, nonce: Some(1u64), storage: None, private_key: None }),
-            (address!("482582979c9125abab5a06f0e196e8f4015bf77a"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,138,199,35,4,137,232,0,0]), code: None, nonce: None, storage: None, private_key: None }),
-            (address!("4e59b44847b379578588920ca78fbf26c0b4956c"), GenesisAccount { balance: U256::ZERO, code: Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/code_4e59b44847b379578588920ca78fbf26c0b4956c.bin")))), nonce: None, storage: None, private_key: None }),
-            (address!("b72988b6ddc94e577e98c5565e0e11e688537e73"), GenesisAccount { balance: U256::from_be_bytes([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,12,159,44,156,208,70,116,237,234,64,0,0,0]), code: None, nonce: None, storage: None, private_key: None }),
+            (
+                address!("0000000000000000000000000000000000000001"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000001.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000002"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000002.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000003"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000003.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000004"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000004.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000005"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000005.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000006"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000006.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000007"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000007.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000008"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000008.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000009"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000009.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000a"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000a.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000b"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000b.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000c"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000c.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000d"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000d.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000e"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000e.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("000000000000000000000000000000000000000f"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_000000000000000000000000000000000000000f.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000010"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000010.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000011"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000011.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000000100"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000000100.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520001"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520001.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520005"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520005.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520006"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520006.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520007"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520007.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520008"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520008.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520009"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520009.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520010"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520010.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000000000000000000000000000000000520fee"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000000000000000000000000000000000520fee.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("0000f90827f1c53a10cb7a02335b175320002935"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_0000f90827f1c53a10cb7a02335b175320002935.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("33a831e42b24d19bf57df73682b9a3780a0435ba"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 159, 44, 156,
+                        208, 70, 116, 237, 234, 64, 0, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("390a4cedbb65be7511d9e1a35b115376f39dbdf3"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 159, 44, 156,
+                        208, 70, 116, 237, 234, 64, 0, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("3fab184622dc19b6109349b94811493bf2a45362"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: None,
+                    nonce: Some(1u64),
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("482582979c9125abab5a06f0e196e8f4015bf77a"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        138, 199, 35, 4, 137, 232, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("4e59b44847b379578588920ca78fbf26c0b4956c"),
+                GenesisAccount {
+                    balance: U256::ZERO,
+                    code: Some(Bytes::from_static(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/fluent_genesis_bin/code_4e59b44847b379578588920ca78fbf26c0b4956c.bin"
+                    )))),
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                address!("b72988b6ddc94e577e98c5565e0e11e688537e73"),
+                GenesisAccount {
+                    balance: U256::from_be_bytes([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 159, 44, 156,
+                        208, 70, 116, 237, 234, 64, 0, 0, 0,
+                    ]),
+                    code: None,
+                    nonce: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
         ]
     }
 
@@ -390,8 +1534,12 @@ mod devnet_genesis {
             ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
             beneficiary: address!("0000000000000000000000000000000000000000"),
             state_root: b256!("c87ad389ac346e92793b61e64ccf9b4a43f03cd375a9daa7d50d178b0b5b3505"),
-            transactions_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
-            receipts_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+            transactions_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
+            receipts_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
             logs_bloom: Bloom::ZERO,
             difficulty: U256::ZERO,
             number: 0u64,
@@ -402,11 +1550,17 @@ mod devnet_genesis {
             mix_hash: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
             nonce: 0x0000000000000000u64.into(),
             base_fee_per_gas: Some(1000000000u64),
-            withdrawals_root: Some(b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")),
+            withdrawals_root: Some(b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            )),
             blob_gas_used: Some(0u64),
             excess_blob_gas: Some(0u64),
-            parent_beacon_block_root: Some(b256!("0000000000000000000000000000000000000000000000000000000000000000")),
-            requests_hash: Some(b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")),
+            parent_beacon_block_root: Some(b256!(
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )),
+            requests_hash: Some(b256!(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )),
         }
     }
 
@@ -428,4 +1582,3 @@ mod devnet_genesis {
 
 #[cfg(all(feature = "devnet", not(any(feature = "testnet"))))]
 pub use devnet_genesis::*;
-

@@ -9,8 +9,8 @@ members = [
     "crates/provider",
     "crates/storage/rpc-db",
     "crates/storage/witness-db","crates/nitro-types",
-    "crates/e2e-tests",
     "crates/blob-builder",
+    "crates/l1-rollup-client",
     "crates/witness-orchestrator",
     "bin/witness-orchestrator",
 ]
@@ -58,7 +58,7 @@ bincode = "1.3.3"
 either = "1.13.0"
 clap = { version = "4.5.7", features = ["derive", "env"] }
 dotenv = "0.15.0"
-strum = "0.26"
+strum = "0.27"
 csv = "1.1"
 axum = "0.8.8"
 zstd = "0.13"
@@ -90,6 +90,7 @@ bytes = "1.10.1"
 
 # --- workspace crates ---
 rsp-blob-builder = { path = "./crates/blob-builder" }
+l1-rollup-client = { path = "./crates/l1-rollup-client" }
 rsp-rpc-db = { path = "./crates/storage/rpc-db" }
 rsp-witness-db = { path = "./crates/storage/witness-db" }
 rsp-client-executor = { path = "./crates/executor/client" }
@@ -178,14 +179,6 @@ rustdoc.all = "warn"
 
 # ─── patches (single source of truth) ────────────────────────────────────────
 [patch.crates-io]
-# sp1 precompile patches
-sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha2-0.10.9-sp1-4.0.0", package = "sha2" }
-sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha3-0.10.8-sp1-4.0.0" }
-bn = { git = "https://github.com/sp1-patches/bn", tag = "patch-0.6.0-sp1-5.0.0", package = "substrate-bn" }
-k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-5.0.0" }
-p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p256-13.2-sp1-5.0.0" }
-secp256k1 = { git = "https://github.com/sp1-patches/rust-secp256k1", tag = "patch-0.30.0-sp1-5.0.0" }
-
 # revm patches
 revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
 revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
