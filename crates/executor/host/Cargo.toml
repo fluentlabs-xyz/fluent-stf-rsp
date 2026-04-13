@@ -26,9 +26,9 @@ nitro = [
     "rsp-client-executor/nitro",
     "tokio/process",
 ]
-mainnet = ["fluent-stf-primitives/mainnet"]
-testnet = ["fluent-stf-primitives/testnet"]
-devnet  = ["fluent-stf-primitives/devnet"]
+mainnet = ["fluent-stf-primitives/mainnet", "rsp-client-executor/mainnet"]
+testnet = ["fluent-stf-primitives/testnet", "rsp-client-executor/testnet"]
+devnet  = ["fluent-stf-primitives/devnet",  "rsp-client-executor/devnet"]
 
 [dependencies]
 tokio = { workspace = true, features = ["time", "rt"] }

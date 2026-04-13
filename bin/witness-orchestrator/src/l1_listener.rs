@@ -1,21 +1,20 @@
 //! L1 event listener for batch lifecycle events.
 //!
 //! Polls the rollup contract on L1 for:
-//! - `BatchHeadersSubmitted(batchIndex, batchRoot, expectedBlobsCount)` — new batch declared
-//! - `BatchAccepted(batchIndex)` — all blobs submitted for the batch
+//! - `BatchCommitted(batchIndex, batchRoot, numberOfBlocks, expectedBlobsCount)` — new batch declared
+//! - `BatchSubmitted(batchIndex)` — all blobs submitted for the batch
+//! - `BatchPreconfirmed(batchIndex, nitroVerifier, verifier)` — preconfirmation accepted
 //!
 //! Events are sent to the orchestrator via an mpsc channel.
 //!
-//! Contract ABI + stateless decode helpers live in `l1-rollup-client`.
+//! Contract ABI lives in `l1-rollup-client`.
 
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::Filter;
 use alloy_sol_types::SolEvent;
 use eyre::{eyre, Result};
-use l1_rollup_client::{
-    fetch_block_count_from_tx, BatchAccepted, BatchHeadersSubmitted, BatchPreconfirmed,
-};
+use l1_rollup_client::{BatchCommitted, BatchPreconfirmed, BatchSubmitted};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -24,20 +23,21 @@ use tracing::{error, info, warn};
 // ---------------------------------------------------------------------------
 
 /// Events the L1 listener sends to the orchestrator.
+///
+/// Variant names mirror the v0.1.0 contract event names 1:1.
 #[derive(Debug)]
 pub enum L1Event {
-    /// A new batch has been declared on L1.
-    BatchHeaders {
+    /// `BatchCommitted` — a new batch has been declared on L1.
+    BatchCommitted {
         batch_index: u64,
         batch_root: B256,
         expected_blobs: u64,
-        /// Number of block headers in the `acceptNextBatch` calldata.
-        /// Used with sequential tracking to determine from_block/to_block.
+        /// Number of L2 block headers in the batch (`numberOfBlocks` from the event).
         num_blocks: u64,
     },
-    /// All blobs for the batch have been accepted.
-    BlobsAccepted { batch_index: u64 },
-    /// Batch was preconfirmed on L1 — carries the real tx_hash and l1_block.
+    /// `BatchSubmitted` — all blobs for the batch have been submitted.
+    BatchSubmitted { batch_index: u64 },
+    /// `BatchPreconfirmed` — carries the real tx_hash and l1_block.
     Preconfirmed { batch_index: u64, tx_hash: B256, l1_block: u64 },
     /// All events up to this L1 block have been sent.
     /// Orchestrator persists this as the L1 checkpoint.
@@ -109,29 +109,6 @@ pub async fn run(
 }
 
 const PAGE_SIZE: u64 = 2_000;
-const MAX_RPC_RETRIES: u32 = 5;
-
-/// Fetch block count with retry and exponential backoff for transient RPC errors (429, timeouts).
-async fn retry_fetch_block_count(
-    provider: &RootProvider,
-    tx_hash: Option<B256>,
-    batch_index: u64,
-) -> Result<u64> {
-    let mut backoff = std::time::Duration::from_millis(500);
-    let mut last_err = None;
-    for attempt in 1..=MAX_RPC_RETRIES {
-        match fetch_block_count_from_tx(provider, tx_hash).await {
-            Ok(n) => return Ok(n),
-            Err(e) => {
-                warn!(batch_index, attempt, err = %e, ?backoff, "fetch_block_count failed — retrying");
-                last_err = Some(e);
-                tokio::time::sleep(backoff).await;
-                backoff *= 2;
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| eyre!("fetch_block_count failed with 0 retries")))
-}
 
 /// Single poll iteration: fetch logs from `from_block` to latest, paginated.
 /// Returns `Complete` on full success, `Partial` on page failure with progress saved.
@@ -168,7 +145,7 @@ async fn poll_once(
     Ok(PollOutcome::Complete(latest_block))
 }
 
-/// Process a single page of blocks: fetch and emit both event types in one query.
+/// Process a single page of blocks: fetch and emit all event types in one query.
 async fn process_page(
     provider: &RootProvider,
     contract_addr: Address,
@@ -179,8 +156,8 @@ async fn process_page(
     let filter = Filter::new()
         .address(contract_addr)
         .event_signature(vec![
-            BatchHeadersSubmitted::SIGNATURE_HASH,
-            BatchAccepted::SIGNATURE_HASH,
+            BatchCommitted::SIGNATURE_HASH,
+            BatchSubmitted::SIGNATURE_HASH,
             BatchPreconfirmed::SIGNATURE_HASH,
         ])
         .from_block(from)
@@ -194,26 +171,23 @@ async fn process_page(
     for log in &logs {
         let topic0 = log.topic0().copied().unwrap_or_default();
 
-        if topic0 == BatchHeadersSubmitted::SIGNATURE_HASH {
-            match BatchHeadersSubmitted::decode_log_data(&log.inner.data) {
+        if topic0 == BatchCommitted::SIGNATURE_HASH {
+            match BatchCommitted::decode_log_data(&log.inner.data) {
                 Ok(event) => {
                     let batch_index: u64 = event
                         .batchIndex
                         .try_into()
                         .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-                    let expected_blobs: u64 =
-                        event.expectedBlobsCount.try_into().map_err(|_| {
-                            eyre!("expectedBlobsCount overflow: {}", event.expectedBlobsCount)
-                        })?;
+                    let num_blocks: u64 = event
+                        .numberOfBlocks
+                        .try_into()
+                        .map_err(|_| eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks))?;
+                    let expected_blobs: u64 = event.expectedBlobsCount.into();
 
-                    let num_blocks =
-                        retry_fetch_block_count(provider, log.transaction_hash, batch_index)
-                            .await?;
-
-                    info!(batch_index, expected_blobs, num_blocks, "BatchHeadersSubmitted event");
+                    info!(batch_index, expected_blobs, num_blocks, "BatchCommitted event");
 
                     if tx
-                        .send(L1Event::BatchHeaders {
+                        .send(L1Event::BatchCommitted {
                             batch_index,
                             batch_root: event.batchRoot,
                             expected_blobs,
@@ -225,21 +199,21 @@ async fn process_page(
                         warn!(batch_index, "L1 event channel closed");
                     }
                 }
-                Err(e) => error!(err = %e, "Failed to decode BatchHeadersSubmitted"),
+                Err(e) => error!(err = %e, "Failed to decode BatchCommitted"),
             }
-        } else if topic0 == BatchAccepted::SIGNATURE_HASH {
-            match BatchAccepted::decode_log_data(&log.inner.data) {
+        } else if topic0 == BatchSubmitted::SIGNATURE_HASH {
+            match BatchSubmitted::decode_log_data(&log.inner.data) {
                 Ok(event) => {
                     let batch_index: u64 = event
                         .batchIndex
                         .try_into()
                         .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-                    info!(batch_index, "BatchAccepted event");
-                    if tx.send(L1Event::BlobsAccepted { batch_index }).await.is_err() {
+                    info!(batch_index, "BatchSubmitted event");
+                    if tx.send(L1Event::BatchSubmitted { batch_index }).await.is_err() {
                         warn!(batch_index, "L1 event channel closed");
                     }
                 }
-                Err(e) => error!(err = %e, "Failed to decode BatchAccepted"),
+                Err(e) => error!(err = %e, "Failed to decode BatchSubmitted"),
             }
         } else if topic0 == BatchPreconfirmed::SIGNATURE_HASH {
             match BatchPreconfirmed::decode_log_data(&log.inner.data) {

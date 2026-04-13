@@ -8363,11 +8363,14 @@ name = "rsp-blob-builder"
 version = "0.1.0"
 dependencies = [
  "alloy-eips",
+ "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types",
  "brotlic",
  "eyre",
+ "fluent-stf-primitives",
  "futures",
+ "tokio",
  "tracing",
 ]
 
@@ -8382,6 +8385,7 @@ dependencies = [
  "alloy-rpc-types",
  "alloy-sol-types",
  "bincode 1.3.3",
+ "fluent-stf-primitives",
  "fluentbase-revm",
  "fluentbase-runtime",
  "itertools 0.13.0",

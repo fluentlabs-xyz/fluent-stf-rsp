@@ -38,7 +38,7 @@ use tracing::{error, info, warn};
 use crate::accumulator::BatchAccumulator;
 use crate::db::Db;
 use crate::l1_listener::L1Event;
-use l1_rollup_client::{is_key_registered, submit_preconfirmation};
+use l1_rollup_client::{nitro_verifier::is_key_registered, submit_preconfirmation};
 use witness_orchestrator::proto::witness_service_client::WitnessServiceClient;
 use witness_orchestrator::proto::SubscribeRequest;
 use witness_orchestrator::types::{EthExecutionResponse, SubmitBatchResponse};
@@ -544,14 +544,14 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
         from_block: u64,
     ) {
         match event {
-            L1Event::BatchHeaders { batch_index, expected_blobs: _, batch_root: _, num_blocks } => {
+            L1Event::BatchCommitted { batch_index, expected_blobs: _, batch_root: _, num_blocks } => {
                 let from = next_batch_from_block.unwrap_or(from_block);
                 let to = from + num_blocks.saturating_sub(1);
                 info!(batch_index, from, to, num_blocks, "Setting batch from L1 event");
                 accumulator.set_batch(batch_index, from, to).await;
                 *next_batch_from_block = Some(to + 1);
             }
-            L1Event::BlobsAccepted { batch_index } => {
+            L1Event::BatchSubmitted { batch_index } => {
                 accumulator.mark_blobs_accepted(batch_index).await;
                 self.try_sign_next_batch(accumulator);
                 self.try_dispatch_next_batch(accumulator);

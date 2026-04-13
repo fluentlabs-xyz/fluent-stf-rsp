@@ -45,15 +45,15 @@ l1-rollup-client.workspace = true
 rsp-host-executor = { workspace = true, default-features = false }
 rsp-client-executor.workspace = true
 rsp-provider.workspace = true
-fluent-stf-primitives = { workspace = true, default-features = false, features = ["testnet"] }
+fluent-stf-primitives = { workspace = true, default-features = false }
 reth-chainspec.workspace = true
 reth-evm.workspace = true
 
 [features]
-default = ["testnet"]
-mainnet = ["fluent-stf-primitives/mainnet", "rsp-host-executor/mainnet"]
-testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet"]
-devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet"]
+default = ["mainnet"]
+mainnet = ["fluent-stf-primitives/mainnet", "rsp-host-executor/mainnet", "rsp-blob-builder/mainnet"]
+testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet", "rsp-blob-builder/testnet"]
+devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet",  "rsp-blob-builder/devnet"]
 
 [dev-dependencies]
 alloy-rpc-client.workspace = true

@@ -299,7 +299,6 @@ async fn fetch_challenge_blobs(
 
     let (from_block, to_block) = l1_rollup_client::fetch_batch_range(
         &l1.l1_provider,
-        &l2_provider,
         l1.contract_addr,
         batch_index,
         l1.deploy_block,

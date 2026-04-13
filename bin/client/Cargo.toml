@@ -109,9 +109,6 @@ op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "
 
 
 [dev-dependencies]
-rsp-host-executor  = { path = "../../crates/executor/host", default-features = false, features = ["testnet", "sp1"] }
-rsp-blob-builder   = { path = "../../crates/blob-builder" }
-fluent-stf-primitives     = { path = "../../crates/primitives", default-features = false, features = ["testnet"] }
 reth-chainspec     = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v1.11-patched" }
 tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
 alloy-provider     = { version = "1.8.1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }

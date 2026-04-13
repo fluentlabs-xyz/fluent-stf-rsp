@@ -66,8 +66,8 @@ serde_bytes = "0.11.19"
 
 
 [features]
-default = ["devnet"]
-mainnet = ["fluent-stf-primitives/mainnet", "rsp-host-executor/mainnet"]
-testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet"]
-devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet"]
+default = ["mainnet"]
+mainnet = ["fluent-stf-primitives/mainnet", "rsp-host-executor/mainnet", "rsp-blob-builder/mainnet"]
+testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet", "rsp-blob-builder/testnet"]
+devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet",  "rsp-blob-builder/devnet"]
 prove-key-attestation = []

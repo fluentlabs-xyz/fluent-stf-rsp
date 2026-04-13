@@ -28,7 +28,7 @@ pub struct BridgeHashes {
     pub deposit_hash: B256,
 }
 
-pub(crate) struct BridgeInfo {
+pub struct BridgeInfo {
     pub bridge_address: Address,
     pub withdrawal_topic: B256,
     pub rollback_topic: B256,
@@ -36,7 +36,7 @@ pub(crate) struct BridgeInfo {
 }
 
 impl BridgeInfo {
-    pub(crate) fn calculate_bridge_hashes<T: TxReceipt<Log = alloy_primitives::Log>>(
+    pub fn calculate_bridge_hashes<T: TxReceipt<Log = alloy_primitives::Log>>(
         &self,
         execution_outcome: &ExecutionOutcome<T>,
     ) -> Result<BridgeHashes, Error> {

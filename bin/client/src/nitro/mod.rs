@@ -21,6 +21,7 @@ use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::B256;
 use c_kzg::{Blob, KzgSettings, BYTES_PER_BLOB};
 
+use fluent_stf_primitives::{FLUENT_CHAIN_ID, NITRO_VERIFIER_ADDRESS};
 use nitro_types::{EnclaveIncoming, EnclaveResponse, EthExecutionResponse, SubmitBatchResponse};
 use rsp_client_executor::{executor::EthClientExecutor, io::EthClientExecutorInput};
 
@@ -225,20 +226,39 @@ fn verify_blobs(blobs: &[Vec<u8>], tx_data_hashes: &[B256]) -> anyhow::Result<Ve
 // ---------------------------------------------------------------------------
 
 /// Signs batch_root and versioned_hashes into a SubmitBatchResponse.
-/// ABI-encode `(bytes32, bytes32[])` matching Solidity's `abi.encode(batchRoot, blobHashes)`.
+/// ABI-encode `(uint256 chainId, address verifier, bytes32 batchRoot, bytes32[] blobHashes)`
+/// matching Solidity's `abi.encode(block.chainid, address(this), batchRoot, blobHashes)`
+/// in `NitroVerifier.verifyBatch` (domain separation against cross-chain /
+/// cross-deployment replay).
 fn abi_encode_batch(batch_root: &[u8; 32], hashes: &[B256]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(32 + 32 + 32 + hashes.len() * 32);
+    // Head: chainId(32) + verifier(32) + batchRoot(32) + offset(32) = 128 bytes
+    // Tail: array length(32) + elements(32 * N)
+    let mut buf = Vec::with_capacity(128 + 32 + hashes.len() * 32);
+
+    // uint256 chainId — left-padded big-endian
+    let mut chain_id_word = [0u8; 32];
+    chain_id_word[24..32].copy_from_slice(&FLUENT_CHAIN_ID.to_be_bytes());
+    buf.extend_from_slice(&chain_id_word);
+
+    // address verifier — left-padded (12 zero bytes || 20-byte address)
+    let mut verifier_word = [0u8; 32];
+    verifier_word[12..32].copy_from_slice(&NITRO_VERIFIER_ADDRESS);
+    buf.extend_from_slice(&verifier_word);
+
     // bytes32 batchRoot
     buf.extend_from_slice(batch_root);
-    // offset to dynamic array data (0x40 = 64)
+
+    // offset to dynamic array data (head is 4 * 32 = 128 = 0x80)
     let mut offset = [0u8; 32];
-    offset[31] = 64;
+    offset[31] = 0x80;
     buf.extend_from_slice(&offset);
+
     // array length
     let mut len = [0u8; 32];
     let len_bytes = (hashes.len() as u64).to_be_bytes();
     len[24..32].copy_from_slice(&len_bytes);
     buf.extend_from_slice(&len);
+
     // array elements
     for h in hashes {
         buf.extend_from_slice(h.as_slice());

@@ -127,10 +127,10 @@ async fn main() {
                     batch_id,
                     "FLUENT_START_BATCH_ID set — resolving L2 start checkpoint from L1"
                 );
+                let _ = l2_provider; // L2 lookup no longer required by resolve_l2_start_checkpoint
                 let (l2_from_block, l1_event_block, _num_blocks) =
                     l1_rollup_client::resolve_l2_start_checkpoint(
                         &l1_read_provider,
-                        &l2_provider,
                         l1_contract_addr,
                         batch_id,
                         l1_deploy_block,

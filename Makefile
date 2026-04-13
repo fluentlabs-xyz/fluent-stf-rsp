@@ -103,7 +103,8 @@ run-enclave:
 # ─── Proxy ────────────────────────────────────────────────────────────────────
 
 build-proxy:
-	RUSTFLAGS="-C target-cpu=native" cargo build --release -p proxy
+	RUSTFLAGS="-C target-cpu=native" cargo build --release -p proxy \
+		--no-default-features --features $(NETWORK)
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
