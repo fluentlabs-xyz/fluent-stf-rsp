@@ -42,7 +42,7 @@ alloy-consensus.workspace = true
 # workspace crates
 rsp-blob-builder.workspace = true
 l1-rollup-client.workspace = true
-rsp-host-executor = { workspace = true, default-features = false, features = ["testnet"] }
+rsp-host-executor = { workspace = true, default-features = false }
 rsp-client-executor.workspace = true
 rsp-provider.workspace = true
 fluent-stf-primitives = { workspace = true, default-features = false, features = ["testnet"] }

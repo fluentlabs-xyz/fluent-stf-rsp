@@ -286,3 +286,72 @@ Terminate enclave
 ```cmd
 nitro-cli terminate-enclave --enclave-name rsp-client-enclave
 ```
+
+## Production Docker Compose
+
+The [`docker-compose.yml`](docker-compose.yml) at the repo root runs the `proxy`
+and `witness-orchestrator` as two containers on a single EC2 host. The AWS Nitro
+Enclave itself runs **outside** Docker — the proxy talks to it over VSOCK via
+the host's `/dev/vsock` device.
+
+### Prerequisites
+
+- AWS EC2 instance with Nitro Enclave support, `nitro-cli` installed, and the
+  allocator service running.
+- Host-side Fluent node exposing its gRPC witness server on `127.0.0.1:10000`.
+- L2 archive RPC available (set via `FLUENT_FALLBACK_LOCAL_RPC`).
+- Build-time: `cargo-prove` (SP1 toolchain) + Docker for the reproducible ELF
+  build. See [Makefile](Makefile) `build-client-docker` and
+  `build-nitro-validator-docker`.
+
+### One-shot build and run
+
+```bash
+cp .env.example .env
+chmod 600 .env
+# edit .env — fill in API_KEY, L1_SUBMITTER_KEY, RPC_URL, L1_RPC_URL,
+# L1_CONTRACT_ADDR, NITRO_VERIFIER_ADDR, FLUENT_FALLBACK_LOCAL_RPC, etc.
+
+# Build reproducible ELFs + both docker images
+make compose-build NETWORK=mainnet
+
+# Start the enclave (outside docker) — the proxy expects CID 10
+nitro-cli run-enclave --eif-path rsp-client-enclave-mainnet.eif \
+    --cpu-count 2 --memory 512 --enclave-cid 10
+
+# Start proxy + witness-orchestrator
+make compose-up
+
+# Tail logs
+make compose-logs
+```
+
+### Operational notes
+
+- **Secrets**: `.env` holds `API_KEY` and `L1_SUBMITTER_KEY` in plaintext. It is
+  gitignored; `chmod 600` so only root/owner can read it. The values are visible
+  via `docker inspect fluent-proxy` to anyone with docker socket access — run
+  compose as root on a dedicated host.
+- **State persistence**: proxy's attestation cache and orchestrator's SQLite DB
+  live in named docker volumes (`fluent_proxy_state`, `fluent_witness_state`).
+  `compose down` preserves them; use `compose down -v` to wipe.
+- **Healthcheck is TCP-only**: the proxy container is considered "healthy"
+  when it binds port 8080. This does not verify enclave handshake success.
+  Check `docker compose logs proxy` after boot to confirm the vsock handshake.
+- **Reproducibility matters**: always use `make compose-build` (chains
+  `build-client-docker` + `build-nitro-validator-docker`), never
+  `build-client` directly — non-reproducible ELFs change PCR0 and break
+  enclave attestation.
+- **Updating**: edit `.env` → `make compose-up` (compose recreates changed
+  services). For image updates, `make compose-build && make compose-up`.
+- **Gotchas**:
+  - Hardcoded enclave CID is 10 (proxy side) and 5005 is the VSOCK port;
+    `/dev/vsock` is passed through as a device (research G3).
+  - Docker < 20.10.10 seccomp profile blocks `AF_VSOCK` — host must run a
+    recent Docker daemon (research G5).
+  - `RUSTFLAGS="-C target-cpu=native"` in [Makefile](Makefile) makes the
+    `build-proxy` dev target non-portable across CPU generations — the
+    compose build uses `build-client-docker` instead, which is reproducible
+    (research G10).
+  - See [research.md](.claude/tasks/2026_04_10__11_37__production_docker_compose_proxy_and_orchestrator/research.md)
+    for the full gotcha list.

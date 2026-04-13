@@ -1,5 +1,6 @@
 .PHONY: build-client build-client-docker build-nitro-validator build-nitro-validator-docker \
-        build-enclave build-proxy run run-sp1-only run-enclave download-genesis clean help
+        build-enclave build-proxy run run-sp1-only run-enclave download-genesis clean help \
+        compose-build compose-up compose-down compose-logs
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 CLIENT_DIR   := bin/client
@@ -149,6 +150,10 @@ help:
 	@echo "  run                           Build and run with Nitro + SP1"
 	@echo "  run-sp1-only                  Build and run with SP1 only (no Nitro)"
 	@echo "  run-enclave                   Run enclave in debug mode"
+	@echo "  compose-build                 Build ELFs + docker images for compose stack"
+	@echo "  compose-up                    Start proxy + witness-orchestrator in background"
+	@echo "  compose-down                  Stop the compose stack (volumes preserved)"
+	@echo "  compose-logs                  Tail compose logs"
 	@echo "  download-genesis              Download genesis file (TAG=$(TAG))"
 	@echo "  clean                         Remove build artifacts"
 	@echo ""
@@ -165,3 +170,24 @@ help:
 	@echo "  make build-client                      # mainnet (default)"
 	@echo "  make build-client NETWORK=testnet      # testnet"
 	@echo "  make build-enclave NETWORK=devnet      # devnet"
+
+# ─── Docker Compose ───────────────────────────────────────────────────────────
+
+## Build ELFs (reproducibly, via docker) and docker images for the compose
+## stack (one-shot). Uses the *-docker targets so ELFs are identical across
+## developer machines — critical because the enclave hardcodes EXPECTED_PCR0
+## and a non-reproducible build will cause attestation verification to fail.
+compose-build: build-client-docker build-nitro-validator-docker
+	NETWORK=$(NETWORK) docker compose build
+
+## Start the compose stack in the background.
+compose-up:
+	NETWORK=$(NETWORK) docker compose up -d
+
+## Stop and remove the compose stack (volumes preserved).
+compose-down:
+	docker compose down
+
+## Tail compose logs.
+compose-logs:
+	docker compose logs -f --tail=200

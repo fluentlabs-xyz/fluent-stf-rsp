@@ -26,8 +26,8 @@ vsock.workspace = true
 
 # workspace crates
 rsp-provider.workspace = true
-rsp-host-executor = { workspace = true, default-features = false, features = ["devnet"] }
-fluent-stf-primitives = { workspace = true, default-features = false, features=["devnet"] }
+rsp-host-executor = { workspace = true, default-features = false }
+fluent-stf-primitives = { workspace = true, default-features = false }
 rsp-client-executor.workspace = true
 rsp-blob-builder.workspace = true
 l1-rollup-client.workspace = true
