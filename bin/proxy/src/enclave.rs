@@ -78,7 +78,7 @@ pub(crate) async fn execute_block(
     input: EthClientExecutorInput,
     config: NitroConfig,
 ) -> eyre::Result<EthExecutionResponse> {
-    let msg = EnclaveIncoming::ExecuteBlock { input };
+    let msg = EnclaveIncoming::ExecuteBlock { input: Box::new(input) };
     execute_block_inner(msg, &config).await
 }
 

@@ -34,7 +34,6 @@ struct ColdTier {
     dir: PathBuf,
     index: Arc<StdRwLock<BTreeSet<u64>>>,
     tx: mpsc::Sender<SharedProveRequest>,
-    max_dir_bytes: u64,
     current_dir_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -181,6 +180,12 @@ pub struct WitnessHub {
     cold: Option<ColdTier>,
 }
 
+impl std::fmt::Debug for WitnessHub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WitnessHub").finish_non_exhaustive()
+    }
+}
+
 /// Byte-bounded ring buffer for witness replay.
 struct RingBuffer {
     entries: VecDeque<SharedProveRequest>,
@@ -275,7 +280,7 @@ impl WitnessHub {
                 Arc::clone(&current_dir_bytes),
             ));
 
-            ColdTier { dir, index, tx: cold_tx, max_dir_bytes: max_cold_bytes, current_dir_bytes }
+            ColdTier { dir, index, tx: cold_tx, current_dir_bytes }
         });
 
         Self { tx, buffer: RwLock::new(RingBuffer::new(max_bytes)), cold }

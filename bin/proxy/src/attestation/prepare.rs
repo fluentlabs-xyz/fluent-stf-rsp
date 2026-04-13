@@ -35,12 +35,7 @@ pub(crate) struct GuestInput {
 // ─── CBOR structures (parsed only on the host) ─────────────────────────────
 
 #[derive(Deserialize)]
-struct CoseSign1(ByteBuf, ciborium::Value, ByteBuf, ByteBuf);
-
-#[derive(Deserialize)]
 struct AttestationDoc {
-    module_id: String,
-    timestamp: u64,
     #[serde(with = "pcrs_de")]
     pcrs: BTreeMap<usize, Vec<u8>>,
     #[serde(with = "serde_bytes")]
@@ -49,10 +44,6 @@ struct AttestationDoc {
     cabundle: Vec<Vec<u8>>,
     #[serde(default, with = "opt_bytes_de")]
     user_data: Option<Vec<u8>>,
-    #[serde(default, with = "opt_bytes_de")]
-    public_key: Option<Vec<u8>>,
-    #[serde(default, with = "opt_bytes_de")]
-    nonce: Option<Vec<u8>>,
 }
 
 // ─── Main entry point ───────────────────────────────────────────────────────
@@ -64,10 +55,12 @@ pub(crate) fn prepare_guest_input(
     root_cert_der: &[u8],
 ) -> Result<GuestInput, Box<dyn std::error::Error>> {
     // 1. Parse COSE Sign1
-    let cose: CoseSign1 = ciborium::from_reader(attestation_bytes)?;
+    let (protected, _unprotected, payload, signature):
+        (ByteBuf, ciborium::Value, ByteBuf, ByteBuf) =
+        ciborium::from_reader(attestation_bytes)?;
 
     // 2. Parse AttestationDoc from COSE payload
-    let doc: AttestationDoc = ciborium::from_reader(&cose.2[..])?;
+    let doc: AttestationDoc = ciborium::from_reader(&payload[..])?;
 
     // 3. Extract root public key
     let (_, root_cert) = X509Certificate::from_der(root_cert_der)?;
@@ -94,14 +87,14 @@ pub(crate) fn prepare_guest_input(
     }
 
     // 6. Build COSE Sig_structure
-    let sig_structure = build_sig_structure(&cose.0, &cose.2)?;
+    let sig_structure = build_sig_structure(&protected, &payload)?;
 
     // 7. Extract COSE signature (raw 96 bytes for P-384)
     let mut cose_signature = [0u8; 96];
-    if cose.3.len() != 96 {
-        return Err(format!("expected 96-byte COSE signature, got {}", cose.3.len()).into());
+    if signature.len() != 96 {
+        return Err(format!("expected 96-byte COSE signature, got {}", signature.len()).into());
     }
-    cose_signature.copy_from_slice(&cose.3);
+    cose_signature.copy_from_slice(&signature);
 
     // 8. Extract PCR0
     let pcr0_vec = doc.pcrs.get(&0).ok_or("missing PCR0")?;
@@ -189,7 +182,7 @@ fn build_sig_structure(
 
 mod pcrs_de {
     use super::*;
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
         d: D,
     ) -> Result<BTreeMap<usize, Vec<u8>>, D::Error> {
         let m: BTreeMap<usize, ByteBuf> = BTreeMap::deserialize(d)?;
@@ -199,7 +192,7 @@ mod pcrs_de {
 
 mod cabundle_de {
     use super::*;
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
         let v: Vec<ByteBuf> = Vec::deserialize(d)?;
         Ok(v.into_iter().map(|b| b.into_vec()).collect())
     }
@@ -208,7 +201,7 @@ mod cabundle_de {
 mod opt_bytes_de {
     use serde::Deserialize;
     use serde_bytes::ByteBuf;
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
         d: D,
     ) -> Result<Option<Vec<u8>>, D::Error> {
         let o: Option<ByteBuf> = Option::deserialize(d)?;

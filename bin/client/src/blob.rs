@@ -137,7 +137,7 @@ mod tests {
         if input.is_empty() {
             return Vec::new();
         }
-        let chunks = (input.len() + BYTES_PER_FIELD - 1) / BYTES_PER_FIELD;
+        let chunks = input.len().div_ceil(BYTES_PER_FIELD);
         let mut result = vec![0u8; chunks * FIELD_SIZE];
         let mut inp = 0;
         let mut out = 0;

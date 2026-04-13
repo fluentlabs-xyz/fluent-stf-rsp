@@ -36,7 +36,7 @@ pub struct SubmitBatchResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum EnclaveIncoming {
     Handshake { credentials: AwsCredentials },
-    ExecuteBlock { input: EthClientExecutorInput },
+    ExecuteBlock { input: Box<EthClientExecutorInput> },
     SubmitBatch { from: u64, to: u64, responses: Vec<EthExecutionResponse>, blobs: Vec<Vec<u8>> },
 }
 

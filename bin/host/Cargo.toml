@@ -28,7 +28,6 @@ rsp-host-executor = { workspace = true, default-features = false }
 rsp-provider.workspace = true
 
 # alloy
-alloy-chains.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-provider.workspace = true

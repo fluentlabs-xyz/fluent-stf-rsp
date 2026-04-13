@@ -28,6 +28,7 @@ pub struct BridgeHashes {
     pub deposit_hash: B256,
 }
 
+#[derive(Debug)]
 pub struct BridgeInfo {
     pub bridge_address: Address,
     pub withdrawal_topic: B256,

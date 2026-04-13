@@ -19,7 +19,7 @@ use crate::db::Db;
 use witness_orchestrator::types::{EthExecutionResponse, SubmitBatchResponse};
 
 #[derive(Debug)]
-pub struct PendingBatch {
+pub(crate) struct PendingBatch {
     pub batch_index: u64,
     pub from_block: u64,
     pub to_block: u64,
@@ -27,7 +27,7 @@ pub struct PendingBatch {
 }
 
 #[derive(Debug)]
-pub struct DispatchedBatch {
+pub(crate) struct DispatchedBatch {
     pub batch_index: u64,
     pub from_block: u64,
     pub to_block: u64,
@@ -35,14 +35,8 @@ pub struct DispatchedBatch {
     pub l1_block: u64,
 }
 
-impl PendingBatch {
-    pub fn expected_count(&self) -> u64 {
-        self.to_block - self.from_block + 1
-    }
-}
-
 #[derive(Debug)]
-pub struct BatchAccumulator {
+pub(crate) struct BatchAccumulator {
     batches: BTreeMap<u64, PendingBatch>,
     responses: HashMap<u64, EthExecutionResponse>,
     /// BlobsAccepted events that arrived before BatchHeadersSubmitted.
@@ -73,7 +67,8 @@ impl BatchAccumulator {
         }
     }
 
-    pub fn new() -> Self {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self {
             batches: BTreeMap::new(),
             responses: HashMap::new(),
@@ -85,7 +80,7 @@ impl BatchAccumulator {
     }
 
     /// Create accumulator backed by a DB. Loads all state from DB on construction.
-    pub fn with_db(db: Arc<Mutex<Db>>) -> Self {
+    pub(crate) fn with_db(db: Arc<Mutex<Db>>) -> Self {
         let guard = db.lock().unwrap_or_else(|e| e.into_inner());
         let responses: HashMap<u64, EthExecutionResponse> =
             guard.load_responses().into_iter().map(|r| (r.block_number, r)).collect();
@@ -132,7 +127,7 @@ impl BatchAccumulator {
     }
 
     /// Register a new batch from `BatchHeadersSubmitted` event.
-    pub async fn set_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
+    pub(crate) async fn set_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
         // Consume any buffered BlobsAccepted for this batch
         let blobs_accepted = self.pending_blobs_accepted.remove(&batch_index);
         if blobs_accepted {
@@ -158,14 +153,14 @@ impl BatchAccumulator {
     }
 
     /// Store a block execution response. O(1).
-    pub async fn insert_response(&mut self, resp: EthExecutionResponse) {
+    pub(crate) async fn insert_response(&mut self, resp: EthExecutionResponse) {
         let resp_clone = resp.clone();
         self.persist(move |db| db.save_response(&resp_clone)).await;
         let block = resp.block_number;
         self.responses.insert(block, resp);
     }
 
-    pub async fn mark_blobs_accepted(&mut self, batch_index: u64) {
+    pub(crate) async fn mark_blobs_accepted(&mut self, batch_index: u64) {
         if let Some(batch) = self.batches.get_mut(&batch_index) {
             batch.blobs_accepted = true;
             self.persist(move |db| db.update_blobs_accepted(batch_index)).await;
@@ -182,13 +177,14 @@ impl BatchAccumulator {
             && (batch.from_block..=batch.to_block).all(|b| self.responses.contains_key(&b))
     }
 
-    pub fn first_ready(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn first_ready(&self) -> Option<u64> {
         self.batches.values().find(|b| self.is_batch_ready(b)).map(|b| b.batch_index)
     }
 
     /// Returns the first ready batch (in BTreeMap order) that does NOT have
     /// a cached signature. Used by the eager signer.
-    pub fn first_ready_unsigned(&self) -> Option<u64> {
+    pub(crate) fn first_ready_unsigned(&self) -> Option<u64> {
         self.batches
             .values()
             .filter(|b| self.is_batch_ready(b))
@@ -200,19 +196,19 @@ impl BatchAccumulator {
     /// along with the signature bytes. Used by the sequential dispatcher.
     ///
     /// Returns `None` if the first pending batch is not yet signed (strict ordering).
-    pub fn first_sequential_signed(&self) -> Option<(u64, Vec<u8>)> {
+    pub(crate) fn first_sequential_signed(&self) -> Option<(u64, Vec<u8>)> {
         let first = self.batches.values().next()?;
         let resp = self.signatures.get(&first.batch_index)?;
         Some((first.batch_index, resp.signature.clone()))
     }
 
-    pub fn get(&self, batch_index: u64) -> Option<&PendingBatch> {
+    pub(crate) fn get(&self, batch_index: u64) -> Option<&PendingBatch> {
         self.batches.get(&batch_index)
     }
 
     /// Returns the highest `to_block` across all pending and dispatched batches, or `None` if empty.
     /// Used on restart to recover `next_batch_from_block` without reading a DB key.
-    pub fn max_to_block(&self) -> Option<u64> {
+    pub(crate) fn max_to_block(&self) -> Option<u64> {
         let pending_max = self.batches.values().map(|b| b.to_block).max();
         let dispatched_max = self.dispatched.values().map(|d| d.to_block).max();
         pending_max.max(dispatched_max)
@@ -221,7 +217,7 @@ impl BatchAccumulator {
     /// Purge responses for specific blocks (key rotation recovery).
     /// Clears responses so they can be re-populated with freshly signed ones.
     /// Batches are preserved — only responses are removed.
-    pub async fn purge_responses(&mut self, blocks: &[u64]) {
+    pub(crate) async fn purge_responses(&mut self, blocks: &[u64]) {
         for &block in blocks {
             self.responses.remove(&block);
             self.persist(move |db| db.delete_response(block)).await;
@@ -230,28 +226,24 @@ impl BatchAccumulator {
     }
 
     /// Cache a signature in memory (called after successful signing).
-    pub fn cache_signature(&mut self, batch_index: u64, resp: SubmitBatchResponse) {
+    pub(crate) fn cache_signature(&mut self, batch_index: u64, resp: SubmitBatchResponse) {
         self.signatures.insert(batch_index, resp);
     }
 
     /// Delete a cached batch signature (e.g. after key rotation invalidation).
-    pub async fn delete_batch_signature(&mut self, batch_index: u64) {
+    pub(crate) async fn delete_batch_signature(&mut self, batch_index: u64) {
         self.signatures.remove(&batch_index);
         self.persist(move |db| db.delete_batch_signature(batch_index)).await;
     }
 
     /// Returns cloned responses for blocks in [from, to].
-    pub fn get_responses(&self, from: u64, to: u64) -> Vec<EthExecutionResponse> {
+    pub(crate) fn get_responses(&self, from: u64, to: u64) -> Vec<EthExecutionResponse> {
         (from..=to).filter_map(|b| self.responses.get(&b).cloned()).collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.batches.len()
     }
 
     /// Move a batch from pending to dispatched state.
     /// Removes from `batches` and `signatures`, inserts into `dispatched`.
-    pub async fn mark_dispatched(&mut self, batch_index: u64, tx_hash: B256, l1_block: u64) {
+    pub(crate) async fn mark_dispatched(&mut self, batch_index: u64, tx_hash: B256, l1_block: u64) {
         let Some(batch) = self.batches.remove(&batch_index) else { return };
         self.signatures.remove(&batch_index);
 
@@ -272,7 +264,7 @@ impl BatchAccumulator {
     }
 
     /// Finalize a dispatched batch: delete all associated data from DB + memory.
-    pub async fn finalize_dispatched(&mut self, batch_index: u64) -> Option<DispatchedBatch> {
+    pub(crate) async fn finalize_dispatched(&mut self, batch_index: u64) -> Option<DispatchedBatch> {
         let dispatched = self.dispatched.remove(&batch_index)?;
         let fb = dispatched.from_block;
         let tb = dispatched.to_block;
@@ -287,7 +279,7 @@ impl BatchAccumulator {
     }
 
     /// Move a dispatched batch back to pending (reorg recovery).
-    pub async fn undispatch(&mut self, batch_index: u64) -> bool {
+    pub(crate) async fn undispatch(&mut self, batch_index: u64) -> bool {
         let Some(dispatched) = self.dispatched.remove(&batch_index) else {
             return false;
         };
@@ -308,7 +300,7 @@ impl BatchAccumulator {
     }
 
     /// Returns dispatched batch indices where l1_block <= finalized.
-    pub fn dispatched_finalization_candidates(&self, finalized_block: u64) -> Vec<u64> {
+    pub(crate) fn dispatched_finalization_candidates(&self, finalized_block: u64) -> Vec<u64> {
         self.dispatched
             .values()
             .filter(|d| d.l1_block <= finalized_block)
@@ -317,12 +309,12 @@ impl BatchAccumulator {
     }
 
     /// Check if any dispatched batches exist.
-    pub fn has_dispatched(&self) -> bool {
+    pub(crate) fn has_dispatched(&self) -> bool {
         !self.dispatched.is_empty()
     }
 
     /// Get the tx_hash of a dispatched batch.
-    pub fn dispatched_tx_hash(&self, batch_index: u64) -> Option<B256> {
+    pub(crate) fn dispatched_tx_hash(&self, batch_index: u64) -> Option<B256> {
         self.dispatched.get(&batch_index).map(|d| d.tx_hash)
     }
 }

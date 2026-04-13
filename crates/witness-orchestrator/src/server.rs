@@ -34,6 +34,7 @@ use crate::proto::{
     witness_service_server::{WitnessService, WitnessServiceServer},
 };
 /// gRPC service implementation backed by a [`WitnessHub`].
+#[derive(Debug)]
 pub struct WitnessGrpcService {
     hub: Arc<WitnessHub>,
 }

@@ -1,11 +1,9 @@
-#![cfg_attr(not(test), no_main)]
-
 #[cfg(not(test))]
 sp1_zkvm::entrypoint!(main);
 
-#[cfg(not(test))]
-use rsp_client_executor::executor::DESERIALZE_INPUTS;
 use rsp_client_executor::executor::EthClientExecutor;
+#[cfg(target_os = "zkvm")]
+use rsp_client_executor::executor::DESERIALZE_INPUTS;
 use rsp_client_executor::io::EthClientExecutorInput;
 use rsp_client_executor::utils::profile_report;
 
@@ -196,7 +194,7 @@ mod tests {
             for i in 0..3000u16 {
                 let val = (i % 256) as u8;
                 stream.put_u8(val);
-                reference_hasher.update(&[val]);
+                reference_hasher.update([val]);
             }
         }
         assert_eq!(hasher.finalize(), reference_hasher.finalize(), "Stream hash mismatch");
@@ -244,9 +242,9 @@ mod tests {
             stream.put_u8(0xEE);
         }
         reference_hasher.update(&chunk1);
-        reference_hasher.update(&[0xFF]);
+        reference_hasher.update([0xFF]);
         reference_hasher.update(&chunk2);
-        reference_hasher.update(&[0xEE]);
+        reference_hasher.update([0xEE]);
         assert_eq!(hasher.finalize(), reference_hasher.finalize(), "Stream hash mismatch");
     }
 
@@ -269,7 +267,7 @@ mod tests {
             }
             stream.put_u8(0x00);
         }
-        reference_hasher.update(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00]);
+        reference_hasher.update([0xDE, 0xAD, 0xBE, 0xEF, 0x00]);
         assert_eq!(
             hasher.finalize(),
             reference_hasher.finalize(),

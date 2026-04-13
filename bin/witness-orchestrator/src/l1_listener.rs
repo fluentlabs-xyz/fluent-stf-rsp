@@ -26,12 +26,10 @@ use tracing::{error, info, warn};
 ///
 /// Variant names mirror the v0.1.0 contract event names 1:1.
 #[derive(Debug)]
-pub enum L1Event {
+pub(crate) enum L1Event {
     /// `BatchCommitted` — a new batch has been declared on L1.
     BatchCommitted {
         batch_index: u64,
-        batch_root: B256,
-        expected_blobs: u64,
         /// Number of L2 block headers in the batch (`numberOfBlocks` from the event).
         num_blocks: u64,
     },
@@ -66,7 +64,7 @@ enum PollOutcome {
 ///
 /// Polls L1 logs starting from `from_block` and sends parsed events to `tx`.
 /// This function runs forever.
-pub async fn run(
+pub(crate) async fn run(
     l1_provider: RootProvider,
     contract_addr: Address,
     mut from_block: u64,
@@ -182,17 +180,10 @@ async fn process_page(
                         .numberOfBlocks
                         .try_into()
                         .map_err(|_| eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks))?;
-                    let expected_blobs: u64 = event.expectedBlobsCount.into();
-
-                    info!(batch_index, expected_blobs, num_blocks, "BatchCommitted event");
+                    info!(batch_index, num_blocks, "BatchCommitted event");
 
                     if tx
-                        .send(L1Event::BatchCommitted {
-                            batch_index,
-                            batch_root: event.batchRoot,
-                            expected_blobs,
-                            num_blocks,
-                        })
+                        .send(L1Event::BatchCommitted { batch_index, num_blocks })
                         .await
                         .is_err()
                     {

@@ -148,7 +148,6 @@ struct ChallengeSp1Request {
 struct SignBatchRootRequest {
     from_block: u64,
     to_block: u64,
-    batch_index: u64,
     responses: Vec<EthExecutionResponse>,
     blobs: Vec<Vec<u8>>,
 }

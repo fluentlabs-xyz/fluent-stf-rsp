@@ -31,7 +31,7 @@ pub(crate) struct AttestationConfig {
 }
 
 impl AttestationConfig {
-    pub async fn from_env() -> Result<Self> {
+    pub(crate) async fn from_env() -> Result<Self> {
         let elf_path = std::env::var("NITRO_VALIDATOR_ELF_PATH")
             .map_err(|_| eyre!("NITRO_VALIDATOR_ELF_PATH not set"))?;
         let elf_bytes = std::fs::read(&elf_path)
@@ -99,13 +99,6 @@ fn load_request_id() -> Option<B256> {
 
 fn delete_request_id() {
     let _ = std::fs::remove_file(request_id_path());
-}
-
-/// Delete any saved request_id. Called when a new enclave key is generated
-/// to prevent `prove_and_submit` from picking up a stale proof for a
-/// previous key.
-pub(crate) fn delete_stale_request_id() {
-    delete_request_id();
 }
 
 /// Submit new attestation proof request to SP1. Returns request_id.

@@ -136,7 +136,7 @@ pub fn main() {
     // 1. Trust anchor: verify root CA pubkey against hardcoded hash
     let root_hash = Sha384::digest(&input.root_pubkey);
     assert_eq!(
-        root_hash.as_slice(),
+        &root_hash[..],
         &EXPECTED_ROOT_PUBKEY_HASH,
         "root CA pubkey hash mismatch"
     );

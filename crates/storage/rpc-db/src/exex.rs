@@ -43,7 +43,6 @@ use crate::RpcDbError;
 /// This is critical for correct `BundleState` generation: revm must see
 /// `None` from `basic_ref` for non-existent accounts to produce `Created`
 /// (not `Changed`) entries in the bundle state.
-
 pub struct ExExDb<F> {
     pub provider_factory: F,
     pub block_number: u64,

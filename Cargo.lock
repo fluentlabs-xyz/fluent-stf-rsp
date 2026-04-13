@@ -8331,7 +8331,6 @@ dependencies = [
 name = "rsp"
 version = "0.1.0"
 dependencies = [
- "alloy-chains",
  "alloy-consensus",
  "alloy-network",
  "alloy-primitives",
@@ -13113,8 +13112,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "rwasm"
-version = "0.4.3"
-source = "git+https://www.github.com/fluentlabs-xyz/rwasm?tag=v0.4.3#9a6c979595d2170edad39510634e12781ff30af8"

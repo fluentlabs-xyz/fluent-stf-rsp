@@ -20,7 +20,7 @@ use tracing::error;
 use crate::accumulator::PendingBatch;
 use witness_orchestrator::types::{EthExecutionResponse, SubmitBatchResponse};
 
-pub struct Db {
+pub(crate) struct Db {
     conn: Connection,
 }
 
@@ -32,7 +32,7 @@ impl std::fmt::Debug for Db {
 
 impl Db {
     /// Open or create the SQLite database at `path`.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(
@@ -72,7 +72,7 @@ impl Db {
 
     // ── Checkpoint ──────────────────────────────────────────────────────────
 
-    pub fn get_checkpoint(&self) -> u64 {
+    pub(crate) fn get_checkpoint(&self) -> u64 {
         self.conn
             .query_row("SELECT value FROM meta WHERE key = 'checkpoint'", [], |row| {
                 row.get::<_, String>(0)
@@ -82,7 +82,7 @@ impl Db {
             .unwrap_or(0)
     }
 
-    pub fn save_checkpoint(&self, block_number: u64) {
+    pub(crate) fn save_checkpoint(&self, block_number: u64) {
         if let Err(e) = self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('checkpoint', ?1)",
             params![block_number.to_string()],
@@ -96,7 +96,7 @@ impl Db {
     /// Last L1 block successfully polled by the L1 listener.
     /// On restart, the listener resumes from `get_l1_checkpoint().map(|b| b + 1).unwrap_or(l1_start_block)`.
     /// Returns `None` if never set — distinguishes "not persisted" from "persisted block 0".
-    pub fn get_l1_checkpoint(&self) -> Option<u64> {
+    pub(crate) fn get_l1_checkpoint(&self) -> Option<u64> {
         self.conn
             .query_row("SELECT value FROM meta WHERE key = 'l1_checkpoint'", [], |row| {
                 row.get::<_, String>(0)
@@ -105,7 +105,7 @@ impl Db {
             .and_then(|s| s.parse().ok())
     }
 
-    pub fn save_l1_checkpoint(&self, block_number: u64) {
+    pub(crate) fn save_l1_checkpoint(&self, block_number: u64) {
         if let Err(e) = self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('l1_checkpoint', ?1)",
             params![block_number.to_string()],
@@ -119,7 +119,7 @@ impl Db {
     /// to_block of the last successfully preconfirmed batch.
     /// Used to recover `next_batch_from_block` on restart when pending_batches is empty.
     /// Returns None if no batch has ever been preconfirmed.
-    pub fn get_last_batch_end(&self) -> Option<u64> {
+    pub(crate) fn get_last_batch_end(&self) -> Option<u64> {
         self.conn
             .query_row("SELECT value FROM meta WHERE key = 'last_batch_end'", [], |row| {
                 row.get::<_, String>(0)
@@ -128,7 +128,7 @@ impl Db {
             .and_then(|s| s.parse().ok())
     }
 
-    pub fn save_last_batch_end(&self, block_number: u64) {
+    pub(crate) fn save_last_batch_end(&self, block_number: u64) {
         if let Err(e) = self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('last_batch_end', ?1)",
             params![block_number.to_string()],
@@ -139,7 +139,7 @@ impl Db {
 
     // ── Responses ───────────────────────────────────────────────────────────
 
-    pub fn save_response(&self, resp: &EthExecutionResponse) {
+    pub(crate) fn save_response(&self, resp: &EthExecutionResponse) {
         let blob = match bincode::serialize(resp) {
             Ok(b) => b,
             Err(e) => {
@@ -155,16 +155,7 @@ impl Db {
         }
     }
 
-    pub fn delete_responses(&self, from_block: u64, to_block: u64) {
-        if let Err(e) = self.conn.execute(
-            "DELETE FROM block_responses WHERE block_number BETWEEN ?1 AND ?2",
-            params![from_block, to_block],
-        ) {
-            error!(err = %e, "Failed to delete block responses");
-        }
-    }
-
-    pub fn delete_response(&self, block_number: u64) {
+    pub(crate) fn delete_response(&self, block_number: u64) {
         if let Err(e) = self
             .conn
             .execute("DELETE FROM block_responses WHERE block_number = ?1", params![block_number])
@@ -173,7 +164,7 @@ impl Db {
         }
     }
 
-    pub fn load_responses(&self) -> Vec<EthExecutionResponse> {
+    pub(crate) fn load_responses(&self) -> Vec<EthExecutionResponse> {
         let mut stmt =
             match self.conn.prepare("SELECT response FROM block_responses ORDER BY block_number") {
                 Ok(s) => s,
@@ -189,7 +180,7 @@ impl Db {
         blobs.into_iter().filter_map(|b| bincode::deserialize(&b).ok()).collect()
     }
 
-    pub fn get_all_response_block_numbers(&self) -> Vec<u64> {
+    pub(crate) fn get_all_response_block_numbers(&self) -> Vec<u64> {
         let mut stmt = match self
             .conn
             .prepare("SELECT block_number FROM block_responses ORDER BY block_number")
@@ -204,7 +195,7 @@ impl Db {
 
     // ── Batches ─────────────────────────────────────────────────────────────
 
-    pub fn save_batch(&self, batch: &PendingBatch) {
+    pub(crate) fn save_batch(&self, batch: &PendingBatch) {
         if let Err(e) = self.conn.execute(
             "INSERT OR REPLACE INTO pending_batches(batch_index, from_block, to_block, blobs_accepted)
              VALUES(?1, ?2, ?3, ?4)",
@@ -214,7 +205,7 @@ impl Db {
         }
     }
 
-    pub fn update_blobs_accepted(&self, batch_index: u64) {
+    pub(crate) fn update_blobs_accepted(&self, batch_index: u64) {
         if let Err(e) = self.conn.execute(
             "UPDATE pending_batches SET blobs_accepted = 1 WHERE batch_index = ?1",
             params![batch_index],
@@ -223,16 +214,7 @@ impl Db {
         }
     }
 
-    pub fn delete_batch(&self, batch_index: u64) {
-        if let Err(e) = self
-            .conn
-            .execute("DELETE FROM pending_batches WHERE batch_index = ?1", params![batch_index])
-        {
-            error!(err = %e, batch_index, "Failed to delete batch");
-        }
-    }
-
-    pub fn load_batches(&self) -> Vec<PendingBatch> {
+    pub(crate) fn load_batches(&self) -> Vec<PendingBatch> {
         let mut stmt = match self.conn.prepare(
             "SELECT batch_index, from_block, to_block, blobs_accepted FROM pending_batches ORDER BY batch_index",
         ) {
@@ -256,7 +238,7 @@ impl Db {
 
     // ── Batch signatures ─────────────────────────────────────────────────────
 
-    pub fn save_batch_signature(&self, batch_index: u64, resp: &SubmitBatchResponse) {
+    pub(crate) fn save_batch_signature(&self, batch_index: u64, resp: &SubmitBatchResponse) {
         let blob = match bincode::serialize(resp) {
             Ok(b) => b,
             Err(e) => {
@@ -272,7 +254,7 @@ impl Db {
         }
     }
 
-    pub fn get_batch_signature(&self, batch_index: u64) -> Option<SubmitBatchResponse> {
+    pub(crate) fn get_batch_signature(&self, batch_index: u64) -> Option<SubmitBatchResponse> {
         let blob: Vec<u8> = self
             .conn
             .query_row(
@@ -284,17 +266,7 @@ impl Db {
         bincode::deserialize(&blob).ok()
     }
 
-    pub fn has_batch_signature(&self, batch_index: u64) -> bool {
-        self.conn
-            .query_row(
-                "SELECT 1 FROM batch_signatures WHERE batch_index = ?1",
-                params![batch_index],
-                |_| Ok(()),
-            )
-            .is_ok()
-    }
-
-    pub fn delete_batch_signature(&self, batch_index: u64) {
+    pub(crate) fn delete_batch_signature(&self, batch_index: u64) {
         if let Err(e) = self
             .conn
             .execute("DELETE FROM batch_signatures WHERE batch_index = ?1", params![batch_index])
@@ -305,7 +277,7 @@ impl Db {
 
     // ── Pending blobs accepted ───────────────────────────────────────────────
 
-    pub fn save_pending_blobs_accepted(&self, batch_index: u64) {
+    pub(crate) fn save_pending_blobs_accepted(&self, batch_index: u64) {
         if let Err(e) = self.conn.execute(
             "INSERT OR IGNORE INTO pending_blobs_accepted(batch_index) VALUES(?1)",
             params![batch_index],
@@ -314,7 +286,7 @@ impl Db {
         }
     }
 
-    pub fn delete_pending_blobs_accepted(&self, batch_index: u64) {
+    pub(crate) fn delete_pending_blobs_accepted(&self, batch_index: u64) {
         if let Err(e) = self.conn.execute(
             "DELETE FROM pending_blobs_accepted WHERE batch_index = ?1",
             params![batch_index],
@@ -323,7 +295,7 @@ impl Db {
         }
     }
 
-    pub fn load_pending_blobs_accepted(&self) -> Vec<u64> {
+    pub(crate) fn load_pending_blobs_accepted(&self) -> Vec<u64> {
         let mut stmt = match self.conn.prepare("SELECT batch_index FROM pending_blobs_accepted") {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -337,7 +309,7 @@ impl Db {
 
     /// Atomically move a batch from pending to dispatched.
     /// Single transaction: DELETE from pending + INSERT into dispatched.
-    pub fn move_to_dispatched(
+    pub(crate) fn move_to_dispatched(
         &mut self,
         batch_index: u64,
         from_block: u64,
@@ -374,7 +346,7 @@ impl Db {
 
     /// Atomically clean up a finalized dispatched batch.
     /// Single transaction: DELETE dispatched + DELETE responses + DELETE signature.
-    pub fn finalize_dispatched_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
+    pub(crate) fn finalize_dispatched_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
         let tx = match self.conn.transaction() {
             Ok(tx) => tx,
             Err(e) => {
@@ -410,7 +382,7 @@ impl Db {
 
     /// Move a dispatched batch back to pending (reorg recovery).
     /// Single transaction: DELETE from dispatched + INSERT into pending.
-    pub fn undispatch_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
+    pub(crate) fn undispatch_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
         let tx = match self.conn.transaction() {
             Ok(tx) => tx,
             Err(e) => {
@@ -438,7 +410,7 @@ impl Db {
         }
     }
 
-    pub fn load_dispatched_batches(&self) -> Vec<(u64, u64, u64, Vec<u8>, u64)> {
+    pub(crate) fn load_dispatched_batches(&self) -> Vec<(u64, u64, u64, Vec<u8>, u64)> {
         let mut stmt = match self.conn.prepare(
             "SELECT batch_index, from_block, to_block, tx_hash, l1_block
              FROM dispatched_batches ORDER BY batch_index",

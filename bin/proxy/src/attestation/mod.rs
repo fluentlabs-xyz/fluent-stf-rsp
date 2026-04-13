@@ -90,14 +90,12 @@ mod tests {
     /// Debug: parse CBOR directly to inspect PCRs map
     #[test]
     fn test_debug_pcrs_from_cbor() {
-        use serde::Deserialize;
         use serde_bytes::ByteBuf;
 
-        #[derive(Deserialize)]
-        struct CoseSign1(ByteBuf, ciborium::Value, ByteBuf, ByteBuf);
-
-        let cose: CoseSign1 = ciborium::from_reader(ATTESTATION_BYTES).unwrap();
-        let payload = &cose.2[..];
+        let (_protected, _unprotected, payload, _signature):
+            (ByteBuf, ciborium::Value, ByteBuf, ByteBuf) =
+            ciborium::from_reader(ATTESTATION_BYTES).unwrap();
+        let payload = &payload[..];
 
         // Parse as raw ciborium::Value to see what PCRs looks like
         let raw: ciborium::Value = ciborium::from_reader(payload).unwrap();

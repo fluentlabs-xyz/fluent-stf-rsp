@@ -1046,15 +1046,11 @@ pub fn transition_multiproofs_to_tries(
         let node = MptNode::decode(rlp_bytes).map_err(FromProofError::DecodingError)?;
 
         let reference = node.reference();
-        if !state_nodes.contains_key(&reference) {
-            state_nodes.insert(reference, node.clone());
-        }
+        state_nodes.entry(reference).or_insert_with(|| node.clone());
 
         for short_node in shorten_node_path(&node) {
             let short_ref = short_node.reference();
-            if !state_nodes.contains_key(&short_ref) {
-                state_nodes.insert(short_ref, short_node);
-            }
+            state_nodes.entry(short_ref).or_insert(short_node);
         }
     }
 
@@ -1093,15 +1089,11 @@ pub fn transition_multiproofs_to_tries(
                 let node = MptNode::decode(rlp_bytes).map_err(FromProofError::DecodingError)?;
 
                 let reference = node.reference();
-                if !storage_nodes.contains_key(&reference) {
-                    storage_nodes.insert(reference, node.clone());
-                }
+                storage_nodes.entry(reference).or_insert_with(|| node.clone());
 
                 for short_node in shorten_node_path(&node) {
                     let short_ref = short_node.reference();
-                    if !storage_nodes.contains_key(&short_ref) {
-                        storage_nodes.insert(short_ref, short_node);
-                    }
+                    storage_nodes.entry(short_ref).or_insert(short_node);
                 }
             }
         }

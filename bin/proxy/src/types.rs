@@ -42,14 +42,10 @@ pub(crate) struct NitroConfig {
     pub enclave_cid: u32,
     /// VSOCK port the enclave listens on for execution requests.
     pub enclave_port: u32,
-    /// Number of vCPUs allocated to the enclave (`--cpu-count`).
-    pub cpu_count: u32,
-    /// RAM in MiB allocated to the enclave (`--memory`).
-    pub memory_mib: u32,
 }
 
 impl Default for NitroConfig {
     fn default() -> Self {
-        Self { enclave_cid: 10, enclave_port: 5005, cpu_count: 2, memory_mib: 1024 }
+        Self { enclave_cid: 10, enclave_port: 5005 }
     }
 }

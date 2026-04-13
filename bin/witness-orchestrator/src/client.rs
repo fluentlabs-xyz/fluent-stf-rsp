@@ -70,7 +70,7 @@ const FALLBACK_BATCH_SIZE: usize = 128;
 
 /// Configuration for the orchestrator.
 #[derive(Clone)]
-pub struct OrchestratorConfig<P: Provider + Clone + 'static> {
+pub(crate) struct OrchestratorConfig<P: Provider + Clone + 'static> {
     pub server_addr: String,
     pub proxy_url: String,
     pub db_path: PathBuf,
@@ -141,6 +141,7 @@ enum GrpcEvent {
 /// For lazy tasks (`payload: None`), fetches the witness JIT via gRPC
 /// `GetWitness` — this avoids holding large payloads in memory while
 /// waiting in the channel queue.
+#[allow(clippy::too_many_arguments)]
 async fn execution_worker(
     worker_id: usize,
     high_rx: AsyncReceiver<ExecutionTask>,
@@ -349,7 +350,7 @@ async fn fallback_worker(
 ///
 /// Creates persistent worker pools and channels once, then reconnects to the
 /// gRPC witness stream on failure with exponential backoff.
-pub async fn run<P: Provider + Clone + 'static>(
+pub(crate) async fn run<P: Provider + Clone + 'static>(
     config: OrchestratorConfig<P>,
     mut l1_events: mpsc::Receiver<L1Event>,
 ) -> ! {
@@ -544,7 +545,7 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
         from_block: u64,
     ) {
         match event {
-            L1Event::BatchCommitted { batch_index, expected_blobs: _, batch_root: _, num_blocks } => {
+            L1Event::BatchCommitted { batch_index, num_blocks } => {
                 let from = next_batch_from_block.unwrap_or(from_block);
                 let to = from + num_blocks.saturating_sub(1);
                 info!(batch_index, from, to, num_blocks, "Setting batch from L1 event");
@@ -1154,6 +1155,7 @@ async fn run_stream<P: Provider + Clone + 'static>(
 /// Returns `SignOutcome::Signed` on success (signature persisted to DB),
 /// or `SignOutcome::InvalidSignatures` on key rotation (409).
 /// Transient errors are retried with exponential backoff (50ms → 2s).
+#[allow(clippy::too_many_arguments)]
 async fn sign_batch_io(
     http_client: &reqwest::Client,
     proxy_url: &str,
@@ -1246,6 +1248,7 @@ async fn sign_batch_io(
 }
 
 /// Call the proxy's `/sign-batch-root` endpoint.
+#[allow(clippy::too_many_arguments)]
 async fn call_sign_batch_root(
     http_client: &reqwest::Client,
     proxy_url: &str,
