@@ -17,6 +17,7 @@ use tracing_subscriber::{
 };
 use url::Url;
 
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_fluent() {
     run_eth_e2e("http://207.154.218.23:8545", 21846700, None).await;

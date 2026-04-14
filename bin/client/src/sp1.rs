@@ -133,10 +133,13 @@ pub fn main() {
     // 2. Decanonicalize + brotli decompress + hash blob tx_data
     //    Compute blob_tx_data_hash early and drop decompressed BEFORE STF execution
     //    to avoid holding ~MBs of decompressed payload during the memory-heavy executor step.
-    let blob_tx_data_hash = {
+    //    Also capture the blob's L2BlockHeader fields (owned, Copy) for cross-check
+    //    against STF execution output below.
+    let (blob_tx_data_hash, blob_l2_header) = {
         let (header, decompressed) = blob::decode_blob_payload(&blob_input.blobs).unwrap();
-        let tx_data = blob::extract_block_tx_data(&header, &decompressed, block_number).unwrap();
-        B256::from_slice(&Sha256::digest(tx_data))
+        let (l2_header, tx_data) =
+            blob::extract_block(&header, &decompressed, block_number).unwrap();
+        (B256::from_slice(&Sha256::digest(tx_data)), l2_header)
         // decompressed dropped here
     };
 
@@ -191,8 +194,23 @@ pub fn main() {
     // 5. Compare blob tx_data hash with execution tx_data hash
     assert_eq!(tx_data_hash_exec, blob_tx_data_hash, "Data integrity mismatch: EXEC vs DA");
 
-    // 6. Commit results for L1 Verifier
+    // 5a. Bind blob L2BlockHeader against STF execution output.
     let block_hash = header.hash_slow();
+    assert_eq!(
+        blob_l2_header.previous_block_hash, header.parent_hash,
+        "DA/STF parent_hash mismatch"
+    );
+    assert_eq!(blob_l2_header.block_hash, block_hash, "DA/STF block_hash mismatch");
+    assert_eq!(
+        blob_l2_header.withdrawal_root, events_hash.withdrawal_hash,
+        "DA/STF withdrawal_root mismatch"
+    );
+    assert_eq!(
+        blob_l2_header.deposit_root, events_hash.deposit_hash,
+        "DA/STF deposit_root mismatch"
+    );
+
+    // 6. Commit results for L1 Verifier
     sp1_zkvm::io::commit(&header.parent_hash);
     sp1_zkvm::io::commit(&block_hash);
     sp1_zkvm::io::commit(&events_hash.withdrawal_hash);
