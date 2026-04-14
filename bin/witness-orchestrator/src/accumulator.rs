@@ -220,8 +220,9 @@ impl BatchAccumulator {
     pub(crate) async fn purge_responses(&mut self, blocks: &[u64]) {
         for &block in blocks {
             self.responses.remove(&block);
-            self.persist(move |db| db.delete_response(block)).await;
         }
+        let owned = blocks.to_vec();
+        self.persist(move |db| db.delete_responses_batch(&owned)).await;
         info!(count = blocks.len(), "Purged stale responses for key rotation recovery");
     }
 

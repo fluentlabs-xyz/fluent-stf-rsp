@@ -17,38 +17,14 @@ pub struct ProveRequest {
 /// Arc-wrapped prove request for cheap cloning across broadcast subscribers.
 pub type SharedProveRequest = Arc<ProveRequest>;
 
-// ---------------------------------------------------------------------------
-// Mirror types from `fluent-nitro-types` (different workspace)
-// ---------------------------------------------------------------------------
+// Shared enclave response types live in the `nitro-types` workspace crate
+// so the orchestrator, proxy, and enclave cannot drift out of bincode sync.
+pub use nitro_types::{EthExecutionResponse, SubmitBatchResponse};
 
-use alloy_primitives::{Address, B256};
-use serde_big_array::BigArray;
-
-/// Per-block execution response from the Nitro enclave.
-///
-/// Mirror of `nitro_types::EthExecutionResponse` — kept in sync manually.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EthExecutionResponse {
-    pub block_number: u64,
-    pub leaf: [u8; 32],
-    pub tx_data_hash: B256,
-    #[serde(with = "BigArray")]
-    pub signature: [u8; 64],
-}
-
-/// Batch signing response from the Nitro enclave.
-///
-/// Mirror of `nitro_types::SubmitBatchResponse` — kept in sync manually.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SubmitBatchResponse {
-    pub batch_root: Vec<u8>,
-    pub versioned_hashes: Vec<B256>,
-    pub signature: Vec<u8>,
-}
+use alloy_primitives::Address;
 
 /// Response from proxy when batch signing fails due to enclave key rotation.
-///
-/// Mirror of proxy's `InvalidSignaturesResponse`.
+/// Proxy-owned type — kept local because it is not part of `nitro-types`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InvalidSignaturesResponse {
     pub invalid_blocks: Vec<u64>,

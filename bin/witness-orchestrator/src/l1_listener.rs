@@ -16,7 +16,8 @@ use alloy_sol_types::SolEvent;
 use eyre::{eyre, Result};
 use l1_rollup_client::{BatchCommitted, BatchPreconfirmed, BatchSubmitted};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // Event types sent to orchestrator
@@ -49,6 +50,21 @@ pub(crate) enum L1Event {
 const POLL_INTERVAL_SECS: u64 = 6;
 const MAX_POLL_BACKOFF_SECS: u64 = 120;
 
+const MIN_PAGE: u64 = 100;
+const MAX_PAGE: u64 = 10_000;
+const INITIAL_PAGE: u64 = 2_000;
+
+fn is_too_many_results(err_msg: &str) -> bool {
+    let s = err_msg.to_lowercase();
+    s.contains("-32005")
+        || s.contains("limit exceeded")
+        || s.contains("too many results")
+        || s.contains("log response size exceeded")
+        || s.contains("query returned more than")
+        || s.contains("please limit your query")
+        || s.contains("range is too large")
+}
+
 /// Number of blocks to lag behind `latest` to avoid L1 reorgs.
 const L1_SAFE_BLOCKS: u64 = 3;
 
@@ -69,7 +85,8 @@ pub(crate) async fn run(
     contract_addr: Address,
     mut from_block: u64,
     tx: mpsc::Sender<L1Event>,
-) -> ! {
+    shutdown: CancellationToken,
+) {
     info!(
         %contract_addr,
         from_block,
@@ -77,12 +94,28 @@ pub(crate) async fn run(
     );
 
     let mut backoff_secs = POLL_INTERVAL_SECS;
+    let mut page_size: u64 = INITIAL_PAGE;
 
     loop {
-        match poll_once(&l1_provider, contract_addr, from_block, &tx).await {
+        if shutdown.is_cancelled() {
+            info!("Shutdown requested — exiting listener");
+            break;
+        }
+        // Secondary guard: if the consumer dropped the receiver without
+        // going through the shutdown token, the Partial/Err retry cycle
+        // would otherwise spin forever.
+        if tx.is_closed() {
+            warn!("L1 event channel closed — exiting listener");
+            break;
+        }
+
+        match poll_once(&l1_provider, contract_addr, from_block, &mut page_size, &tx, &shutdown)
+            .await
+        {
             Ok(PollOutcome::Complete(latest)) => {
                 if tx.send(L1Event::Checkpoint(latest)).await.is_err() {
                     warn!(latest, "L1 event channel closed");
+                    break;
                 }
                 from_block = latest + 1;
                 backoff_secs = POLL_INTERVAL_SECS; // reset on full success
@@ -90,6 +123,7 @@ pub(crate) async fn run(
             Ok(PollOutcome::Partial(last_ok)) => {
                 if tx.send(L1Event::Checkpoint(last_ok)).await.is_err() {
                     warn!(last_ok, "L1 event channel closed");
+                    break;
                 }
                 from_block = last_ok + 1;
                 // Escalate backoff — don't reset, we hit rate limits
@@ -102,11 +136,17 @@ pub(crate) async fn run(
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("Shutdown requested mid-backoff — exiting listener");
+                break;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+        }
     }
-}
 
-const PAGE_SIZE: u64 = 2_000;
+    info!("L1 listener exiting");
+}
 
 /// Single poll iteration: fetch logs from `from_block` to latest, paginated.
 /// Returns `Complete` on full success, `Partial` on page failure with progress saved.
@@ -114,7 +154,9 @@ async fn poll_once(
     provider: &RootProvider,
     contract_addr: Address,
     from_block: u64,
+    page_size: &mut u64,
     tx: &mpsc::Sender<L1Event>,
+    shutdown: &CancellationToken,
 ) -> Result<PollOutcome> {
     let raw_latest =
         provider.get_block_number().await.map_err(|e| eyre!("Failed to get latest block: {e}"))?;
@@ -125,19 +167,42 @@ async fn poll_once(
     }
 
     let mut current = from_block;
-    // Track last fully-processed page so we can return partial progress on error.
     let mut last_ok = from_block.saturating_sub(1);
 
     while current <= latest_block {
-        let page_end = (current + PAGE_SIZE - 1).min(latest_block);
+        let page_end = (current + *page_size - 1).min(latest_block);
 
-        if let Err(e) = process_page(provider, contract_addr, current, page_end, tx).await {
-            warn!(err = %e, current, page_end, "Page failed — returning partial progress");
-            return Ok(PollOutcome::Partial(last_ok));
+        match process_page(provider, contract_addr, current, page_end, tx).await {
+            Ok(()) => {
+                last_ok = page_end;
+                current = page_end + 1;
+                *page_size = (*page_size + 100).min(MAX_PAGE);
+            }
+            Err(e) if is_too_many_results(&format!("{e}")) => {
+                if shutdown.is_cancelled() {
+                    return Ok(PollOutcome::Partial(last_ok));
+                }
+                let prev = *page_size;
+                *page_size = (*page_size / 2).max(MIN_PAGE);
+                warn!(new_page_size = *page_size, "RPC log limit hit — shrinking page");
+                // If already at MIN_PAGE and still hitting the limit, bail
+                // with partial progress so the outer backoff can kick in —
+                // otherwise we spin retrying the same range forever.
+                if prev == MIN_PAGE {
+                    warn!(
+                        current,
+                        page_end,
+                        "RPC limit hit at MIN_PAGE — returning partial progress"
+                    );
+                    return Ok(PollOutcome::Partial(last_ok));
+                }
+                continue;
+            }
+            Err(e) => {
+                warn!(err = %e, current, page_end, "Page failed — returning partial progress");
+                return Ok(PollOutcome::Partial(last_ok));
+            }
         }
-
-        last_ok = page_end;
-        current = page_end + 1;
     }
 
     Ok(PollOutcome::Complete(latest_block))
@@ -170,61 +235,65 @@ async fn process_page(
         let topic0 = log.topic0().copied().unwrap_or_default();
 
         if topic0 == BatchCommitted::SIGNATURE_HASH {
-            match BatchCommitted::decode_log_data(&log.inner.data) {
-                Ok(event) => {
-                    let batch_index: u64 = event
-                        .batchIndex
-                        .try_into()
-                        .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-                    let num_blocks: u64 = event
-                        .numberOfBlocks
-                        .try_into()
-                        .map_err(|_| eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks))?;
-                    info!(batch_index, num_blocks, "BatchCommitted event");
+            let event = BatchCommitted::decode_log_data(&log.inner.data).map_err(|e| {
+                eyre!(
+                    "Failed to decode BatchCommitted at L1 block {:?}: {e}",
+                    log.block_number
+                )
+            })?;
+            let batch_index: u64 = event
+                .batchIndex
+                .try_into()
+                .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
+            let num_blocks: u64 = event
+                .numberOfBlocks
+                .try_into()
+                .map_err(|_| eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks))?;
+            if num_blocks == 0 {
+                return Err(eyre!(
+                    "BatchCommitted with num_blocks=0 (batch_index={batch_index}) — refusing to advance checkpoint"
+                ));
+            }
+            info!(batch_index, num_blocks, "BatchCommitted event");
 
-                    if tx.send(L1Event::BatchCommitted { batch_index, num_blocks }).await.is_err() {
-                        warn!(batch_index, "L1 event channel closed");
-                    }
-                }
-                Err(e) => error!(err = %e, "Failed to decode BatchCommitted"),
+            if tx.send(L1Event::BatchCommitted { batch_index, num_blocks }).await.is_err() {
+                return Err(eyre!("L1 event channel closed"));
             }
         } else if topic0 == BatchSubmitted::SIGNATURE_HASH {
-            match BatchSubmitted::decode_log_data(&log.inner.data) {
-                Ok(event) => {
-                    let batch_index: u64 = event
-                        .batchIndex
-                        .try_into()
-                        .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-                    info!(batch_index, "BatchSubmitted event");
-                    if tx.send(L1Event::BatchSubmitted { batch_index }).await.is_err() {
-                        warn!(batch_index, "L1 event channel closed");
-                    }
-                }
-                Err(e) => error!(err = %e, "Failed to decode BatchSubmitted"),
+            let event = BatchSubmitted::decode_log_data(&log.inner.data).map_err(|e| {
+                eyre!(
+                    "Failed to decode BatchSubmitted at L1 block {:?}: {e}",
+                    log.block_number
+                )
+            })?;
+            let batch_index: u64 = event
+                .batchIndex
+                .try_into()
+                .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
+            info!(batch_index, "BatchSubmitted event");
+            if tx.send(L1Event::BatchSubmitted { batch_index }).await.is_err() {
+                return Err(eyre!("L1 event channel closed"));
             }
         } else if topic0 == BatchPreconfirmed::SIGNATURE_HASH {
-            match BatchPreconfirmed::decode_log_data(&log.inner.data) {
-                Ok(event) => {
-                    let batch_index: u64 = event
-                        .batchIndex
-                        .try_into()
-                        .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-                    let tx_hash = log
-                        .transaction_hash
-                        .ok_or_else(|| eyre!("BatchPreconfirmed log missing transaction_hash"))?;
-                    let l1_block = log
-                        .block_number
-                        .ok_or_else(|| eyre!("BatchPreconfirmed log missing block_number"))?;
-                    info!(batch_index, %tx_hash, l1_block, "BatchPreconfirmed event");
-                    if tx
-                        .send(L1Event::Preconfirmed { batch_index, tx_hash, l1_block })
-                        .await
-                        .is_err()
-                    {
-                        warn!(batch_index, "L1 event channel closed");
-                    }
-                }
-                Err(e) => error!(err = %e, "Failed to decode BatchPreconfirmed"),
+            let event = BatchPreconfirmed::decode_log_data(&log.inner.data).map_err(|e| {
+                eyre!(
+                    "Failed to decode BatchPreconfirmed at L1 block {:?}: {e}",
+                    log.block_number
+                )
+            })?;
+            let batch_index: u64 = event
+                .batchIndex
+                .try_into()
+                .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
+            let tx_hash = log
+                .transaction_hash
+                .ok_or_else(|| eyre!("BatchPreconfirmed log missing transaction_hash"))?;
+            let l1_block = log
+                .block_number
+                .ok_or_else(|| eyre!("BatchPreconfirmed log missing block_number"))?;
+            info!(batch_index, %tx_hash, l1_block, "BatchPreconfirmed event");
+            if tx.send(L1Event::Preconfirmed { batch_index, tx_hash, l1_block }).await.is_err() {
+                return Err(eyre!("L1 event channel closed"));
             }
         }
     }

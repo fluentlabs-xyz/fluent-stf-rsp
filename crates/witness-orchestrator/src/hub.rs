@@ -15,8 +15,9 @@
 //! holds ~12-30 blocks — more than enough for a co-located courier restart
 //! (typically 1-3 seconds).
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -30,11 +31,24 @@ use crate::types::{ProveRequest, SharedProveRequest};
 /// before it gets `Lagged` and must reconnect.
 const BROADCAST_CAPACITY: usize = 1024;
 
+/// Subtract `sub` from `counter` without wrapping below zero.
+/// Counter drift in the cold tier (e.g. files deleted out-of-band, missing
+/// metadata on eviction) must never produce a huge `u64` value that then
+/// triggers the FIFO loop to delete the entire directory.
+fn saturating_sub_atomic(counter: &AtomicU64, sub: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _ = counter.fetch_update(Relaxed, Relaxed, |cur| Some(cur.saturating_sub(sub)));
+}
+
 struct ColdTier {
     dir: PathBuf,
-    index: Arc<StdRwLock<BTreeSet<u64>>>,
+    /// Maps block_number → compressed file size. Authoritative source of
+    /// truth for byte-accounting: every size used to decrement
+    /// `current_dir_bytes` comes from here, never from `fs::metadata` —
+    /// otherwise a NotFound branch cannot deduct (file already gone).
+    index: Arc<StdRwLock<BTreeMap<u64, u64>>>,
     tx: mpsc::Sender<SharedProveRequest>,
-    current_dir_bytes: Arc<std::sync::atomic::AtomicU64>,
+    current_dir_bytes: Arc<AtomicU64>,
 }
 
 /// Maximum age of cold-tier files in blocks. Older files are evicted.
@@ -43,9 +57,9 @@ const MAX_COLD_AGE: u64 = 60 * 60 * 48; // ~48h at 1 block/sec
 async fn run_cold_writer(
     mut rx: mpsc::Receiver<SharedProveRequest>,
     dir: PathBuf,
-    index: Arc<StdRwLock<BTreeSet<u64>>>,
+    index: Arc<StdRwLock<BTreeMap<u64, u64>>>,
     max_dir_bytes: u64,
-    current_dir_bytes: Arc<std::sync::atomic::AtomicU64>,
+    current_dir_bytes: Arc<AtomicU64>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -74,94 +88,65 @@ async fn run_cold_writer(
         let final_path = dir.join(format!("{block_number}.bin"));
 
         match tokio::fs::write(&tmp_path, &compressed).await {
-            Ok(()) => {
-                match tokio::fs::rename(&tmp_path, &final_path).await {
-                    Ok(()) => {
-                        index.write().unwrap_or_else(|e| e.into_inner()).insert(block_number);
-                        current_dir_bytes.fetch_add(compressed_len, Relaxed);
-                        info!(block_number, compressed_bytes = compressed_len, "Cold: written");
+            Ok(()) => match tokio::fs::rename(&tmp_path, &final_path).await {
+                Ok(()) => {
+                    index
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(block_number, compressed_len);
+                    current_dir_bytes.fetch_add(compressed_len, Relaxed);
+                    info!(block_number, compressed_bytes = compressed_len, "Cold: written");
 
-                        // FIFO eviction
-                        while current_dir_bytes.load(Relaxed) > max_dir_bytes {
-                            let oldest = {
-                                let idx = index.read().unwrap_or_else(|e| e.into_inner());
-                                idx.iter().next().copied()
-                            };
-                            let Some(oldest_block) = oldest else { break };
-                            let path = dir.join(format!("{oldest_block}.bin"));
-                            match tokio::fs::metadata(&path).await {
-                                Ok(m) => {
-                                    let file_size = m.len();
-                                    if let Err(e) = tokio::fs::remove_file(&path).await {
-                                        warn!(oldest_block, err = %e, "Cold eviction: remove failed");
-                                        break;
-                                    }
-                                    index
-                                        .write()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .remove(&oldest_block);
-                                    current_dir_bytes.fetch_sub(file_size, Relaxed);
-                                    info!(
-                                        oldest_block,
-                                        freed_bytes = file_size,
-                                        "Cold: evicted oldest"
-                                    );
-                                }
-                                Err(_) => {
-                                    index
-                                        .write()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .remove(&oldest_block);
-                                    break;
-                                }
-                            }
+                    // FIFO eviction — size comes from the index, not fs::metadata.
+                    while current_dir_bytes.load(Relaxed) > max_dir_bytes {
+                        let oldest = {
+                            let idx = index.read().unwrap_or_else(|e| e.into_inner());
+                            idx.iter().next().map(|(&k, &v)| (k, v))
+                        };
+                        let Some((oldest_block, size)) = oldest else { break };
+                        let path = dir.join(format!("{oldest_block}.bin"));
+                        if let Err(e) = tokio::fs::remove_file(&path).await {
+                            error!(oldest_block, err = %e, "Cold eviction: remove failed — dropping from index anyway to prevent eviction loop");
                         }
-
-                        // Age-based eviction
-                        loop {
-                            let oldest = {
-                                let idx = index.read().unwrap_or_else(|e| e.into_inner());
-                                idx.iter().next().copied()
-                            };
-                            let Some(oldest_block) = oldest else { break };
-                            if block_number.saturating_sub(oldest_block) < MAX_COLD_AGE {
-                                break;
-                            }
-                            let path = dir.join(format!("{oldest_block}.bin"));
-                            match tokio::fs::metadata(&path).await {
-                                Ok(m) => {
-                                    let file_size = m.len();
-                                    if let Err(e) = tokio::fs::remove_file(&path).await {
-                                        warn!(oldest_block, err = %e, "Cold age eviction: remove failed");
-                                        break;
-                                    }
-                                    index
-                                        .write()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .remove(&oldest_block);
-                                    current_dir_bytes.fetch_sub(file_size, Relaxed);
-                                    info!(
-                                        oldest_block,
-                                        age = block_number - oldest_block,
-                                        "Cold: age-evicted"
-                                    );
-                                }
-                                Err(_) => {
-                                    index
-                                        .write()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .remove(&oldest_block);
-                                    break;
-                                }
-                            }
-                        }
+                        index
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&oldest_block);
+                        saturating_sub_atomic(&current_dir_bytes, size);
+                        info!(oldest_block, freed_bytes = size, "Cold: evicted oldest");
                     }
-                    Err(e) => {
-                        error!(block_number, err = %e, "Cold rename failed");
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
+
+                    // Age-based eviction.
+                    loop {
+                        let oldest = {
+                            let idx = index.read().unwrap_or_else(|e| e.into_inner());
+                            idx.iter().next().map(|(&k, &v)| (k, v))
+                        };
+                        let Some((oldest_block, size)) = oldest else { break };
+                        if block_number.saturating_sub(oldest_block) < MAX_COLD_AGE {
+                            break;
+                        }
+                        let path = dir.join(format!("{oldest_block}.bin"));
+                        if let Err(e) = tokio::fs::remove_file(&path).await {
+                            error!(oldest_block, err = %e, "Cold age eviction: remove failed — dropping from index anyway");
+                        }
+                        index
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&oldest_block);
+                        saturating_sub_atomic(&current_dir_bytes, size);
+                        info!(
+                            oldest_block,
+                            age = block_number - oldest_block,
+                            "Cold: age-evicted"
+                        );
                     }
                 }
-            }
+                Err(e) => {
+                    error!(block_number, err = %e, "Cold rename failed");
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                }
+            },
             Err(e) => {
                 error!(block_number, err = %e, "Cold write failed");
             }
@@ -245,7 +230,7 @@ impl WitnessHub {
 
             // Clean up leftover .tmp files from previous crash.
             // Populate index from complete .bin files only (skip empty/corrupt).
-            let mut existing = BTreeSet::new();
+            let mut existing: BTreeMap<u64, u64> = BTreeMap::new();
             let mut initial_bytes: u64 = 0;
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for entry in rd.flatten() {
@@ -259,7 +244,7 @@ impl WitnessHub {
                         match entry.metadata() {
                             Ok(m) if m.len() > 0 => {
                                 initial_bytes += m.len();
-                                existing.insert(n);
+                                existing.insert(n, m.len());
                             }
                             _ => {
                                 let _ = std::fs::remove_file(entry.path());
@@ -269,7 +254,7 @@ impl WitnessHub {
                 }
             }
 
-            let current_dir_bytes = Arc::new(std::sync::atomic::AtomicU64::new(initial_bytes));
+            let current_dir_bytes = Arc::new(AtomicU64::new(initial_bytes));
             let index = Arc::new(StdRwLock::new(existing));
             let (cold_tx, cold_rx) = mpsc::channel(1000);
             tokio::spawn(run_cold_writer(
@@ -293,6 +278,31 @@ impl WitnessHub {
     /// If there are no active subscribers the broadcast send is silently dropped.
     pub async fn push(&self, req: Arc<ProveRequest>) {
         let payload_bytes = req.payload.len();
+
+        // Oversized witness: bypass the hot ring entirely. Pushing a
+        // payload larger than the ring's capacity would evict every
+        // existing entry (they all fit, the oversized one doesn't),
+        // nuking the replay buffer for every live subscriber. Send
+        // straight to cold tier and broadcast once.
+        {
+            let max = self.buffer.read().await.max_bytes;
+            if payload_bytes > max {
+                warn!(
+                    block_number = req.block_number,
+                    payload_bytes,
+                    max_bytes = max,
+                    "Oversized witness — bypassing ring buffer, sending to cold tier"
+                );
+                if let Some(cold) = &self.cold {
+                    if cold.tx.try_send(Arc::clone(&req)).is_err() {
+                        warn!("Cold channel full — dropping oversized witness");
+                    }
+                }
+                let _ = self.tx.send(req);
+                return;
+            }
+        }
+
         let evicted = {
             let mut buf = self.buffer.write().await;
             let evicted = buf.push(Arc::clone(&req));
@@ -349,7 +359,7 @@ impl WitnessHub {
             return vec![];
         };
         let idx = cold.index.read().unwrap_or_else(|e| e.into_inner());
-        idx.range(from..to).copied().collect()
+        idx.range(from..to).map(|(&k, _)| k).collect()
     }
 
     /// Read one cold-tier file. Returns None if not found (already deleted or never written).
@@ -363,15 +373,18 @@ impl WitnessHub {
                 {
                     Ok(Ok(payload)) => Some(Arc::new(ProveRequest { block_number, payload })),
                     Ok(Err(e)) => {
-                        use std::sync::atomic::Ordering::Relaxed;
                         warn!(block_number, err = %e, "Cold: Zstd decompression failed — deleting corrupt file");
-                        if let Ok(meta) = tokio::fs::metadata(&path).await {
-                            cold.current_dir_bytes.fetch_sub(meta.len(), Relaxed);
+                        let removed = cold
+                            .index
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&block_number);
+                        if let Some(size) = removed {
+                            saturating_sub_atomic(&cold.current_dir_bytes, size);
                         }
                         if let Err(e) = tokio::fs::remove_file(&path).await {
                             warn!(block_number, err = %e, "Failed to delete corrupt cold file");
                         }
-                        cold.index.write().unwrap_or_else(|e| e.into_inner()).remove(&block_number);
                         None
                     }
                     Err(e) => {
@@ -381,12 +394,26 @@ impl WitnessHub {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                cold.index.write().unwrap_or_else(|e| e.into_inner()).remove(&block_number);
+                let removed = cold
+                    .index
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&block_number);
+                if let Some(size) = removed {
+                    saturating_sub_atomic(&cold.current_dir_bytes, size);
+                }
                 None
             }
             Err(e) => {
                 warn!(block_number, err = %e, "Failed to read cold witness — removing from index");
-                cold.index.write().unwrap_or_else(|e| e.into_inner()).remove(&block_number);
+                let removed = cold
+                    .index
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&block_number);
+                if let Some(size) = removed {
+                    saturating_sub_atomic(&cold.current_dir_bytes, size);
+                }
                 None
             }
         }
@@ -411,28 +438,21 @@ impl WitnessHub {
         let Some(cold) = &self.cold else {
             return;
         };
-        use std::sync::atomic::Ordering::Relaxed;
 
         for block_number in blocks {
             let path = cold.dir.join(format!("{block_number}.bin"));
-            match tokio::fs::metadata(&path).await {
-                Ok(m) => {
-                    let file_size = m.len();
-                    match tokio::fs::remove_file(&path).await {
-                        Ok(()) => {
-                            cold.index
-                                .write()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .remove(&block_number);
-                            cold.current_dir_bytes.fetch_sub(file_size, Relaxed);
-                        }
-                        Err(e) => warn!(block_number, err = %e, "Failed to delete cold witness"),
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    cold.index.write().unwrap_or_else(|e| e.into_inner()).remove(&block_number);
-                }
-                Err(e) => warn!(block_number, err = %e, "Failed to stat cold witness"),
+            let removed = cold
+                .index
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&block_number);
+            if let Some(size) = removed {
+                saturating_sub_atomic(&cold.current_dir_bytes, size);
+            }
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(block_number, err = %e, "Failed to delete cold witness"),
             }
         }
     }
@@ -447,7 +467,7 @@ impl WitnessHub {
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .range(from_block..=to_block)
-                    .copied()
+                    .map(|(&k, _)| k)
                     .collect()
             })
             .unwrap_or_default();
@@ -466,7 +486,7 @@ impl WitnessHub {
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .range(..=up_to_block)
-                    .copied()
+                    .map(|(&k, _)| k)
                     .collect()
             })
             .unwrap_or_default();
@@ -483,6 +503,8 @@ impl Default for WitnessHub {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     const TEST_MAX_BYTES: usize = 1024 * 1024 * 1024;
@@ -520,5 +542,138 @@ mod tests {
         let snap = buf.snapshot_from(12);
         let numbers: Vec<u64> = snap.iter().map(|r| r.block_number).collect();
         assert_eq!(numbers, vec![12, 13, 14]);
+    }
+
+    fn unique_cold_dir(tag: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("witness_hub_{tag}_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Drive the cold writer long enough for queued writes to hit disk
+    /// and show up in the index. `run_cold_writer` is a spawned task —
+    /// tests need to yield to let it drain.
+    async fn wait_for_cold_index_size(hub: &WitnessHub, expected: usize) {
+        for _ in 0..100 {
+            let n = hub
+                .cold
+                .as_ref()
+                .map(|c| c.index.read().unwrap().len())
+                .unwrap_or(0);
+            if n == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("cold index did not reach expected size {expected}");
+    }
+
+    /// A1 fix: after the cold file is deleted out-of-band, `read_cold_block`
+    /// must still deduct the recorded size from the counter — otherwise the
+    /// counter drifts upward and FIFO eventually nukes the entire tier.
+    #[tokio::test]
+    async fn cold_drift_not_found_deducts_counter() {
+        let dir = unique_cold_dir("drift_not_found");
+        let hub = WitnessHub::new(1024 * 1024, Some(dir.clone()), 10 * 1024 * 1024);
+
+        // Push a single witness small enough to stay in the hot ring — we
+        // need it in cold explicitly, so evict it by pushing enough data
+        // to overflow the 1MiB hot buffer.
+        hub.push(Arc::new(ProveRequest { block_number: 1, payload: vec![0u8; 800 * 1024] })).await;
+        hub.push(Arc::new(ProveRequest { block_number: 2, payload: vec![0u8; 800 * 1024] })).await;
+
+        wait_for_cold_index_size(&hub, 1).await;
+
+        let bytes_before = hub.cold.as_ref().unwrap().current_dir_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(bytes_before > 0, "counter should be non-zero after cold write");
+
+        // Yank the file out from under the tier, then call read_cold_block.
+        let file = dir.join("1.bin");
+        std::fs::remove_file(&file).unwrap();
+
+        let got = hub.read_cold_block(1).await;
+        assert!(got.is_none());
+
+        let bytes_after = hub.cold.as_ref().unwrap().current_dir_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(bytes_after, 0, "NotFound branch must deduct using index size, not fs::metadata");
+        assert!(hub.cold.as_ref().unwrap().index.read().unwrap().get(&1).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sum(index.values()) == current_dir_bytes` must hold after any
+    /// sequence of inserts and evictions.
+    #[tokio::test]
+    async fn cold_index_btreemap_tracks_sizes() {
+        let dir = unique_cold_dir("index_tracks");
+        // Small hot buffer so every push spills to cold; small cold cap
+        // so FIFO kicks in after a few pushes.
+        let hub = WitnessHub::new(256 * 1024, Some(dir.clone()), 512 * 1024);
+
+        for i in 1..=6u64 {
+            hub.push(Arc::new(ProveRequest {
+                block_number: i,
+                payload: vec![i as u8; 200 * 1024],
+            }))
+            .await;
+        }
+
+        // Poll until the cold writer has drained and counter matches the
+        // index — avoids a fixed sleep that flakes on slow CI runners.
+        let cold = hub.cold.as_ref().unwrap();
+        let (sum, counter) = {
+            let mut result = (0u64, 1u64);
+            for _ in 0..200 {
+                let idx = cold.index.read().unwrap();
+                let sum: u64 = idx.values().copied().sum();
+                drop(idx);
+                let counter = cold.current_dir_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                if sum == counter && sum > 0 {
+                    result = (sum, counter);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            result
+        };
+        assert_eq!(sum, counter, "index sizes must match counter after evictions");
+        assert!(sum > 0, "expected at least one entry in cold tier");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An oversized payload must not evict the entire hot ring.
+    #[tokio::test]
+    async fn oversized_witness_bypasses_hot_buffer() {
+        let dir = unique_cold_dir("oversized");
+        let hub = WitnessHub::new(64 * 1024, Some(dir.clone()), 10 * 1024 * 1024);
+
+        // Warm the hot ring with a few normal entries.
+        for i in 1..=3u64 {
+            hub.push(Arc::new(ProveRequest { block_number: i, payload: vec![0u8; 10 * 1024] }))
+                .await;
+        }
+        assert_eq!(hub.buffer.read().await.entries.len(), 3);
+
+        // Push something too large for the ring.
+        hub.push(Arc::new(ProveRequest {
+            block_number: 100,
+            payload: vec![7u8; 128 * 1024],
+        }))
+        .await;
+
+        // Hot ring must still hold the original three.
+        let buf = hub.buffer.read().await;
+        assert_eq!(buf.entries.len(), 3);
+        assert!(buf.entries.iter().all(|r| r.block_number != 100));
+        drop(buf);
+
+        // Oversized one should have landed in cold.
+        wait_for_cold_index_size(&hub, 1).await;
+        assert!(hub.cold.as_ref().unwrap().index.read().unwrap().contains_key(&100));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -33,6 +33,7 @@ use crate::proto::{
     self,
     witness_service_server::{WitnessService, WitnessServiceServer},
 };
+use crate::MAX_GRPC_MESSAGE_SIZE;
 /// gRPC service implementation backed by a [`WitnessHub`].
 #[derive(Debug)]
 pub struct WitnessGrpcService {
@@ -172,10 +173,6 @@ impl WitnessService for WitnessGrpcService {
         Ok(Response::new(proto::AcknowledgeResponse {}))
     }
 }
-
-/// 512 MB — generous headroom for the largest witnesses while preventing
-/// catastrophic OOM from malformed length-prefixed frames.
-const MAX_GRPC_MESSAGE_SIZE: usize = 512 * 1024 * 1024;
 
 /// Build a [`WitnessServiceServer`] ready to be added to a tonic server.
 pub fn create_service(hub: Arc<WitnessHub>) -> WitnessServiceServer<WitnessGrpcService> {

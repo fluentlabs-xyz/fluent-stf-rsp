@@ -50,6 +50,7 @@ use alloy_network::EthereumWallet;
 use alloy_primitives::Address;
 use alloy_provider::{ProviderBuilder, RootProvider};
 use alloy_signer_local::PrivateKeySigner;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use client::OrchestratorConfig;
@@ -61,7 +62,12 @@ const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let server_addr =
         std::env::var("FLUENT_WITNESS_ADDR").unwrap_or_else(|_| DEFAULT_SERVER_ADDR.into());
@@ -90,7 +96,7 @@ async fn main() {
         std::env::var("FLUENT_START_BATCH_ID").ok().and_then(|s| s.parse().ok());
     let l1_deploy_block: u64 =
         std::env::var("FLUENT_L1_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let api_key = std::env::var("FLUENT_API_KEY").unwrap_or_default();
+    let api_key = std::env::var("FLUENT_API_KEY").expect("FLUENT_API_KEY is required");
     let fallback_local_rpc = std::env::var("FLUENT_FALLBACK_LOCAL_RPC").ok();
     let fallback_remote_rpc = std::env::var("FLUENT_FALLBACK_REMOTE_RPC").ok();
     let max_concurrent_fallbacks: usize = std::env::var("FLUENT_MAX_CONCURRENT_FALLBACKS")
@@ -143,6 +149,15 @@ async fn main() {
                 // Save (l1_event_block - 1) so listener resumes FROM l1_event_block
                 db_startup.save_l1_checkpoint(l1_event_block.saturating_sub(1));
 
+                // Seed last_batch_end so the first BatchCommitted after
+                // startup lands on the correct L2 range. Guarded: never
+                // overwrite progress from a previous run, where `checkpoint`
+                // may reset to 0 while `last_batch_end` still holds a real
+                // value.
+                if db_startup.get_last_batch_end().is_none() {
+                    db_startup.save_last_batch_end(l2_checkpoint);
+                }
+
                 info!(
                     batch_id,
                     l2_from_block,
@@ -191,9 +206,39 @@ async fn main() {
     let wallet = EthereumWallet::from(signer);
     let l1_write_provider = ProviderBuilder::new().wallet(wallet).connect_http(l1_rpc_url_parsed);
 
+    // Root shutdown token — cancelled on SIGTERM/SIGINT. Propagated into
+    // l1_listener and client::run so in-flight work can drain cleanly
+    // instead of being abruptly dropped by runtime teardown.
+    let shutdown = CancellationToken::new();
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut sigterm = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(err = %e, "Failed to install SIGTERM handler");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => info!("SIGTERM received — initiating graceful shutdown"),
+                _ = tokio::signal::ctrl_c() => info!("SIGINT received — initiating graceful shutdown"),
+            }
+            shutdown.cancel();
+        });
+    }
+
     // Start L1 event listener
     let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(l1_listener::run(l1_read_provider, l1_contract_addr, listener_from_block, l1_tx));
+    tokio::spawn(l1_listener::run(
+        l1_read_provider,
+        l1_contract_addr,
+        listener_from_block,
+        l1_tx,
+        shutdown.clone(),
+    ));
 
     // Build L2 provider for blob construction
     let l2_provider: RootProvider = {
@@ -222,5 +267,5 @@ async fn main() {
         l2_provider,
     };
 
-    client::run(config, l1_rx).await;
+    client::run(config, l1_rx, shutdown).await;
 }

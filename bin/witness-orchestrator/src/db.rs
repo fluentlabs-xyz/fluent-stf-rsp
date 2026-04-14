@@ -155,12 +155,26 @@ impl Db {
         }
     }
 
-    pub(crate) fn delete_response(&self, block_number: u64) {
-        if let Err(e) = self
-            .conn
-            .execute("DELETE FROM block_responses WHERE block_number = ?1", params![block_number])
-        {
-            error!(err = %e, block_number, "Failed to delete block response");
+    /// Delete many responses in a single transaction — used by key-rotation
+    /// purge so the accumulator doesn't serialize N writes.
+    pub(crate) fn delete_responses_batch(&mut self, blocks: &[u64]) {
+        let tx = match self.conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                error!(err = %e, "delete_responses_batch: begin transaction failed");
+                return;
+            }
+        };
+        for &block in blocks {
+            if let Err(e) = tx.execute(
+                "DELETE FROM block_responses WHERE block_number = ?1",
+                params![block],
+            ) {
+                error!(err = %e, block_number = block, "delete_responses_batch: row delete failed");
+            }
+        }
+        if let Err(e) = tx.commit() {
+            error!(err = %e, "delete_responses_batch: commit failed");
         }
     }
 

@@ -27,6 +27,7 @@ reqwest = { workspace = true, features = ["json"] }
 url.workspace = true
 rusqlite.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
@@ -57,6 +58,7 @@ devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet",  "rsp-bl
 
 [dev-dependencies]
 alloy-rpc-client.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints]
 workspace = true

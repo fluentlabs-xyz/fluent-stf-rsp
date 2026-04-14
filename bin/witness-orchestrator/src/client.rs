@@ -22,7 +22,7 @@
 //! Worker pools and channels are created once in [`run`] and survive reconnects.
 //! Only the gRPC stream and per-session state are recreated on each attempt.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,6 +30,7 @@ use std::time::Duration;
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use bytes::Bytes;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
@@ -45,16 +46,19 @@ use witness_orchestrator::types::{EthExecutionResponse, SubmitBatchResponse};
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::Ethereum;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
 use fluent_stf_primitives::fluent_chainspec;
 use rsp_client_executor::{evm::FluentEvmConfig, io::ClientExecutorInput};
 use rsp_host_executor::HostExecutor;
 use rsp_provider::create_provider;
 
-/// 512 MB — generous headroom for the largest witnesses while preventing
-/// catastrophic OOM from malformed length-prefixed frames.
-const MAX_GRPC_MESSAGE_SIZE: usize = 512 * 1024 * 1024;
+use witness_orchestrator::MAX_GRPC_MESSAGE_SIZE;
+
+/// Time window before a persistently missing receipt is treated as a reorg
+/// and the batch is undispatched. Time-based (not count-based) so it is
+/// robust against changes to the finalization tick period.
+const RECEIPT_MISSING_WINDOW: Duration = Duration::from_secs(60);
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
@@ -67,6 +71,11 @@ const FALLBACK_GAP_M: u64 = 32;
 
 /// Maximum fallback tasks dispatched per tick (caps `fallback_active` set).
 const FALLBACK_BATCH_SIZE: usize = 128;
+
+/// Bounded wait for workers to finish their in-flight HTTP calls on
+/// shutdown. Longer than a typical request, shorter than a systemd
+/// `TimeoutStopSec`.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for the orchestrator.
 #[derive(Clone)]
@@ -152,12 +161,18 @@ async fn execution_worker(
     api_key: String,
     mut witness_client: WitnessServiceClient<Channel>,
     fallback_tx: AsyncSender<FallbackTask>,
+    shutdown: CancellationToken,
 ) {
     info!(worker_id, "Execution worker started");
     loop {
-        // biased: always drain high-priority (re-execution) before normal
+        // biased: always drain high-priority (re-execution) before normal.
+        // Cancel is checked ONLY between tasks — never mid-HTTP-call —
+        // so an in-flight payload is either fully sent and answered, or
+        // not started at all. This prevents the proxy from landing in an
+        // inconsistent state on an abrupt worker exit.
         let task = tokio::select! {
             biased;
+            _ = shutdown.cancelled() => break,
             Ok(t) = high_rx.recv() => t,
             Ok(t) = normal_rx.recv() => t,
             else => break, // channels closed — shutting down
@@ -216,7 +231,6 @@ async fn execution_worker(
         let payload = Bytes::from(payload);
         let mut backoff = Duration::from_millis(50);
         let mut attempts: u32 = 0;
-        let started = tokio::time::Instant::now();
         loop {
             attempts += 1;
             match send_block_request(
@@ -230,7 +244,7 @@ async fn execution_worker(
             {
                 Ok(response) => {
                     if attempts > 1 {
-                        info!(worker_id, block = task.block_number, attempts, elapsed = ?started.elapsed(), "Block succeeded after retries");
+                        info!(worker_id, block = task.block_number, attempts, "Block succeeded after retries");
                     }
                     if result_tx
                         .send(BlockResult { block_number: task.block_number, response })
@@ -242,31 +256,29 @@ async fn execution_worker(
                     break;
                 }
                 Err(e) => {
-                    let elapsed = started.elapsed();
-                    if attempts >= 50 {
-                        error!(
-                            worker_id,
-                            block = task.block_number,
-                            attempts,
-                            elapsed_secs = elapsed.as_secs(),
-                            err = %e,
-                            "Block execution stuck — proxy may be down"
-                        );
-                    } else {
-                        warn!(
-                            worker_id,
-                            block = task.block_number,
-                            attempt = attempts,
-                            err = %e,
-                            "Execution failed, retrying"
-                        );
+                    warn!(
+                        worker_id,
+                        block = task.block_number,
+                        attempt = attempts,
+                        err = %e,
+                        "Execution failed, retrying"
+                    );
+                    // Cancel check belongs here — between HTTP calls, not
+                    // mid-call. Mid-call cancel risks a "proxy executed,
+                    // orchestrator gave up" divergence. Blocks are
+                    // sequential, so giving up on block n would only
+                    // create a gap — retry forever until proxy recovers
+                    // or operator intervenes.
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(backoff) => {}
                     }
-                    tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(2));
                 }
             }
         }
     }
+    info!(worker_id, "Execution worker exiting");
 }
 
 // ============================================================================
@@ -279,6 +291,7 @@ struct FallbackTask {
 
 /// Recovers missing witnesses via GetWitness (hub), then L3/L4 RPC,
 /// and feeds recovered payloads into the high-priority execution queue.
+#[allow(clippy::too_many_arguments)]
 async fn fallback_worker(
     worker_id: usize,
     fallback_rx: AsyncReceiver<FallbackTask>,
@@ -286,9 +299,20 @@ async fn fallback_worker(
     fallback_done_tx: mpsc::Sender<(u64, bool)>,
     mut witness_client: WitnessServiceClient<Channel>,
     config: OrchestratorConfig<impl Provider + Clone + 'static>,
+    shutdown: CancellationToken,
 ) {
     info!(worker_id, "Fallback worker started");
-    while let Ok(task) = fallback_rx.recv().await {
+    loop {
+        // Cancel only between tasks, same invariant as execution_worker:
+        // never abort a running L3/L4 recovery mid-flight.
+        let task = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            res = fallback_rx.recv() => match res {
+                Ok(t) => t,
+                Err(_) => break,
+            }
+        };
         let block_number = task.block_number;
 
         // L2: try GetWitness from hub (hot buffer + cold tier)
@@ -340,6 +364,7 @@ async fn fallback_worker(
             }
         }
     }
+    info!(worker_id, "Fallback worker exiting");
 }
 
 // ============================================================================
@@ -353,9 +378,15 @@ async fn fallback_worker(
 pub(crate) async fn run<P: Provider + Clone + 'static>(
     config: OrchestratorConfig<P>,
     mut l1_events: mpsc::Receiver<L1Event>,
-) -> ! {
+    shutdown: CancellationToken,
+) {
     let db = Arc::new(Mutex::new(Db::open(&config.db_path).expect("Failed to open courier DB")));
-    let mut accumulator = BatchAccumulator::with_db(Arc::clone(&db));
+    let mut accumulator = {
+        let db = Arc::clone(&db);
+        tokio::task::spawn_blocking(move || BatchAccumulator::with_db(db))
+            .await
+            .expect("startup accumulator load panicked")
+    };
     let mut backoff = INITIAL_BACKOFF;
 
     let mut next_batch_from_block: Option<u64> =
@@ -363,10 +394,23 @@ pub(crate) async fn run<P: Provider + Clone + 'static>(
             db.lock().unwrap_or_else(|e| e.into_inner()).get_last_batch_end().map(|e| e + 1)
         });
 
-    // Check dispatched batches from previous run
+    // Persists across reconnects — a batch still dispatched but with a
+    // transiently missing receipt should not reset its observation window
+    // when the gRPC stream drops and run_stream recreates its state.
+    let mut missing_receipt_first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
+
+    // Check dispatched batches from previous run. On startup the map is
+    // empty, so the first `Ok(None)` only records `now` (elapsed = 0) and
+    // never immediately undispatches a correctly submitted batch.
     if accumulator.has_dispatched() {
         info!("Checking dispatched batches from previous run...");
-        let _ = check_finalized_batches(&config.l1_provider, &db, &mut accumulator).await;
+        let _ = check_finalized_batches(
+            &config.l1_provider,
+            &db,
+            &mut accumulator,
+            &mut missing_receipt_first_seen,
+        )
+        .await;
     }
 
     // Channels live for the entire process — workers survive reconnects.
@@ -381,18 +425,45 @@ pub(crate) async fn run<P: Provider + Clone + 'static>(
     // Persistent gRPC channel for execution and fallback workers.
     // Execution workers use this for GetWitness JIT (re-execution tasks).
     // Fallback workers use this to try GetWitness before L3/L4 RPC recovery.
-    let worker_grpc_channel = Channel::from_shared(config.server_addr.clone())
-        .expect("invalid server address")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(600))
-        .connect_lazy();
+    //
+    // Eager connect with retry: `connect_lazy` hides startup failures
+    // behind a "healthy" facade, so we poll `.connect()` until the gRPC
+    // server is reachable (or shutdown cancels us). The per-request
+    // `.timeout(600s)` from the previous version was removed because
+    // tonic applies it to server-streaming Subscribe as well, which would
+    // rip the long-lived witness stream every 10 minutes. Unary calls
+    // that need a timeout set it via `Request::set_timeout` at the call
+    // site (see acknowledge_range below and sign_batch_root in 4.2).
+    let worker_grpc_channel = loop {
+        if shutdown.is_cancelled() {
+            info!("Shutdown requested during worker gRPC connect — aborting startup");
+            return;
+        }
+        match Channel::from_shared(config.server_addr.clone())
+            .expect("invalid server address")
+            .connect_timeout(Duration::from_secs(5))
+            .connect()
+            .await
+        {
+            Ok(ch) => break ch,
+            Err(e) => {
+                warn!(err = %e, "Failed to connect worker gRPC channel — retrying in 5s");
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+            }
+        }
+    };
     let worker_witness_client = WitnessServiceClient::new(worker_grpc_channel)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
-    // Spawn persistent execution worker pool
+    // Spawn persistent worker pools into a JoinSet so they can be drained
+    // (rather than abruptly dropped by runtime teardown) on shutdown.
+    let mut workers: JoinSet<()> = JoinSet::new();
     for i in 0..EXECUTION_WORKERS {
-        tokio::spawn(execution_worker(
+        workers.spawn(execution_worker(
             i,
             high_rx.clone(),
             normal_rx.clone(),
@@ -402,22 +473,32 @@ pub(crate) async fn run<P: Provider + Clone + 'static>(
             config.api_key.clone(),
             worker_witness_client.clone(),
             fallback_tx.clone(),
+            shutdown.clone(),
         ));
     }
-
-    // Spawn persistent fallback worker pool
     for i in 0..config.max_concurrent_fallbacks {
-        tokio::spawn(fallback_worker(
+        workers.spawn(fallback_worker(
             i,
             fallback_rx.clone(),
             high_tx.clone(),
             fallback_done_tx.clone(),
             worker_witness_client.clone(),
             config.clone(),
+            shutdown.clone(),
         ));
     }
 
+    // Drop result_tx / fallback_done_tx clones held only by this scope —
+    // we still own copies for cloning into worker pools but the pools
+    // carry their own, so the ones held in `run` itself shouldn't block
+    // drain. (We keep them because run_stream reads from result_rx and
+    // fallback_done_rx — cloning into workers is enough.)
+
     loop {
+        if shutdown.is_cancelled() {
+            info!("Shutdown requested — exiting reconnect loop");
+            break;
+        }
         let (from_block, confirmed) = {
             let db_guard = db.lock().unwrap_or_else(|e| e.into_inner());
             let from = db_guard.get_checkpoint() + 1;
@@ -430,22 +511,30 @@ pub(crate) async fn run<P: Provider + Clone + 'static>(
         };
         info!(from_block, confirmed_count = confirmed.len(), "Connecting to witness server");
 
-        match run_stream(
-            &config,
-            &db,
-            from_block,
-            confirmed,
-            &normal_tx,
-            &high_tx,
-            &fallback_tx,
-            &mut result_rx,
-            &mut fallback_done_rx,
-            &mut l1_events,
-            &mut accumulator,
-            &mut next_batch_from_block,
-        )
-        .await
-        {
+        let stream_res = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                info!("Shutdown requested while connecting stream");
+                break;
+            }
+            res = run_stream(
+                &config,
+                &db,
+                from_block,
+                confirmed,
+                &normal_tx,
+                &high_tx,
+                &fallback_tx,
+                &mut result_rx,
+                &mut fallback_done_rx,
+                &mut l1_events,
+                &mut accumulator,
+                &mut next_batch_from_block,
+                &mut missing_receipt_first_seen,
+                shutdown.clone(),
+            ) => res,
+        };
+        match stream_res {
             Ok(()) => {
                 info!("Stream ended gracefully");
                 backoff = INITIAL_BACKOFF;
@@ -459,9 +548,52 @@ pub(crate) async fn run<P: Provider + Clone + 'static>(
             }
         }
 
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
+
+    // ── Graceful drain ────────────────────────────────────────────────
+    // Close the task channels so workers observe `Err` on recv() and
+    // exit cleanly after their current task. Then JoinSet.join_next()
+    // awaits their completion, bounded by SHUTDOWN_DRAIN_TIMEOUT.
+    // Workers check `shutdown.cancelled()` only between HTTP calls —
+    // an in-flight payload either completes its round-trip or is never
+    // started, preventing "proxy executed, orchestrator gave up" drift.
+    info!("Closing worker task channels — draining workers");
+    drop(high_tx);
+    drop(normal_tx);
+    drop(fallback_tx);
+    drop(result_tx);
+    drop(fallback_done_tx);
+    // Drop the receiver halves too: workers completing their final HTTP
+    // call will try to `.send()` results. With the receivers still alive
+    // those sends buffer up to channel capacity; dropping the receivers
+    // makes every such send fail fast so workers exit immediately rather
+    // than parking on a full channel.
+    drop(result_rx);
+    drop(fallback_done_rx);
+
+    let drain = async {
+        while let Some(res) = workers.join_next().await {
+            if let Err(e) = res {
+                warn!(err = %e, "Worker panicked or was cancelled");
+            }
+        }
+    };
+    match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain).await {
+        Ok(()) => info!("All workers drained cleanly"),
+        Err(_) => {
+            warn!(
+                timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                "Shutdown drain deadline exceeded — aborting remaining workers"
+            );
+            workers.shutdown().await;
+        }
+    }
+    info!("client::run exited");
 }
 
 // ============================================================================
@@ -710,15 +842,14 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
                         let mut backoff = Duration::from_secs(1);
                         const MAX_ACK_RETRIES: u32 = 10;
                         for attempt in 1..=MAX_ACK_RETRIES {
-                            match ack
-                                .acknowledge_range(
-                                    witness_orchestrator::proto::AcknowledgeRangeRequest {
-                                        from_block: fb,
-                                        to_block: tb,
-                                    },
-                                )
-                                .await
-                            {
+                            let mut req = tonic::Request::new(
+                                witness_orchestrator::proto::AcknowledgeRangeRequest {
+                                    from_block: fb,
+                                    to_block: tb,
+                                },
+                            );
+                            req.set_timeout(Duration::from_secs(10));
+                            match ack.acknowledge_range(req).await {
                                 Ok(_) => break,
                                 Err(e) => {
                                     if attempt == MAX_ACK_RETRIES {
@@ -864,21 +995,31 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
     }
 
     /// Check finalized batches and process results.
-    async fn on_finalization_tick(&mut self, accumulator: &mut BatchAccumulator) {
-        let (changed, finalized_ranges) =
-            check_finalized_batches(&self.config.l1_provider, &self.db, accumulator).await;
+    async fn on_finalization_tick(
+        &mut self,
+        accumulator: &mut BatchAccumulator,
+        missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
+    ) {
+        let (changed, finalized_ranges) = check_finalized_batches(
+            &self.config.l1_provider,
+            &self.db,
+            accumulator,
+            missing_receipt_first_seen,
+        )
+        .await;
 
         // Safety net: acknowledge cold files for finalized batches
         for (fb, tb) in finalized_ranges {
             let mut ack = self.ack_client.clone();
             tokio::spawn(async move {
-                if let Err(e) = ack
-                    .acknowledge_range(witness_orchestrator::proto::AcknowledgeRangeRequest {
+                let mut req = tonic::Request::new(
+                    witness_orchestrator::proto::AcknowledgeRangeRequest {
                         from_block: fb,
                         to_block: tb,
-                    })
-                    .await
-                {
+                    },
+                );
+                req.set_timeout(Duration::from_secs(10));
+                if let Err(e) = ack.acknowledge_range(req).await {
                     warn!(fb, tb, err = %e, "Safety-net acknowledge_range failed");
                 }
             });
@@ -891,27 +1032,60 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
     }
 }
 
+/// Narrow RPC surface used by [`check_finalized_batches`]. The blanket impl
+/// for any `alloy` [`Provider`] lets production code pass `&l1_provider` as-is,
+/// while tests substitute a hand-rolled stub.
+#[async_trait::async_trait]
+pub(crate) trait FinalityRpc: Send + Sync {
+    async fn finalized_block_number(&self) -> Option<u64>;
+    async fn receipt_exists(&self, tx_hash: B256) -> Result<bool, String>;
+}
+
+#[async_trait::async_trait]
+impl<P: Provider + Send + Sync> FinalityRpc for P {
+    async fn finalized_block_number(&self) -> Option<u64> {
+        match self.get_block_by_number(BlockNumberOrTag::Finalized).await {
+            Ok(Some(block)) => Some(block.header.number),
+            Ok(None) => {
+                warn!("Finalized block not available from RPC");
+                None
+            }
+            Err(e) => {
+                warn!(err = %e, "Failed to fetch finalized block");
+                None
+            }
+        }
+    }
+
+    async fn receipt_exists(&self, tx_hash: B256) -> Result<bool, String> {
+        match self.get_transaction_receipt(tx_hash).await {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 /// Fetch L1 finalized block, then process dispatched batches contiguously:
-/// finalized + receipt present → cleanup; receipt missing → undispatch (reorg).
-async fn check_finalized_batches<P: Provider + Clone + 'static>(
-    provider: &P,
+/// finalized + receipt present → cleanup; receipt missing for longer than
+/// [`RECEIPT_MISSING_WINDOW`] → undispatch (reorg).
+///
+/// `missing_receipt_first_seen` persists across reconnects so a transiently
+/// missing receipt does not reset its observation window whenever the gRPC
+/// stream drops. Passing an empty map from a startup call is safe — the
+/// first `Ok(None)` records `now` and never immediately undispatches.
+async fn check_finalized_batches(
+    provider: &dyn FinalityRpc,
     db: &Arc<Mutex<Db>>,
     accumulator: &mut BatchAccumulator,
+    missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
 ) -> (bool, Vec<(u64, u64)>) {
     if !accumulator.has_dispatched() {
         return (false, vec![]);
     }
 
-    let finalized_block = match provider.get_block_by_number(BlockNumberOrTag::Finalized).await {
-        Ok(Some(block)) => block.header.number,
-        Ok(None) => {
-            warn!("Finalized block not available from RPC");
-            return (false, vec![]);
-        }
-        Err(e) => {
-            warn!(err = %e, "Failed to fetch finalized block");
-            return (false, vec![]);
-        }
+    let Some(finalized_block) = provider.finalized_block_number().await else {
+        return (false, vec![]);
     };
 
     let candidates = accumulator.dispatched_finalization_candidates(finalized_block);
@@ -927,8 +1101,9 @@ async fn check_finalized_batches<P: Provider + Clone + 'static>(
             continue;
         };
 
-        match provider.get_transaction_receipt(tx_hash).await {
-            Ok(Some(_receipt)) => {
+        match provider.receipt_exists(tx_hash).await {
+            Ok(true) => {
+                missing_receipt_first_seen.remove(&batch_index);
                 let Some(dispatched) = accumulator.finalize_dispatched(batch_index).await else {
                     continue;
                 };
@@ -947,15 +1122,36 @@ async fn check_finalized_batches<P: Provider + Clone + 'static>(
                 finalized_ranges.push((dispatched.from_block, dispatched.to_block));
                 changed = true;
             }
-            Ok(None) => {
-                warn!(batch_index, %tx_hash, "TX not found after finalization — reorg detected, re-dispatching");
-                accumulator.undispatch(batch_index).await;
-                changed = true;
-                break;
+            Ok(false) => {
+                let now = tokio::time::Instant::now();
+                let first =
+                    *missing_receipt_first_seen.entry(batch_index).or_insert(now);
+                let elapsed = now.duration_since(first);
+                warn!(
+                    batch_index,
+                    %tx_hash,
+                    elapsed_secs = elapsed.as_secs(),
+                    "Receipt missing after finalization"
+                );
+                if elapsed >= RECEIPT_MISSING_WINDOW {
+                    warn!(
+                        batch_index,
+                        %tx_hash,
+                        elapsed_secs = elapsed.as_secs(),
+                        "Receipt missing beyond window — treating as reorg, re-dispatching"
+                    );
+                    missing_receipt_first_seen.remove(&batch_index);
+                    accumulator.undispatch(batch_index).await;
+                    changed = true;
+                }
+                // No `break`: keep checking other candidates. A single
+                // transient None on one batch must not stall processing of
+                // subsequent finalized batches.
             }
             Err(e) => {
+                // RPC error is transient — don't advance the window and
+                // don't break (other candidates may still have answers).
                 warn!(batch_index, %tx_hash, err = %e, "Receipt check failed — will retry");
-                break;
             }
         }
     }
@@ -982,10 +1178,15 @@ async fn run_stream<P: Provider + Clone + 'static>(
     l1_events: &mut mpsc::Receiver<L1Event>,
     accumulator: &mut BatchAccumulator,
     next_batch_from_block: &mut Option<u64>,
+    missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
+    shutdown: CancellationToken,
 ) -> eyre::Result<()> {
+    // NOTE: no `.timeout(..)` on the Channel. Applying a per-request
+    // timeout to this Channel would also enforce it on the long-lived
+    // server-streaming Subscribe call, ripping the stream periodically.
+    // Unary calls set their own timeout via `Request::set_timeout`.
     let channel = Channel::from_shared(config.server_addr.clone())?
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(600))
         .connect()
         .await?;
 
@@ -1083,6 +1284,13 @@ async fn run_stream<P: Provider + Clone + 'static>(
     let result = async {
         loop {
             tokio::select! {
+                biased;
+                // ── Shutdown — highest priority so we stop the loop
+                //    instead of starting new work under cancellation.
+                _ = shutdown.cancelled() => {
+                    info!("Shutdown requested — exiting stream session");
+                    return Ok(());
+                }
                 // ── Stream A: gRPC reader events ────────────────────────
                 event = grpc_event_rx.recv() => match event {
                     Some(GrpcEvent::WitnessQueued(bn)) => {
@@ -1135,7 +1343,7 @@ async fn run_stream<P: Provider + Clone + 'static>(
 
                 // ── Stream H: finalization checker ─────────────────────
                 _ = finalization_ticker.tick() =>
-                    state.on_finalization_tick(accumulator).await,
+                    state.on_finalization_tick(accumulator, missing_receipt_first_seen).await,
             }
         }
     }
@@ -1269,8 +1477,17 @@ async fn call_sign_batch_root(
         "blobs": blobs,
     });
 
-    let resp =
-        http_client.post(&url).header("x-api-key", api_key).json(&body).send().await.map_err(
+    let resp = http_client
+        .post(&url)
+        // Explicit per-request timeout: the HTTP client default (120s) is
+        // too tight for large batches where proxy constructs blobs before
+        // signing. 5 minutes is a hard upper bound for a single attempt.
+        .timeout(Duration::from_secs(300))
+        .header("x-api-key", api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(
             |e| {
                 use std::error::Error;
                 let kind = if e.is_connect() {
@@ -1419,5 +1636,121 @@ async fn generate_fallback_payload<P: Provider + Clone + 'static>(
             error!(block_number, err = %e, "Fallback: spawn_blocking panicked");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accumulator::BatchAccumulator;
+    use crate::db::Db;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_db() -> Arc<StdMutex<Db>> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("client_test_{id}_{}.db", std::process::id()));
+        let db = Db::open(&path).unwrap();
+        Arc::new(StdMutex::new(db))
+    }
+
+    /// Hand-rolled stub implementing only the two RPC methods
+    /// [`check_finalized_batches`] actually touches. Per-tx receipt answers
+    /// come from the provided map (default: `Ok(false)` = missing).
+    struct StubFinality {
+        finalized: Option<u64>,
+        receipts: HashMap<B256, Result<bool, String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FinalityRpc for StubFinality {
+        async fn finalized_block_number(&self) -> Option<u64> {
+            self.finalized
+        }
+        async fn receipt_exists(&self, tx_hash: B256) -> Result<bool, String> {
+            self.receipts.get(&tx_hash).cloned().unwrap_or(Ok(false))
+        }
+    }
+
+    async fn register_dispatched(
+        acc: &mut BatchAccumulator,
+        batch_index: u64,
+        from_block: u64,
+        to_block: u64,
+        tx_hash: B256,
+        l1_block: u64,
+    ) {
+        acc.set_batch(batch_index, from_block, to_block).await;
+        acc.mark_dispatched(batch_index, tx_hash, l1_block).await;
+    }
+
+    /// First `Ok(false)` must only record `first_seen` — no undispatch.
+    /// After advancing past `RECEIPT_MISSING_WINDOW`, the next tick must
+    /// undispatch the batch (simulated reorg recovery).
+    #[tokio::test(start_paused = true)]
+    async fn receipt_missing_window_elapsed() {
+        let db = temp_db();
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let tx_hash = B256::repeat_byte(0xAA);
+        register_dispatched(&mut acc, 1, 100, 110, tx_hash, 500).await;
+
+        let provider = StubFinality {
+            finalized: Some(1000),
+            receipts: HashMap::new(), // default Ok(false) — missing
+        };
+        let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
+
+        // First tick: records first_seen, must NOT undispatch.
+        let (changed, _) =
+            check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        assert!(!changed, "first missing receipt must not cause undispatch");
+        assert!(acc.has_dispatched(), "batch must remain dispatched");
+        assert!(first_seen.contains_key(&1));
+
+        // Advance past the window, then tick again: undispatch expected.
+        tokio::time::advance(RECEIPT_MISSING_WINDOW + Duration::from_secs(1)).await;
+        let (changed, _) =
+            check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        assert!(changed, "elapsed window must trigger undispatch");
+        assert!(!acc.has_dispatched(), "batch must be undispatched after window");
+        assert!(!first_seen.contains_key(&1), "first_seen entry cleared on undispatch");
+    }
+
+    /// A single transient `Ok(false)` on an early candidate must NOT
+    /// stop the loop — subsequent candidates with receipts must still
+    /// be finalized in the same tick.
+    #[tokio::test(start_paused = true)]
+    async fn finalization_no_break_after_transient_none() {
+        let db = temp_db();
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+
+        let tx_a = B256::repeat_byte(0x01);
+        let tx_b = B256::repeat_byte(0x02);
+        register_dispatched(&mut acc, 1, 100, 110, tx_a, 500).await;
+        register_dispatched(&mut acc, 2, 111, 120, tx_b, 501).await;
+
+        let mut receipts = HashMap::new();
+        // Batch 1: missing receipt (transient None).
+        receipts.insert(tx_a, Ok(false));
+        // Batch 2: present — must still finalize in same tick.
+        receipts.insert(tx_b, Ok(true));
+
+        let provider = StubFinality { finalized: Some(1000), receipts };
+        let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
+
+        let (changed, finalized) =
+            check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+
+        assert!(changed, "batch 2 finalization must mark state as changed");
+        assert_eq!(finalized, vec![(111, 120)], "batch 2 range must be reported");
+        assert!(first_seen.contains_key(&1), "batch 1 first_seen recorded");
+        assert!(acc.has_dispatched(), "batch 1 remains dispatched (transient None)");
+        assert!(
+            acc.dispatched_tx_hash(2).is_none(),
+            "batch 2 must be removed from dispatched after finalization"
+        );
     }
 }
