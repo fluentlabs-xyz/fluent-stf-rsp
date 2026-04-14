@@ -15,6 +15,7 @@ use k256::ecdsa::{
     signature::Signer, signature::Verifier, signature::DigestSigner, RecoveryId, Signature,
     SigningKey, VerifyingKey,
 };
+use k256::elliptic_curve::scalar::IsHigh;
 use k256::SecretKey;
 
 use alloy_eips::eip2718::Encodable2718;
@@ -196,9 +197,25 @@ fn verify_response(
 ///
 /// `tx_data_hashes` come from trusted sources: the in-memory BlockStore
 /// (cache hit) or verified signed EthExecutionResponses (cache miss).
-fn verify_blobs(blobs: &[Vec<u8>], tx_data_hashes: &[B256]) -> anyhow::Result<Vec<B256>> {
+fn verify_blobs(
+    blobs: &[Vec<u8>],
+    tx_data_hashes: &[B256],
+    from: u64,
+    to: u64,
+) -> anyhow::Result<Vec<B256>> {
     let (header, all_raw) =
         blob::decode_blob_payload(blobs).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    anyhow::ensure!(
+        header.from_block == from,
+        "DA header from_block mismatch: header={}, expected={from}",
+        header.from_block,
+    );
+    anyhow::ensure!(
+        header.to_block == to,
+        "DA header to_block mismatch: header={}, expected={to}",
+        header.to_block,
+    );
 
     let num_blocks = header.block_boundaries.len();
     anyhow::ensure!(
@@ -277,6 +294,15 @@ fn sign_batch(
         .sign_digest_recoverable(digest)
         .expect("signing cannot fail with a valid key");
 
+    // Defence-in-depth: k256 0.13.x guarantees low-S from sign_digest_recoverable.
+    // If a future upstream version ever regresses, fail loud at signing time rather
+    // than silently producing a signature that Solidity's ecrecover rejects or whose
+    // recid is now inconsistent after a manual flip.
+    assert!(
+        !bool::from(signature.s().is_high()),
+        "k256 produced high-S signature — upstream regression"
+    );
+
     // Ethereum-compatible 65-byte signature: r (32) || s (32) || v (1)
     let mut sig_bytes = [0u8; 65];
     sig_bytes[..64].copy_from_slice(&signature.to_bytes());
@@ -338,7 +364,7 @@ pub(crate) fn handle_submit_batch(
 
     let batch_root = calculate_merkle_root(&leaves)
         .map_err(SubmitBatchError::Other)?;
-    let versioned_hashes = verify_blobs(blobs, &tx_data_hashes)
+    let versioned_hashes = verify_blobs(blobs, &tx_data_hashes, from, to)
         .map_err(SubmitBatchError::Other)?;
     Ok(sign_batch(batch_root, versioned_hashes, signing_key))
 }
@@ -520,7 +546,7 @@ impl Enclave {
                     let store = Arc::clone(&block_store);
 
                     thread::spawn(move || {
-                        let result = execute_block(input, &id.signing_key, &store);
+                        let result = execute_block(*input, &id.signing_key, &store);
                         let resp = match result {
                             Ok(output) => EnclaveResponse::ExecutionResult(output),
                             Err(e) => EnclaveResponse::Error(format!("{e:#}")),
@@ -778,6 +804,27 @@ mod tests {
                 assert_eq!(blocks, vec![100, 101, 102]);
             }
             _ => panic!("Expected InvalidSignatures error"),
+        }
+    }
+
+    #[test]
+    fn sign_batch_always_low_s() {
+        // RFC6979 is deterministic per-key, so we need multiple keys × multiple
+        // messages to get meaningful coverage of the (r, s) space.
+        let mut rng = k256::elliptic_curve::rand_core::OsRng;
+        for _ in 0..32 {
+            let signing_key = SigningKey::random(&mut rng);
+            for msg_idx in 0u32..32 {
+                let mut batch_root = [0u8; 32];
+                batch_root[..4].copy_from_slice(&msg_idx.to_be_bytes());
+                let hashes = vec![B256::from([msg_idx as u8; 32])];
+                let resp = sign_batch(batch_root, hashes, &signing_key);
+                let sig = Signature::from_slice(&resp.signature[..64]).unwrap();
+                assert!(
+                    !bool::from(sig.s().is_high()),
+                    "high-S signature produced for msg {msg_idx}"
+                );
+            }
         }
     }
 }
