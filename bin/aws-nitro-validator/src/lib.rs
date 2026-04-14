@@ -52,6 +52,13 @@ pub struct GuestInput {
 }
 
 // ─── Anchors ─────────────────────────────────────────────────────────────────
+//
+// Hardcoded SHA-384 anchors for the AWS Nitro root CA and the enclave PCR0.
+// Rotating any of these constants means trusting a different root / image —
+// treat them as security-critical. `EXPECTED_ROOT_PUBKEY_HASH` and
+// `EXPECTED_ROOT_SUBJECT_HASH` are derived from the root CA DER shipped at
+// `bin/proxy/src/attestation/root.der`. `EXPECTED_PCR0` is fixed per network
+// feature.
 
 pub const EXPECTED_ROOT_PUBKEY_HASH: [u8; 48] = [
     0x70, 0x86, 0x37, 0xb2, 0xaf, 0xd0, 0xda, 0x2a,

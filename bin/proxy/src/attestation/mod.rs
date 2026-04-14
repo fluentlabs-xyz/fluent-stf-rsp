@@ -5,7 +5,7 @@
 
 pub(crate) mod prepare;
 
-pub(crate) const ROOT_CERT_DER: &[u8] = include_bytes!("../../../aws-nitro-validator/root.der");
+pub(crate) const ROOT_CERT_DER: &[u8] = include_bytes!("root.der");
 
 mod network;
 
@@ -93,9 +93,12 @@ mod tests {
     fn test_debug_pcrs_from_cbor() {
         use serde_bytes::ByteBuf;
 
-        let (_protected, _unprotected, payload, _signature):
-            (ByteBuf, ciborium::Value, ByteBuf, ByteBuf) =
-            ciborium::from_reader(ATTESTATION_BYTES).unwrap();
+        let (_protected, _unprotected, payload, _signature): (
+            ByteBuf,
+            ciborium::Value,
+            ByteBuf,
+            ByteBuf,
+        ) = ciborium::from_reader(ATTESTATION_BYTES).unwrap();
         let payload = &payload[..];
 
         // Parse as raw ciborium::Value to see what PCRs looks like

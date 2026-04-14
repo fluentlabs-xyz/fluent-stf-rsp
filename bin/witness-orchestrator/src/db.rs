@@ -346,7 +346,12 @@ impl Db {
 
     /// Atomically clean up a finalized dispatched batch.
     /// Single transaction: DELETE dispatched + DELETE responses + DELETE signature.
-    pub(crate) fn finalize_dispatched_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
+    pub(crate) fn finalize_dispatched_batch(
+        &mut self,
+        batch_index: u64,
+        from_block: u64,
+        to_block: u64,
+    ) {
         let tx = match self.conn.transaction() {
             Ok(tx) => tx,
             Err(e) => {

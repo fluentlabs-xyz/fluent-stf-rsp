@@ -11,6 +11,7 @@ description = "gRPC witness transport layer for Fluent zkVM proving pipeline"
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 serde.workspace = true
+serde-big-array = "0.5"
 bincode.workspace = true
 prost.workspace = true
 tonic.workspace = true

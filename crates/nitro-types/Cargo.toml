@@ -11,6 +11,7 @@ exclude.workspace = true
 [dependencies]
 revm-primitives.workspace = true
 serde = { workspace = true,  features = ["derive", "alloc"] }
+serde-big-array = "0.5"
 alloy-primitives = { workspace = true, features = ["serde"] }
 rsp-client-executor.workspace = true
 

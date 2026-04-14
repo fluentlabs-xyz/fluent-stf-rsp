@@ -264,7 +264,10 @@ impl BatchAccumulator {
     }
 
     /// Finalize a dispatched batch: delete all associated data from DB + memory.
-    pub(crate) async fn finalize_dispatched(&mut self, batch_index: u64) -> Option<DispatchedBatch> {
+    pub(crate) async fn finalize_dispatched(
+        &mut self,
+        batch_index: u64,
+    ) -> Option<DispatchedBatch> {
         let dispatched = self.dispatched.remove(&batch_index)?;
         let fb = dispatched.from_block;
         let tb = dispatched.to_block;
@@ -329,7 +332,7 @@ mod tests {
             block_number,
             leaf: [0u8; 32],
             tx_data_hash: B256::ZERO,
-            signature: vec![],
+            signature: [0u8; 64],
         }
     }
 

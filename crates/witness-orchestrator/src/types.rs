@@ -22,6 +22,7 @@ pub type SharedProveRequest = Arc<ProveRequest>;
 // ---------------------------------------------------------------------------
 
 use alloy_primitives::{Address, B256};
+use serde_big_array::BigArray;
 
 /// Per-block execution response from the Nitro enclave.
 ///
@@ -31,7 +32,8 @@ pub struct EthExecutionResponse {
     pub block_number: u64,
     pub leaf: [u8; 32],
     pub tx_data_hash: B256,
-    pub signature: Vec<u8>,
+    #[serde(with = "BigArray")]
+    pub signature: [u8; 64],
 }
 
 /// Batch signing response from the Nitro enclave.

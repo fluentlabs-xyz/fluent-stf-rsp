@@ -21,13 +21,20 @@ pub(crate) struct BlobHeader {
 }
 
 impl BlobHeader {
-    pub(crate) fn size(&self) -> usize {
-        FIXED_HEADER_SIZE + self.block_boundaries.len() * 4
+    pub(crate) fn size(&self) -> Result<usize, String> {
+        self.block_boundaries
+            .len()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(FIXED_HEADER_SIZE))
+            .ok_or_else(|| "header size overflow".to_string())
     }
 }
 
 /// Extracts raw bytes from a single blob's KZG field elements.
 pub(crate) fn decanonicalize(blob: &[u8]) -> Result<Vec<u8>, String> {
+    if !blob.len().is_multiple_of(32) {
+        return Err(format!("blob length ({}) is not a multiple of 32", blob.len()));
+    }
     let mut result = Vec::with_capacity(MAX_RAW_BYTES_PER_BLOB);
     let mut offset = 0;
     while offset < blob.len() && result.len() < MAX_RAW_BYTES_PER_BLOB {
@@ -67,34 +74,48 @@ pub(crate) fn decode_blob_payload(blobs: &[Vec<u8>]) -> Result<(BlobHeader, Vec<
 }
 
 fn parse_header(data: &[u8]) -> Result<BlobHeader, String> {
-    if data.len() < FIXED_HEADER_SIZE {
+    let [
+        f0, f1, f2, f3, f4, f5, f6, f7,
+        t0, t1, t2, t3, t4, t5, t6, t7,
+        n0, n1, n2, n3,
+        ..
+    ] = *data
+    else {
         return Err("blob payload too short for header".into());
-    }
+    };
 
-    let from_block = u64::from_be_bytes(data[0..8].try_into().unwrap());
-    let to_block = u64::from_be_bytes(data[8..16].try_into().unwrap());
-    let num_blocks = u32::from_be_bytes(data[16..20].try_into().unwrap()) as usize;
+    let from_block = u64::from_be_bytes([f0, f1, f2, f3, f4, f5, f6, f7]);
+    let to_block = u64::from_be_bytes([t0, t1, t2, t3, t4, t5, t6, t7]);
+    let num_blocks = u32::from_be_bytes([n0, n1, n2, n3]) as usize;
 
     if from_block > to_block {
         return Err(format!("invalid block range: from ({from_block}) > to ({to_block})"));
     }
-    if (to_block - from_block + 1) as usize != num_blocks {
+    let span = to_block
+        .checked_sub(from_block)
+        .and_then(|d| d.checked_add(1))
+        .ok_or_else(|| "block range span overflow".to_string())?;
+    if span != num_blocks as u64 {
         return Err(format!(
             "block range [{from_block}, {to_block}] doesn't match num_blocks ({num_blocks})"
         ));
     }
 
-    let full_header_size = FIXED_HEADER_SIZE + num_blocks * 4;
+    let full_header_size = num_blocks
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(FIXED_HEADER_SIZE))
+        .ok_or_else(|| "header size overflow".to_string())?;
     if data.len() < full_header_size {
         return Err(format!("blob payload too short for {num_blocks} block boundaries"));
     }
 
-    let mut block_boundaries = Vec::with_capacity(num_blocks);
-    for i in 0..num_blocks {
-        let off = FIXED_HEADER_SIZE + i * 4;
-        let len = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
-        block_boundaries.push(len);
-    }
+    let block_boundaries: Vec<usize> = data[FIXED_HEADER_SIZE..full_header_size]
+        .chunks_exact(4)
+        .map(|chunk| {
+            let &[b0, b1, b2, b3] = chunk else { unreachable!("chunks_exact(4)") };
+            u32::from_be_bytes([b0, b1, b2, b3]) as usize
+        })
+        .collect();
 
     Ok(BlobHeader { from_block, to_block, block_boundaries })
 }
@@ -119,14 +140,22 @@ pub(crate) fn extract_block_tx_data<'a>(
         ));
     }
 
-    let data_offset = header.size() + header.block_boundaries[..idx].iter().sum::<usize>();
+    let mut data_offset = header.size()?;
+    for b in &header.block_boundaries[..idx] {
+        data_offset = data_offset
+            .checked_add(*b)
+            .ok_or_else(|| "tx_data offset overflow".to_string())?;
+    }
     let chunk_len = header.block_boundaries[idx];
+    let end = data_offset
+        .checked_add(chunk_len)
+        .ok_or_else(|| "tx_data end overflow".to_string())?;
 
-    if data_offset.saturating_add(chunk_len) > payload.len() {
+    if end > payload.len() {
         return Err("tx_data exceeds blob payload".into());
     }
 
-    Ok(&payload[data_offset..data_offset + chunk_len])
+    Ok(&payload[data_offset..end])
 }
 
 #[cfg(test)]

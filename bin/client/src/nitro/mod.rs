@@ -137,7 +137,18 @@ fn keccak_pair(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
 fn calculate_merkle_root(leaves: &[[u8; 32]]) -> anyhow::Result<[u8; 32]> {
     anyhow::ensure!(!leaves.is_empty(), "no leaves provided");
 
-    let mut layer: Vec<[u8; 32]> = leaves.to_vec();
+    if leaves.len() == 1 {
+        return Ok(leaves[0]);
+    }
+
+    let mut layer: Vec<[u8; 32]> = leaves
+        .chunks(2)
+        .map(|pair| match pair {
+            [a, b] => keccak_pair(*a, *b),
+            [a] => keccak_pair(*a, *a),
+            _ => unreachable!("chunks(2) yields slices of length 1 or 2"),
+        })
+        .collect();
 
     while layer.len() > 1 {
         let mut next = Vec::with_capacity(layer.len().div_ceil(2));
@@ -347,6 +358,12 @@ pub(crate) fn handle_submit_batch(
     signing_key: &SigningKey,
     block_store: &Mutex<BlockStore>,
 ) -> Result<SubmitBatchResponse, SubmitBatchError> {
+    if from > to {
+        return Err(SubmitBatchError::Other(anyhow::anyhow!(
+            "invalid batch range: from ({from}) > to ({to})"
+        )));
+    }
+
     let verifying_key = *signing_key.verifying_key();
 
     let mut response_map: std::collections::HashMap<u64, &EthExecutionResponse> =
@@ -464,7 +481,7 @@ fn sign_execution(
         block_number: result.block_number,
         leaf: result.leaf,
         tx_data_hash: result.tx_data_hash,
-        signature: signature.to_vec(),
+        signature: signature.to_bytes().into(),
     }
 }
 
@@ -873,14 +890,14 @@ mod tests {
             block_number: 10,
             leaf,
             tx_data_hash,
-            signature: sig.to_vec(),
+            signature: sig.to_bytes().into(),
         };
 
         let invalid_resp = EthExecutionResponse {
             block_number: 11,
             leaf,
             tx_data_hash,
-            signature: vec![0u8; 64], // garbage signature
+            signature: [0u8; 64], // garbage signature
         };
 
         let store = Mutex::new(store);

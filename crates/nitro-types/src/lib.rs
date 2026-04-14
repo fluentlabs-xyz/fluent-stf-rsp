@@ -1,6 +1,7 @@
 use alloy_primitives::B256;
 use rsp_client_executor::io::EthClientExecutorInput;
 use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AwsCredentials {
@@ -14,7 +15,8 @@ pub struct EthExecutionResponse {
     pub block_number: u64,
     pub leaf: [u8; 32],
     pub tx_data_hash: B256,
-    pub signature: Vec<u8>,
+    #[serde(with = "BigArray")]
+    pub signature: [u8; 64],
 }
 
 /// Host-prepared KZG witness consumed by the SP1 guest. Wire-compat via

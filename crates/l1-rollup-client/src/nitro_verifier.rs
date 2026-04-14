@@ -106,10 +106,7 @@ pub async fn submit_attestation(
         pending.get_receipt().await.map_err(|e| eyre!("verifyAttestation tx failed: {e}"))?;
 
     if !receipt.status() {
-        return Err(eyre!(
-            "verifyAttestation tx reverted (tx_hash: {})",
-            receipt.transaction_hash
-        ));
+        return Err(eyre!("verifyAttestation tx reverted (tx_hash: {})", receipt.transaction_hash));
     }
 
     info!(

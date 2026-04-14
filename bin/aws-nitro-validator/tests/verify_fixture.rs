@@ -7,7 +7,7 @@ use serde_bytes::ByteBuf;
 use x509_parser::prelude::*;
 
 const ATTESTATION_BYTES: &[u8] = include_bytes!("../../../attestation.bin");
-const ROOT_DER: &[u8] = include_bytes!("../root.der");
+const ROOT_DER: &[u8] = include_bytes!("../../proxy/src/attestation/root.der");
 
 fn extract_sec1(raw: &[u8]) -> [u8; 97] {
     let sec1 = if raw.len() == 98 && raw[0] == 0x00 {

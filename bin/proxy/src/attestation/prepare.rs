@@ -6,12 +6,9 @@ use x509_parser::prelude::*;
 
 /// SHA-384 of the DER-encoded Subject DN of the AWS Nitro root CA.
 const EXPECTED_ROOT_SUBJECT_HASH: [u8; 48] = [
-    0xfe, 0x19, 0xf1, 0x6b, 0x73, 0xdc, 0xfd, 0xf7,
-    0xad, 0xa6, 0x86, 0xb2, 0x6f, 0xbc, 0x26, 0x80,
-    0x0e, 0x8b, 0x49, 0x33, 0xa0, 0xc1, 0xe7, 0xa9,
-    0xb4, 0x0c, 0xd4, 0xea, 0x80, 0x9f, 0x18, 0x29,
-    0xdc, 0x48, 0x8e, 0x14, 0x75, 0x3c, 0xbd, 0xe8,
-    0x76, 0x86, 0xc4, 0xd9, 0x34, 0x39, 0xf0, 0x3e,
+    0xfe, 0x19, 0xf1, 0x6b, 0x73, 0xdc, 0xfd, 0xf7, 0xad, 0xa6, 0x86, 0xb2, 0x6f, 0xbc, 0x26, 0x80,
+    0x0e, 0x8b, 0x49, 0x33, 0xa0, 0xc1, 0xe7, 0xa9, 0xb4, 0x0c, 0xd4, 0xea, 0x80, 0x9f, 0x18, 0x29,
+    0xdc, 0x48, 0x8e, 0x14, 0x75, 0x3c, 0xbd, 0xe8, 0x76, 0x86, 0xc4, 0xd9, 0x34, 0x39, 0xf0, 0x3e,
 ];
 
 #[derive(Serialize, Deserialize)]
@@ -43,9 +40,12 @@ pub(crate) fn prepare_guest_input(
     root_cert_der: &[u8],
 ) -> Result<GuestInput, Box<dyn std::error::Error>> {
     // COSE_Sign1 = [protected, unprotected, payload, signature]
-    let (protected, _unprotected, payload, signature):
-        (ByteBuf, ciborium::Value, ByteBuf, ByteBuf) =
-        ciborium::from_reader(attestation_bytes)?;
+    let (protected, _unprotected, payload, signature): (
+        ByteBuf,
+        ciborium::Value,
+        ByteBuf,
+        ByteBuf,
+    ) = ciborium::from_reader(attestation_bytes)?;
 
     if signature.len() != 96 {
         return Err(format!("expected 96-byte COSE signature, got {}", signature.len()).into());
@@ -102,12 +102,12 @@ pub(crate) fn prepare_guest_input(
     })
 }
 
+type ChainAndLeaf = (Vec<Vec<u8>>, Vec<u8>);
+
 /// Decode just enough of an `AttestationDoc` CBOR map to pull out the
 /// `cabundle` array and the `certificate` bstr. Host convenience only —
 /// the guest parses the same payload independently.
-fn extract_chain_der(
-    payload: &[u8],
-) -> Result<(Vec<Vec<u8>>, Vec<u8>), Box<dyn std::error::Error>> {
+fn extract_chain_der(payload: &[u8]) -> Result<ChainAndLeaf, Box<dyn std::error::Error>> {
     use serde::Deserialize;
     use std::collections::BTreeMap;
 

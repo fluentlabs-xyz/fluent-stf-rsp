@@ -182,11 +182,7 @@ async fn process_page(
                         .map_err(|_| eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks))?;
                     info!(batch_index, num_blocks, "BatchCommitted event");
 
-                    if tx
-                        .send(L1Event::BatchCommitted { batch_index, num_blocks })
-                        .await
-                        .is_err()
-                    {
+                    if tx.send(L1Event::BatchCommitted { batch_index, num_blocks }).await.is_err() {
                         warn!(batch_index, "L1 event channel closed");
                     }
                 }

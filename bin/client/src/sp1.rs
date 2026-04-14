@@ -99,14 +99,27 @@ impl<'a> Drop for Sha256Stream<'a> {
     }
 }
 
+/// Upper bound on a bincode-serialized `EthClientExecutorInput` / `BlobVerificationInput`
+/// the guest is willing to decode. Bounds memory allocation during deserialization
+/// so a malicious host cannot force the zkVM to allocate unbounded buffers.
+const MAX_INPUT_SIZE: u64 = 256 * 1024 * 1024;
+
 pub fn main() {
     // 1. Read and deserialize inputs using read_vec
     let (executor_input, blob_input) = profile_report!(DESERIALZE_INPUTS, {
+        use bincode::Options as _;
+        let opts = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(MAX_INPUT_SIZE);
+
         let exec_bytes = sp1_zkvm::io::read_vec();
-        let exec_input = bincode::deserialize::<EthClientExecutorInput>(&exec_bytes).unwrap();
+        let exec_input =
+            opts.deserialize::<EthClientExecutorInput>(&exec_bytes).unwrap();
 
         let blob_bytes = sp1_zkvm::io::read_vec();
-        let blob_input = bincode::deserialize::<BlobVerificationInput>(&blob_bytes).unwrap();
+        let blob_input =
+            opts.deserialize::<BlobVerificationInput>(&blob_bytes).unwrap();
 
         (exec_input, blob_input)
     });
@@ -146,6 +159,16 @@ pub fn main() {
     let (header, events_hash) = executor.execute(executor_input).expect("STF execution failed");
 
     // 4. KZG Verification (Using pre-computed host witnesses)
+    assert_eq!(
+        blob_input.blobs.len(),
+        blob_input.commitments.len(),
+        "blobs / commitments length mismatch"
+    );
+    assert_eq!(
+        blob_input.blobs.len(),
+        blob_input.proofs.len(),
+        "blobs / proofs length mismatch"
+    );
     let mut versioned_hashes = Vec::with_capacity(blob_input.commitments.len());
     for i in 0..blob_input.blobs.len() {
         let blob = Blob::from_slice(&blob_input.blobs[i]).expect("Invalid blob slice");
