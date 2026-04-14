@@ -212,7 +212,7 @@ async fn on_new_attestation(public_key: &[u8], attestation: &[u8]) -> eyre::Resu
 
             // Delete stale request_id AFTER acquiring the lock, so we don't
             // race with an in-flight prove_and_submit saving its request_id.
-            crate::attestation::delete_stale_request_id();
+            crate::attestation::delete_request_id();
 
             info!("New key generated — initializing attestation config if needed...");
             match ATTESTATION_CONFIG

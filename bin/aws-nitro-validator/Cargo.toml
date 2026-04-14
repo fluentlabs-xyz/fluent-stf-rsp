@@ -7,6 +7,15 @@ edition = "2021"
 
 # NOTE: This is a standalone SP1 zkVM program — NOT part of the main workspace.
 
+[lib]
+name = "nitro_validator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-validator"
+path = "src/main.rs"
+test = false
+
 [features]
 default = ["mainnet"]
 mainnet = []
@@ -23,6 +32,10 @@ sp1-zkvm = "6.0.2"
 
 [dev-dependencies]
 hex = "0.4"
+ciborium = "0.2"
+x509-parser = "0.18"
+bincode = "1"
+serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }
 
 [patch.crates-io]
 sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.9-sp1-6.0.0" }

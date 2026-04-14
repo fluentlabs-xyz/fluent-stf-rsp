@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use alloy_network::EthereumWallet;
-use alloy_primitives::{Address, Bytes};
-use alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use alloy_primitives::Address;
+use alloy_provider::{ProviderBuilder, RootProvider};
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{sol, SolCall};
 use eyre::{eyre, Result};
+use l1_rollup_client::nitro_verifier;
 use revm_primitives::{hex, B256};
 use sp1_sdk::{
     network::{prover::NetworkProver, NetworkMode},
@@ -15,10 +15,6 @@ use tracing::info;
 use url::Url;
 
 use super::{prepare, ROOT_CERT_DER};
-
-sol! {
-    function verifyAttestation(address expectedPubkey, bytes calldata proofBytes) external;
-}
 
 /// Configuration for attestation proving + L1 submission.
 #[derive(Clone)]
@@ -97,7 +93,7 @@ fn load_request_id() -> Option<B256> {
     B256::try_from(bytes.as_slice()).ok()
 }
 
-fn delete_request_id() {
+pub(crate) fn delete_request_id() {
     let _ = std::fs::remove_file(request_id_path());
 }
 
@@ -174,52 +170,49 @@ async fn check_and_maybe_submit(
     }
 }
 
-/// Extract proof bytes and submit verifyAttestation tx to L1.
+/// Decode the proof's committed public values, sanity-check them against the
+/// locally-derived enclave address, and submit `verifyAttestation` to L1.
 async fn submit_proof_to_l1(
     config: &AttestationConfig,
     public_key: &[u8],
     proof: &sp1_sdk::SP1ProofWithPublicValues,
 ) -> Result<()> {
-    let address = pubkey_to_address(public_key)?;
-    info!(address = %address, "Derived Ethereum address from enclave pubkey");
+    let local_address = pubkey_to_address(public_key)?;
+
+    // Public values committed by the guest: abi.encode(address, uint64).
+    // Decode locally so we can surface a clear error before the tx goes out,
+    // and so the uint64 timestamp can be forwarded to the contract (the
+    // contract reconstructs the same blob and passes it to `verifyProof`).
+    let (committed_address, attestation_time) =
+        nitro_verifier::decode_public_values(proof.public_values.as_slice())
+            .map_err(|e| eyre!("Failed to decode attestation public values: {e}"))?;
+
+    if committed_address != local_address {
+        return Err(eyre!(
+            "Committed enclave address mismatch: proof={committed_address}, local={local_address}"
+        ));
+    }
+
+    info!(
+        address = %local_address,
+        attestation_time,
+        "Derived address + attestation time from proof public values"
+    );
 
     let proof_bytes = proof.bytes();
-
-    let call =
-        verifyAttestationCall { expectedPubkey: address, proofBytes: Bytes::from(proof_bytes) };
 
     let wallet = EthereumWallet::from(config.l1_signer.clone());
     let provider =
         ProviderBuilder::new().wallet(wallet).connect_provider(config.l1_provider.clone());
 
-    let tx = alloy_rpc_types::TransactionRequest {
-        to: Some(config.nitro_verifier_addr.into()),
-        input: Bytes::from(call.abi_encode()).into(),
-        ..Default::default()
-    };
-
-    info!(
-        contract = %config.nitro_verifier_addr,
-        address = %address,
-        "Submitting verifyAttestation tx to L1..."
-    );
-
-    let pending = provider
-        .send_transaction(tx)
-        .await
-        .map_err(|e| eyre!("Failed to send verifyAttestation tx: {e}"))?;
-
-    let receipt =
-        pending.get_receipt().await.map_err(|e| eyre!("verifyAttestation tx failed: {e}"))?;
-
-    if !receipt.status() {
-        return Err(eyre!("verifyAttestation tx reverted (tx_hash: {})", receipt.transaction_hash));
-    }
-
-    info!(
-        tx_hash = %receipt.transaction_hash,
-        "Attestation verified on L1 successfully"
-    );
+    nitro_verifier::submit_attestation(
+        &provider,
+        config.nitro_verifier_addr,
+        local_address,
+        attestation_time,
+        proof_bytes.into(),
+    )
+    .await?;
 
     Ok(())
 }

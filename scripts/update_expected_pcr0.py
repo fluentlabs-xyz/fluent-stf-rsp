@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Rewrite the `EXPECTED_PCR0` constant (for a given network) in
-nitro-validator `main.rs` from the JSON produced by `nitro-cli build-enclave`.
+nitro-validator `lib.rs` from the JSON produced by `nitro-cli build-enclave`.
 
 Usage:
-    update_expected_pcr0.py <nitro-cli-output.json> <main.rs> <network>
+    update_expected_pcr0.py <nitro-cli-output.json> <lib.rs> <network>
 
 `network` must be one of: mainnet, testnet, devnet.
-Only the `#[cfg(feature = "<network>")] const EXPECTED_PCR0 …` block is rewritten.
+Only the `#[cfg(feature = "<network>")] pub const EXPECTED_PCR0 …` block is rewritten.
 """
 import json
 import pathlib
@@ -19,11 +19,11 @@ NETWORKS = ("mainnet", "testnet", "devnet")
 def main() -> None:
     if len(sys.argv) != 4:
         sys.exit(
-            "usage: update_expected_pcr0.py <nitro-cli-output.json> <main.rs> <network>"
+            "usage: update_expected_pcr0.py <nitro-cli-output.json> <lib.rs> <network>"
         )
 
     pcr_json = pathlib.Path(sys.argv[1])
-    main_rs = pathlib.Path(sys.argv[2])
+    lib_rs = pathlib.Path(sys.argv[2])
     network = sys.argv[3]
 
     if network not in NETWORKS:
@@ -41,26 +41,26 @@ def main() -> None:
     ]
     new_block = (
         f'#[cfg(feature = "{network}")]\n'
-        "const EXPECTED_PCR0: [u8; 48] = [\n"
+        "pub const EXPECTED_PCR0: [u8; 48] = [\n"
         + "\n".join(rows)
         + "\n];"
     )
 
-    src = main_rs.read_text()
+    src = lib_rs.read_text()
     pattern = re.compile(
         r'#\[cfg\(feature = "' + re.escape(network) + r'"\)\]\s*\n'
-        r"const EXPECTED_PCR0: \[u8; 48\] = \[[^\]]*\];",
+        r"pub const EXPECTED_PCR0: \[u8; 48\] = \[[^\]]*\];",
         re.DOTALL,
     )
     new_src, n = pattern.subn(new_block, src)
     if n != 1:
         sys.exit(
-            f"expected 1 EXPECTED_PCR0 block for feature `{network}` in {main_rs}, "
+            f"expected 1 EXPECTED_PCR0 block for feature `{network}` in {lib_rs}, "
             f"found {n}"
         )
 
-    main_rs.write_text(new_src)
-    print(f"Updated EXPECTED_PCR0[{network}] in {main_rs} → {pcr0_hex}")
+    lib_rs.write_text(new_src)
+    print(f"Updated EXPECTED_PCR0[{network}] in {lib_rs} → {pcr0_hex}")
 
 
 if __name__ == "__main__":

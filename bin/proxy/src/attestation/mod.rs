@@ -75,16 +75,17 @@ mod tests {
         assert!(result.is_ok(), "prepare_guest_input failed: {:?}", result.err());
 
         let input = result.unwrap();
-        println!("pcr0 (len={}): {:?}", input.pcr0.len(), input.pcr0);
         println!(
             "cose_signature (len={}): {:?}",
             input.cose_signature.len(),
             &input.cose_signature[..8]
         );
-        println!("user_data (len={}): {:?}", input.user_data.len(), &input.user_data[..4]);
+        println!("cose_payload len: {}", input.cose_payload.len());
         assert!(!input.chain.is_empty(), "certificate chain should not be empty");
-        assert!(!input.sig_structure.is_empty(), "sig_structure should not be empty");
-        assert!(!input.user_data.is_empty(), "user_data should not be empty");
+        assert!(!input.cose_protected.is_empty(), "protected header should not be empty");
+        assert!(!input.cose_payload.is_empty(), "payload should not be empty");
+        assert_eq!(input.cose_signature.len(), 96);
+        assert_eq!(input.root_pubkey.len(), 97);
     }
 
     /// Debug: parse CBOR directly to inspect PCRs map

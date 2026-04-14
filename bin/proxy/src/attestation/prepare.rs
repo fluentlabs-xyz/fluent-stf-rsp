@@ -1,125 +1,153 @@
-use std::collections::BTreeMap;
-
 use p384::ecdsa::{signature::DigestVerifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha384};
 use x509_parser::prelude::*;
 
-/// Pre-parsed certificate data extracted from X.509 DER on the host.
+/// SHA-384 of the DER-encoded Subject DN of the AWS Nitro root CA.
+const EXPECTED_ROOT_SUBJECT_HASH: [u8; 48] = [
+    0xfe, 0x19, 0xf1, 0x6b, 0x73, 0xdc, 0xfd, 0xf7,
+    0xad, 0xa6, 0x86, 0xb2, 0x6f, 0xbc, 0x26, 0x80,
+    0x0e, 0x8b, 0x49, 0x33, 0xa0, 0xc1, 0xe7, 0xa9,
+    0xb4, 0x0c, 0xd4, 0xea, 0x80, 0x9f, 0x18, 0x29,
+    0xdc, 0x48, 0x8e, 0x14, 0x75, 0x3c, 0xbd, 0xe8,
+    0x76, 0x86, 0xc4, 0xd9, 0x34, 0x39, 0xf0, 0x3e,
+];
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct CertData {
     #[serde(with = "serde_bytes")]
     pub tbs: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub pubkey: Vec<u8>,
 }
 
-/// Everything the guest receives from the host.
+/// Wire-compatible with `nitro_validator::GuestInput`. Guest parses CBOR and
+/// X.509 DER structurally — host just forwards raw bytes.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct GuestInput {
     pub root_pubkey: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub root_subject: Vec<u8>,
     pub chain: Vec<CertData>,
     #[serde(with = "serde_bytes")]
-    pub sig_structure: Vec<u8>,
+    pub cose_protected: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub cose_payload: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub cose_signature: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub pcr0: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub user_data: Vec<u8>,
 }
 
-// ─── CBOR structures (parsed only on the host) ─────────────────────────────
-
-#[derive(Deserialize)]
-struct AttestationDoc {
-    #[serde(with = "pcrs_de")]
-    pcrs: BTreeMap<usize, Vec<u8>>,
-    #[serde(with = "serde_bytes")]
-    certificate: Vec<u8>,
-    #[serde(with = "cabundle_de")]
-    cabundle: Vec<Vec<u8>>,
-    #[serde(default, with = "opt_bytes_de")]
-    user_data: Option<Vec<u8>>,
-}
-
-// ─── Main entry point ───────────────────────────────────────────────────────
-
-/// Parse the raw attestation document, validate the certificate chain,
-/// and produce a minimal `GuestInput` for the SP1 guest program.
 pub(crate) fn prepare_guest_input(
     attestation_bytes: &[u8],
     root_cert_der: &[u8],
 ) -> Result<GuestInput, Box<dyn std::error::Error>> {
-    // 1. Parse COSE Sign1
+    // COSE_Sign1 = [protected, unprotected, payload, signature]
     let (protected, _unprotected, payload, signature):
         (ByteBuf, ciborium::Value, ByteBuf, ByteBuf) =
         ciborium::from_reader(attestation_bytes)?;
 
-    // 2. Parse AttestationDoc from COSE payload
-    let doc: AttestationDoc = ciborium::from_reader(&payload[..])?;
-
-    // 3. Extract root public key
-    let (_, root_cert) = X509Certificate::from_der(root_cert_der)?;
-    let root_pubkey = extract_sec1(&root_cert.public_key().subject_public_key.data)?;
-
-    // 4. Build CertData chain (cabundle intermediates + leaf certificate)
-    let mut chain = Vec::with_capacity(doc.cabundle.len() + 1);
-
-    for ca_der in &doc.cabundle {
-        let (_, ca) = X509Certificate::from_der(ca_der)?;
-        chain.push(cert_to_data(&ca)?);
-    }
-
-    let (_, leaf) = X509Certificate::from_der(&doc.certificate)?;
-    chain.push(cert_to_data(&leaf)?);
-
-    // 5. Optional: verify the chain on the host too (fail fast before proving)
-    {
-        let mut issuer_pk = root_pubkey;
-        for cert in &chain {
-            verify_p384_host(&issuer_pk, &cert.tbs, &cert.signature)?;
-            issuer_pk = cert.pubkey.clone().try_into().expect("correct size");
-        }
-    }
-
-    // 6. Build COSE Sig_structure
-    let sig_structure = build_sig_structure(&protected, &payload)?;
-
-    // 7. Extract COSE signature (raw 96 bytes for P-384)
-    let mut cose_signature = [0u8; 96];
     if signature.len() != 96 {
         return Err(format!("expected 96-byte COSE signature, got {}", signature.len()).into());
     }
-    cose_signature.copy_from_slice(&signature);
 
-    // 8. Extract PCR0
-    let pcr0_vec = doc.pcrs.get(&0).ok_or("missing PCR0")?;
-    let mut pcr0 = [0u8; 48];
-    if pcr0_vec.len() != 48 {
-        return Err("PCR0 must be 48 bytes".into());
+    // Root pubkey + subject DN. Host validates the subject hash locally so we
+    // fail fast before the prover starts.
+    let (_, root_cert) = X509Certificate::from_der(root_cert_der)?;
+    let root_pubkey = extract_sec1(&root_cert.public_key().subject_public_key.data)?;
+    let root_subject = root_cert.tbs_certificate.subject.as_raw().to_vec();
+    if Sha384::digest(&root_subject)[..] != EXPECTED_ROOT_SUBJECT_HASH {
+        return Err("root CA subject hash mismatch".into());
     }
-    pcr0.copy_from_slice(pcr0_vec);
 
-    // 9. Extract user_data
-    let user_data = doc.user_data.ok_or("missing user_data")?;
+    // Extract cabundle + leaf from the signed AttestationDoc.
+    let doc_payload = payload.clone().into_vec();
+    let (cabundle, leaf_der) = extract_chain_der(&doc_payload)?;
+
+    let mut chain: Vec<CertData> = Vec::with_capacity(cabundle.len() + 1);
+    for der in &cabundle {
+        let (_, parsed) = X509Certificate::from_der(der)?;
+        chain.push(CertData {
+            tbs: parsed.tbs_certificate.as_ref().to_vec(),
+            signature: parsed.signature_value.data.to_vec(),
+        });
+    }
+    let (_, leaf) = X509Certificate::from_der(&leaf_der)?;
+    chain.push(CertData {
+        tbs: leaf.tbs_certificate.as_ref().to_vec(),
+        signature: leaf.signature_value.data.to_vec(),
+    });
+
+    // Fail-fast host verification of the chain (mirrors guest logic).
+    {
+        let mut issuer_pk = root_pubkey;
+        for der in cabundle.iter().chain(std::iter::once(&leaf_der)) {
+            let (_, parsed) = X509Certificate::from_der(der)?;
+            verify_p384_host(
+                &issuer_pk,
+                parsed.tbs_certificate.as_ref(),
+                parsed.signature_value.data.as_ref(),
+            )?;
+            issuer_pk = extract_sec1(&parsed.public_key().subject_public_key.data)?;
+        }
+    }
 
     Ok(GuestInput {
         root_pubkey: root_pubkey.into(),
+        root_subject,
         chain,
-        sig_structure,
-        cose_signature: cose_signature.into(),
-        pcr0: pcr0.into(),
-        user_data,
+        cose_protected: protected.into_vec(),
+        cose_payload: doc_payload,
+        cose_signature: signature.into_vec(),
     })
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+/// Decode just enough of an `AttestationDoc` CBOR map to pull out the
+/// `cabundle` array and the `certificate` bstr. Host convenience only —
+/// the guest parses the same payload independently.
+fn extract_chain_der(
+    payload: &[u8],
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), Box<dyn std::error::Error>> {
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
 
-/// Extract SEC1 uncompressed point (97 bytes) from X.509 BIT STRING.
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(with = "serde_bytes")]
+        certificate: Vec<u8>,
+        #[serde(with = "cabundle_de")]
+        cabundle: Vec<Vec<u8>>,
+        #[allow(dead_code)]
+        #[serde(default, with = "pcrs_de")]
+        pcrs: BTreeMap<usize, Vec<u8>>,
+    }
+
+    mod cabundle_de {
+        use serde::Deserialize;
+        use serde_bytes::ByteBuf;
+        pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<Vec<Vec<u8>>, D::Error> {
+            let v: Vec<ByteBuf> = Vec::deserialize(d)?;
+            Ok(v.into_iter().map(|b| b.into_vec()).collect())
+        }
+    }
+    mod pcrs_de {
+        use serde::Deserialize;
+        use serde_bytes::ByteBuf;
+        use std::collections::BTreeMap;
+        pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<BTreeMap<usize, Vec<u8>>, D::Error> {
+            let m: BTreeMap<usize, ByteBuf> = BTreeMap::deserialize(d)?;
+            Ok(m.into_iter().map(|(k, v)| (k, v.into_vec())).collect())
+        }
+    }
+
+    let doc: Doc = ciborium::from_reader(payload)?;
+    Ok((doc.cabundle, doc.certificate))
+}
+
 fn extract_sec1(raw: &[u8]) -> Result<[u8; 97], Box<dyn std::error::Error>> {
     let sec1 = if raw.len() == 98 && raw[0] == 0x00 {
         &raw[1..]
@@ -138,18 +166,6 @@ fn extract_sec1(raw: &[u8]) -> Result<[u8; 97], Box<dyn std::error::Error>> {
     Ok(out)
 }
 
-/// Convert an X509Certificate into CertData (TBS + signature + pubkey).
-fn cert_to_data(cert: &X509Certificate<'_>) -> Result<CertData, Box<dyn std::error::Error>> {
-    Ok(CertData {
-        tbs: cert.tbs_certificate.as_ref().to_vec(),
-        signature: cert.signature_value.data.to_vec(),
-        pubkey: extract_sec1(&cert.public_key().subject_public_key.data)
-            .expect("correct sec1")
-            .to_vec(),
-    })
-}
-
-/// Host-side signature verification (fail fast, not security-critical).
 fn verify_p384_host(
     issuer_key: &[u8; 97],
     tbs: &[u8],
@@ -160,51 +176,4 @@ fn verify_p384_host(
     let sig = Signature::from_der(sig_bytes)?;
     vk.verify_digest(digest, &sig)?;
     Ok(())
-}
-
-/// Build COSE Sig_structure: ["Signature1", protected, external_aad, payload]
-fn build_sig_structure(
-    protected: &[u8],
-    payload: &[u8],
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let structure = (
-        "Signature1",
-        ByteBuf::from(protected.to_vec()),
-        ByteBuf::from(Vec::new()),
-        ByteBuf::from(payload.to_vec()),
-    );
-    let mut buf = Vec::new();
-    ciborium::into_writer(&structure, &mut buf)?;
-    Ok(buf)
-}
-
-// ─── Serde helpers ──────────────────────────────────────────────────────────
-
-mod pcrs_de {
-    use super::*;
-    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> Result<BTreeMap<usize, Vec<u8>>, D::Error> {
-        let m: BTreeMap<usize, ByteBuf> = BTreeMap::deserialize(d)?;
-        Ok(m.into_iter().map(|(k, v)| (k, v.into_vec())).collect())
-    }
-}
-
-mod cabundle_de {
-    use super::*;
-    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
-        let v: Vec<ByteBuf> = Vec::deserialize(d)?;
-        Ok(v.into_iter().map(|b| b.into_vec()).collect())
-    }
-}
-
-mod opt_bytes_de {
-    use serde::Deserialize;
-    use serde_bytes::ByteBuf;
-    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> Result<Option<Vec<u8>>, D::Error> {
-        let o: Option<ByteBuf> = Option::deserialize(d)?;
-        Ok(o.map(|b| b.into_vec()))
-    }
 }

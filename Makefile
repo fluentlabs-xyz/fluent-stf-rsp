@@ -88,7 +88,7 @@ build-enclave:
 		> $(EIF).pcrs.json
 	python3 scripts/update_expected_pcr0.py \
 		$(EIF).pcrs.json \
-		$(NITRO_VALIDATOR_DIR)/src/main.rs \
+		$(NITRO_VALIDATOR_DIR)/src/lib.rs \
 		$(NETWORK)
 
 ## Run enclave locally (debug)

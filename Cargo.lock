@@ -6838,6 +6838,7 @@ dependencies = [
  "eyre",
  "fluent-stf-primitives",
  "l1-rollup-client",
+ "memchr",
  "nitro-types",
  "p384",
  "reqwest 0.12.28",
