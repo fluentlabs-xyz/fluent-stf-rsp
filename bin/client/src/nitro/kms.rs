@@ -5,12 +5,25 @@ use sha2::{Digest, Sha256};
 use std::{
     io::{Read, Write},
     sync::Arc,
+    time::Duration,
 };
 use vsock::{VsockAddr, VsockStream};
 
 use base64::{engine::general_purpose, Engine as _};
 
-use crate::nitro::{CONTENT_TYPE, HOST_CID, KMS_HOST, KMS_PORT, REGION, TARGET_GENERATE_RANDOM};
+use crate::nitro::{
+    CONTENT_TYPE, HOST_CID, KMS_HOST, KMS_MAX_RESPONSE_BYTES, KMS_PORT, KMS_TIMEOUT_SECS, REGION,
+    TARGET_GENERATE_RANDOM,
+};
+
+/// Reject header values that could enable CRLF injection or NUL-termination
+/// attacks when concatenated into the raw HTTP request.
+fn assert_header_safe(name: &str, value: &str) -> anyhow::Result<()> {
+    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Err(anyhow::anyhow!("unsafe bytes in header value: {name}"));
+    }
+    Ok(())
+}
 
 /// Minimal KMS client used solely to obtain random bytes via `GenerateRandom`.
 /// Serves as a second independent entropy source alongside NSM GetRandom.
@@ -61,8 +74,19 @@ impl KmsClient {
         tls.write_all(http_req.as_bytes())?;
         tls.flush()?;
 
+        // Per-read/per-write timeouts on the underlying vsock stream bound the
+        // duration of any single I/O op. We read `KMS_MAX_RESPONSE_BYTES + 1`
+        // so we can distinguish "response exactly fits the cap" from "response
+        // hit the cap and was truncated".
         let mut resp_str = String::new();
-        tls.read_to_string(&mut resp_str)?;
+        let cap = KMS_MAX_RESPONSE_BYTES;
+        let n = (&mut tls)
+            .take(cap + 1)
+            .read_to_string(&mut resp_str)
+            .map_err(|e| anyhow::anyhow!("Failed to read KMS response: {e}"))?;
+        if n as u64 > cap {
+            return Err(anyhow::anyhow!("KMS response exceeded {cap}-byte cap"));
+        }
 
         let (status_line, body_part) = self.split_http(&resp_str);
 
@@ -82,6 +106,13 @@ impl KmsClient {
 
     fn connect(&self) -> anyhow::Result<StreamOwned<ClientConnection, VsockStream>> {
         let vsock = VsockStream::connect(&self.vsock_addr)?;
+        let timeout = Duration::from_secs(KMS_TIMEOUT_SECS);
+        vsock
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| anyhow::anyhow!("Failed to set KMS vsock read timeout: {e}"))?;
+        vsock
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| anyhow::anyhow!("Failed to set KMS vsock write timeout: {e}"))?;
 
         let mut roots = RootCertStore::empty();
         roots.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
@@ -107,6 +138,12 @@ impl KmsClient {
         let now = chrono::Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
+
+        assert_header_safe("host", self.host.as_str())?;
+        assert_header_safe("x-amz-date", amz_date.as_str())?;
+        assert_header_safe("x-amz-security-token", &self.creds.session_token)?;
+        assert_header_safe("access_key_id", &self.creds.access_key_id)?;
+        assert_header_safe("secret_access_key", &self.creds.secret_access_key)?;
 
         let mut headers = vec![
             ("content-type", CONTENT_TYPE),

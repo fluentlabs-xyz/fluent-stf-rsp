@@ -30,8 +30,10 @@ use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use std::collections::BTreeMap;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
+use std::time::Duration;
 use ::vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
 use crate::blob;
@@ -138,17 +140,14 @@ fn calculate_merkle_root(leaves: &[[u8; 32]]) -> anyhow::Result<[u8; 32]> {
     let mut layer: Vec<[u8; 32]> = leaves.to_vec();
 
     while layer.len() > 1 {
-        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
-
-        for i in 0..layer.len() / 2 {
-            next.push(keccak_pair(layer[i * 2], layer[i * 2 + 1]));
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
+        for pair in layer.chunks(2) {
+            match pair {
+                [a, b] => next.push(keccak_pair(*a, *b)),
+                [a] => next.push(keccak_pair(*a, *a)),
+                _ => unreachable!("chunks(2) yields slices of length 1 or 2"),
+            }
         }
-
-        if layer.len() % 2 == 1 {
-            let last = *layer.last().unwrap();
-            next.push(keccak_pair(last, last));
-        }
-
         layer = next;
     }
 
@@ -175,14 +174,29 @@ fn compute_leaf(
 // Signature verification for EthExecutionResponse
 // ---------------------------------------------------------------------------
 
-/// Verifies that an EthExecutionResponse was signed by this enclave.
+/// Payload layout signed by `sign_execution` / checked by `verify_response`.
+/// `block_number` is committed alongside `(leaf, tx_data_hash)` so a response
+/// signed for block N cannot be replayed under a different block number when
+/// SubmitBatch falls back to responses on cache miss.
+fn execution_sign_payload(
+    block_number: u64,
+    leaf: &[u8; 32],
+    tx_data_hash: &B256,
+) -> [u8; 72] {
+    let mut payload = [0u8; 72];
+    payload[..8].copy_from_slice(&block_number.to_be_bytes());
+    payload[8..40].copy_from_slice(leaf);
+    payload[40..].copy_from_slice(tx_data_hash.as_slice());
+    payload
+}
+
+/// Verifies that an EthExecutionResponse was signed by this enclave for the
+/// specific block_number the response claims to represent.
 fn verify_response(
     resp: &EthExecutionResponse,
     verifying_key: &VerifyingKey,
 ) -> anyhow::Result<()> {
-    let mut payload = [0u8; 64];
-    payload[..32].copy_from_slice(&resp.leaf);
-    payload[32..].copy_from_slice(resp.tx_data_hash.as_slice());
+    let payload = execution_sign_payload(resp.block_number, &resp.leaf, &resp.tx_data_hash);
     let signature = Signature::from_slice(&resp.signature).context("invalid signature encoding")?;
     verifying_key.verify(&payload, &signature).context("signature verification failed")?;
     Ok(())
@@ -331,28 +345,51 @@ pub(crate) fn handle_submit_batch(
     responses: &[EthExecutionResponse],
     blobs: &[Vec<u8>],
     signing_key: &SigningKey,
-    store: &BlockStore,
+    block_store: &Mutex<BlockStore>,
 ) -> Result<SubmitBatchResponse, SubmitBatchError> {
     let verifying_key = *signing_key.verifying_key();
 
-    let response_map: std::collections::HashMap<u64, &EthExecutionResponse> =
-        responses.iter().map(|r| (r.block_number, r)).collect();
+    let mut response_map: std::collections::HashMap<u64, &EthExecutionResponse> =
+        std::collections::HashMap::with_capacity(responses.len());
+    for resp in responses {
+        if response_map.insert(resp.block_number, resp).is_some() {
+            return Err(SubmitBatchError::Other(anyhow::anyhow!(
+                "duplicate block_number {} in SubmitBatch",
+                resp.block_number
+            )));
+        }
+    }
+
+    // Snapshot the cache into an owned vector and drop the guard BEFORE
+    // signature verification / Merkle / blob decode — keeps the store
+    // available to concurrent ExecuteBlock workers during the heavy work.
+    //
+    // Semantics: this is a point-in-time view. Any ExecuteBlock worker that
+    // inserts into `block_store` for a key in `[from, to]` after the snapshot
+    // is intentionally invisible to this in-flight batch; the submitter will
+    // see the fresher value on the next SubmitBatch call.
+    let cached: Vec<Option<BlockEntry>> = {
+        let store = block_store
+            .lock()
+            .map_err(|e| SubmitBatchError::Other(anyhow::anyhow!("block_store mutex poisoned: {e}")))?;
+        (from..=to).map(|n| store.get(n).copied()).collect()
+    };
 
     let mut leaves = Vec::with_capacity((to - from + 1) as usize);
     let mut tx_data_hashes = Vec::with_capacity((to - from + 1) as usize);
     let mut invalid_blocks: Vec<u64> = Vec::new();
 
-    for block in from..=to {
-        if let Some(entry) = store.get(block) {
-            leaves.push(entry.leaf);
-            tx_data_hashes.push(entry.tx_data_hash);
-        } else if let Some(resp) = response_map.get(&block) {
+    for (idx, block) in (from..=to).enumerate() {
+        if let Some(resp) = response_map.get(&block) {
             if verify_response(resp, &verifying_key).is_ok() {
                 leaves.push(resp.leaf);
                 tx_data_hashes.push(resp.tx_data_hash);
             } else {
                 invalid_blocks.push(block);
             }
+        } else if let Some(entry) = cached[idx] {
+            leaves.push(entry.leaf);
+            tx_data_hashes.push(entry.tx_data_hash);
         } else {
             invalid_blocks.push(block);
         }
@@ -419,9 +456,8 @@ fn sign_execution(
     result: &ExecutionResult,
     signing_key: &SigningKey,
 ) -> EthExecutionResponse {
-    let mut payload = [0u8; 64];
-    payload[..32].copy_from_slice(&result.leaf);
-    payload[32..].copy_from_slice(result.tx_data_hash.as_slice());
+    let payload =
+        execution_sign_payload(result.block_number, &result.leaf, &result.tx_data_hash);
     let signature: Signature = signing_key.sign(&payload);
 
     EthExecutionResponse {
@@ -466,6 +502,62 @@ fn send_response(channel: &mut VsockChannel, resp: &EnclaveResponse) {
     }
 }
 
+/// A single in-flight `ExecuteBlock` job handed off to the worker pool.
+/// Owns the vsock channel so the worker can send the response when done.
+struct ExecuteJob {
+    channel: VsockChannel,
+    input: EthClientExecutorInput,
+    identity: Arc<EnclaveIdentity>,
+    block_store: Arc<Mutex<BlockStore>>,
+}
+
+/// Spawns `n` long-lived worker threads that drain `ExecuteJob`s from a
+/// bounded mpsc queue. Capacity is `n`, so at most `n` jobs can be queued
+/// ahead of the workers — on saturation the accept loop will reply
+/// `"enclave busy"` via `try_send` instead of blocking.
+fn spawn_execute_workers(n: usize) -> SyncSender<ExecuteJob> {
+    let (tx, rx) = sync_channel::<ExecuteJob>(n);
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..n {
+        let rx: Arc<Mutex<Receiver<ExecuteJob>>> = Arc::clone(&rx);
+        thread::spawn(move || loop {
+            // Recover from poisoning — the rx mutex is only held during
+            // `recv()`, so the internal state is always consistent on panic.
+            let job = {
+                let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                guard.recv()
+            };
+            let Ok(job) = job else { return };
+
+            // Isolate `execute_block` panics: report an error to the host and
+            // keep the worker alive instead of silently disappearing from the
+            // pool. Without this, a single panic would shrink the pool by one
+            // and eventually starve all ExecuteBlock traffic.
+            let ExecuteJob { mut channel, input, identity, block_store } = job;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_block(input, &identity.signing_key, &block_store)
+            }));
+            let resp = match result {
+                Ok(Ok(output)) => EnclaveResponse::ExecutionResult(output),
+                Ok(Err(e)) => EnclaveResponse::Error(format!("{e:#}")),
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&'static str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown panic");
+                    eprintln!("execute_block panicked: {msg}");
+                    EnclaveResponse::Error(format!("execute_block panicked: {msg}"))
+                }
+            };
+            if let Err(e) = channel.send_bincode(&resp) {
+                eprintln!("Failed to send ExecuteBlock response: {e:#}");
+            }
+        });
+    }
+    tx
+}
+
 impl Enclave {
     fn init() -> anyhow::Result<Self> {
         let listener = VsockListener::bind(&VsockAddr::new(VMADDR_CID_ANY, VSOCK_PORT))
@@ -478,6 +570,7 @@ impl Enclave {
 
         let mut identity: Option<Arc<EnclaveIdentity>> = None;
         let block_store = Arc::new(Mutex::new(BlockStore::new()));
+        let execute_tx = spawn_execute_workers(EXECUTE_WORKER_COUNT);
 
         loop {
             let mut channel = match VsockChannel::accept(&self.listener) {
@@ -487,6 +580,16 @@ impl Enclave {
                     continue;
                 }
             };
+
+            let timeout = Some(Duration::from_secs(VSOCK_READ_TIMEOUT_SECS));
+            if let Err(e) = channel.set_read_timeout(timeout) {
+                eprintln!("Failed to set vsock read timeout: {e:#}");
+                continue;
+            }
+            if let Err(e) = channel.set_write_timeout(timeout) {
+                eprintln!("Failed to set vsock write timeout: {e:#}");
+                continue;
+            }
 
             let raw = match channel.receive() {
                 Ok(data) => data,
@@ -542,19 +645,24 @@ impl Enclave {
                         continue;
                     };
 
-                    let id = Arc::clone(id);
-                    let store = Arc::clone(&block_store);
-
-                    thread::spawn(move || {
-                        let result = execute_block(*input, &id.signing_key, &store);
-                        let resp = match result {
-                            Ok(output) => EnclaveResponse::ExecutionResult(output),
-                            Err(e) => EnclaveResponse::Error(format!("{e:#}")),
-                        };
-                        if let Err(e) = channel.send_bincode(&resp) {
-                            eprintln!("Failed to send ExecuteBlock response: {e:#}");
+                    let job = ExecuteJob {
+                        channel,
+                        input: *input,
+                        identity: Arc::clone(id),
+                        block_store: Arc::clone(&block_store),
+                    };
+                    match execute_tx.try_send(job) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(mut j)) => {
+                            let resp = EnclaveResponse::Error("enclave busy".into());
+                            send_response(&mut j.channel, &resp);
                         }
-                    });
+                        Err(TrySendError::Disconnected(mut j)) => {
+                            let resp =
+                                EnclaveResponse::Error("execute worker pool disconnected".into());
+                            send_response(&mut j.channel, &resp);
+                        }
+                    }
                 }
 
                 // ── SubmitBatch: cache-first with response fallback ──
@@ -565,20 +673,20 @@ impl Enclave {
                         continue;
                     };
 
-                    let resp = match block_store.lock() {
-                        Ok(store) => {
-                            match handle_submit_batch(from, to, &responses, &blobs, &id.signing_key, &store) {
-                                Ok(result) => EnclaveResponse::SubmitBatchResult(result),
-                                Err(SubmitBatchError::InvalidSignatures(blocks)) => {
-                                    EnclaveResponse::InvalidSignatures { invalid_blocks: blocks }
-                                }
-                                Err(SubmitBatchError::Other(e)) => {
-                                    EnclaveResponse::Error(format!("{e:#}"))
-                                }
-                            }
+                    let resp = match handle_submit_batch(
+                        from,
+                        to,
+                        &responses,
+                        &blobs,
+                        &id.signing_key,
+                        &block_store,
+                    ) {
+                        Ok(result) => EnclaveResponse::SubmitBatchResult(result),
+                        Err(SubmitBatchError::InvalidSignatures(blocks)) => {
+                            EnclaveResponse::InvalidSignatures { invalid_blocks: blocks }
                         }
-                        Err(e) => {
-                            EnclaveResponse::Error(format!("block_store mutex poisoned: {e}"))
+                        Err(SubmitBatchError::Other(e)) => {
+                            EnclaveResponse::Error(format!("{e:#}"))
                         }
                     };
                     send_response(&mut channel, &resp);
@@ -758,9 +866,7 @@ mod tests {
         // Create one valid response (signed by our key) and one invalid (bad signature)
         let leaf = [0x01u8; 32];
         let tx_data_hash = B256::ZERO;
-        let mut payload = [0u8; 64];
-        payload[..32].copy_from_slice(&leaf);
-        payload[32..].copy_from_slice(tx_data_hash.as_slice());
+        let payload = execution_sign_payload(10, &leaf, &tx_data_hash);
         let sig: Signature = signing_key.sign(&payload);
 
         let valid_resp = EthExecutionResponse {
@@ -777,6 +883,7 @@ mod tests {
             signature: vec![0u8; 64], // garbage signature
         };
 
+        let store = Mutex::new(store);
         let result = handle_submit_batch(
             10, 11, &[valid_resp, invalid_resp], &[], &signing_key, &store,
         );
@@ -792,7 +899,7 @@ mod tests {
     #[test]
     fn handle_submit_batch_missing_block_collected() {
         let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
-        let store = BlockStore::new();
+        let store = Mutex::new(BlockStore::new());
 
         // No responses, no store entries — all blocks should be invalid
         let result = handle_submit_batch(

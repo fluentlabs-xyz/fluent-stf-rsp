@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::io::{Read, Write};
+use std::time::Duration;
 use vsock::{VsockListener, VsockStream};
 
 use crate::nitro::MAX_FRAME_SIZE;
@@ -14,6 +15,22 @@ impl VsockChannel {
     /// Creates a new channel from an existing VSOCK stream.
     pub fn new(stream: VsockStream) -> Self {
         Self { stream }
+    }
+
+    /// Applies a read timeout to the underlying vsock stream so the enclave
+    /// cannot be pinned by a host that opens a connection and never sends.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> anyhow::Result<()> {
+        self.stream
+            .set_read_timeout(timeout)
+            .map_err(|e| anyhow::anyhow!("Failed to set vsock read timeout: {e}"))
+    }
+
+    /// Applies a write timeout to the underlying vsock stream so the enclave
+    /// cannot be pinned by a host that accepts bytes slowly (or not at all).
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> anyhow::Result<()> {
+        self.stream
+            .set_write_timeout(timeout)
+            .map_err(|e| anyhow::anyhow!("Failed to set vsock write timeout: {e}"))
     }
 
     /// Helper method to wait for the next connection using an existing listener.
@@ -37,7 +54,8 @@ impl VsockChannel {
     /// Core logic for sending a length-prefixed frame over VSOCK.
     /// Handles length prefixing, writing, and flushing.
     fn write_frame(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        let len = data.len() as u32;
+        let len = u32::try_from(data.len())
+            .map_err(|_| anyhow::anyhow!("Outgoing frame size ({}) exceeds u32::MAX", data.len()))?;
 
         // 1. Send the 4-byte Big-Endian length prefix
         self.stream
