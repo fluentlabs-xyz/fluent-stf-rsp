@@ -1,7 +1,11 @@
-use std::{future::Future, time::Duration};
+use std::future::Future;
 
+#[cfg(feature = "sp1")]
 use alloy_consensus::Block;
+#[cfg(feature = "sp1")]
 use reth_primitives_traits::NodePrimitives;
+#[cfg(feature = "sp1")]
+use std::time::Duration;
 
 pub trait ExecutionHooks: Send {
     fn on_execution_start(

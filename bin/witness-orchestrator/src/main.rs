@@ -213,15 +213,14 @@ async fn main() {
     {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let mut sigterm = match tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(err = %e, "Failed to install SIGTERM handler");
-                    return;
-                }
-            };
+            let mut sigterm =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(err = %e, "Failed to install SIGTERM handler");
+                        return;
+                    }
+                };
             tokio::select! {
                 _ = sigterm.recv() => info!("SIGTERM received — initiating graceful shutdown"),
                 _ = tokio::signal::ctrl_c() => info!("SIGINT received — initiating graceful shutdown"),

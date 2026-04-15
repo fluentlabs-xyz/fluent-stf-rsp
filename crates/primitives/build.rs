@@ -201,14 +201,14 @@ fn canonical_addr(raw: &str) -> String {
 
 // ─── account codegen ────────────────────────────────────────────────────────
 
-fn emit_account(addr_clean: &str, account: &Value, bin_dir: &Path) -> String {
+fn emit_account(network: &str, addr_clean: &str, account: &Value, bin_dir: &Path) -> String {
     let balance_hex = account["balance"].as_str().unwrap_or("0x0");
     let balance_lit = fmt_u256(&U256::from_str(balance_hex).unwrap_or_default());
     let nonce_val = parse_json_u64(&account["nonce"]);
     let nonce_lit =
         if nonce_val > 0 { format!("Some({nonce_val}u64)") } else { "None".to_string() };
 
-    let fname = format!("code_{addr_clean}.bin");
+    let fname = format!("code_{network}_{addr_clean}.bin");
     let code_lit = match account["code"].as_str() {
         Some(code_hex) => {
             let bytes = Bytes::from_str(code_hex).unwrap_or_default();
@@ -338,7 +338,10 @@ fn emit_network(
         "    pub fn genesis_alloc() -> [(Address, GenesisAccount); ALLOC_LEN] {\n        [\n",
     );
     for (addr_clean, account) in &alloc_map {
-        out.push_str(&format!("            {},\n", emit_account(addr_clean, account, bin_dir)));
+        out.push_str(&format!(
+            "            {},\n",
+            emit_account(net_def.feature, addr_clean, account, bin_dir)
+        ));
     }
     out.push_str("        ]\n    }\n\n");
 
@@ -613,7 +616,11 @@ pub fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardfor
                 if let Some(code_hex) = account["code"].as_str() {
                     let bytes = Bytes::from_str(code_hex).unwrap_or_default();
                     if !bytes.is_empty() {
-                        referenced_bins.insert(format!("code_{}.bin", canonical_addr(addr)));
+                        referenced_bins.insert(format!(
+                            "code_{}_{}.bin",
+                            net.feature,
+                            canonical_addr(addr)
+                        ));
                     }
                 }
             }

@@ -10,155 +10,240 @@
 //! channel hold `Arc` clones pointing to the same allocation — witness data
 //! is never duplicated.
 //!
-//! The buffer is bounded by **total payload bytes**, not entry count. On an
-//! L2 with 1s block time and 30-80 MB witnesses, the default 1 GiB limit
-//! holds ~12-30 blocks — more than enough for a co-located courier restart
-//! (typically 1-3 seconds).
+//! ## Cold tier
+//!
+//! Entries evicted from the hot ring (or oversized payloads that bypass it)
+//! are persisted in a single `redb` file. A write transaction wraps each
+//! put/delete so `meta[total_bytes] == sum(cold_witnesses values)` holds
+//! by construction. Backfill mode amortizes fsync by batching.
 
-use std::collections::{BTreeMap, VecDeque};
+#![allow(clippy::result_large_err)]
+
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex};
 
-use tokio::sync::{broadcast, mpsc, RwLock};
+use redb::{Database, ReadableTable, TableDefinition};
+use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
 use crate::types::{ProveRequest, SharedProveRequest};
 
 /// Broadcast channel capacity for live subscribers.
-/// This only holds `Arc` clones (~8 bytes each), not data copies.
-/// 1024 gives a slow subscriber ~17 minutes of runway at 1 block/sec
-/// before it gets `Lagged` and must reconnect.
 const BROADCAST_CAPACITY: usize = 1024;
 
-/// Subtract `sub` from `counter` without wrapping below zero.
-/// Counter drift in the cold tier (e.g. files deleted out-of-band, missing
-/// metadata on eviction) must never produce a huge `u64` value that then
-/// triggers the FIFO loop to delete the entire directory.
-fn saturating_sub_atomic(counter: &AtomicU64, sub: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let _ = counter.fetch_update(Relaxed, Relaxed, |cur| Some(cur.saturating_sub(sub)));
-}
+/// Cold witnesses: key = block number, value = zstd(level=3, bincode(payload)).
+const COLD_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("cold_witnesses");
+/// Meta table for counters. Single known key today: `TOTAL_BYTES_KEY`.
+const META_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("cold_meta");
+const TOTAL_BYTES_KEY: &str = "total_bytes";
+
+/// How many entries `new_for_backfill` buffers before committing a batch.
+/// One fsync per 64 puts — big backfill speed-up. Crash window is bounded
+/// by this constant; backfill is re-runnable so the loss is acceptable.
+const BACKFILL_BATCH_SIZE: usize = 64;
+
+/// Pending backfill batch: compressed `(block_number, bytes)` entries
+/// awaiting a commit. Shared between concurrent `write_entry` calls on
+/// the blocking pool.
+type BackfillBatch = Arc<StdMutex<Vec<(u64, Vec<u8>)>>>;
+
+/// Default age (in blocks) after which cold-tier entries are evicted in
+/// live mode. 48 h at 1 block/sec. Backfill mode disables this.
+const DEFAULT_MAX_COLD_AGE: u64 = 60 * 60 * 48;
 
 struct ColdTier {
-    dir: PathBuf,
-    /// Maps block_number → compressed file size. Authoritative source of
-    /// truth for byte-accounting: every size used to decrement
-    /// `current_dir_bytes` comes from here, never from `fs::metadata` —
-    /// otherwise a NotFound branch cannot deduct (file already gone).
-    index: Arc<StdRwLock<BTreeMap<u64, u64>>>,
-    tx: mpsc::Sender<SharedProveRequest>,
-    current_dir_bytes: Arc<AtomicU64>,
+    db: Arc<Database>,
+    max_cold_bytes: u64,
+    max_age: Option<u64>,
+    /// `None` in live mode (per-entry commit). `Some(..)` in backfill mode —
+    /// holds compressed entries until `BACKFILL_BATCH_SIZE` is reached or
+    /// the hub is dropped.
+    batch: Option<BackfillBatch>,
 }
 
-/// Maximum age of cold-tier files in blocks. Older files are evicted.
-const MAX_COLD_AGE: u64 = 60 * 60 * 48; // ~48h at 1 block/sec
+impl Drop for ColdTier {
+    fn drop(&mut self) {
+        let Some(batch) = self.batch.as_ref() else { return };
+        let mut guard = batch.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut *guard);
+        drop(guard);
+        if let Err(e) =
+            commit_batch_blocking(&self.db, entries, self.max_cold_bytes, self.max_age, None)
+        {
+            error!(err = %e, "Cold: final batch flush failed on Drop");
+        }
+    }
+}
 
-async fn run_cold_writer(
-    mut rx: mpsc::Receiver<SharedProveRequest>,
-    dir: PathBuf,
-    index: Arc<StdRwLock<BTreeMap<u64, u64>>>,
-    max_dir_bytes: u64,
-    current_dir_bytes: Arc<AtomicU64>,
-) {
-    use std::sync::atomic::Ordering::Relaxed;
-
-    while let Some(req) = rx.recv().await {
+impl ColdTier {
+    async fn write_entry(&self, req: SharedProveRequest) -> Result<(), String> {
+        let db = Arc::clone(&self.db);
+        let max_cold_bytes = self.max_cold_bytes;
+        let max_age = self.max_age;
+        let batch = self.batch.clone();
         let block_number = req.block_number;
         let payload = req.payload.clone();
 
-        let compressed = match tokio::task::spawn_blocking(move || {
-            zstd::encode_all(payload.as_slice(), 3)
+        let join = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let compressed =
+                zstd::encode_all(payload.as_slice(), 3).map_err(|e| format!("zstd encode: {e}"))?;
+
+            match batch {
+                None => commit_one_blocking(&db, block_number, compressed, max_cold_bytes, max_age)
+                    .map_err(|e| format!("commit_one: {e}")),
+                Some(batch) => {
+                    let mut guard = batch.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.push((block_number, compressed));
+                    if guard.len() >= BACKFILL_BATCH_SIZE {
+                        let drained = std::mem::take(&mut *guard);
+                        drop(guard);
+                        commit_batch_blocking(
+                            &db,
+                            drained,
+                            max_cold_bytes,
+                            max_age,
+                            Some(block_number),
+                        )
+                        .map_err(|e| format!("commit_batch: {e}"))?;
+                    }
+                    Ok(())
+                }
+            }
         })
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                error!(block_number, err = %e, "Cold tier: Zstd compression failed");
-                continue;
-            }
-            Err(e) => {
-                warn!(block_number, err = %e, "Cold: spawn_blocking failed during compression");
-                continue;
-            }
-        };
+        .await;
+
+        match join {
+            Ok(res) => res,
+            Err(e) => Err(format!("spawn_blocking join: {e}")),
+        }
+    }
+}
+
+/// Commit a single `(block_number, compressed)` entry in one write txn:
+/// insert, update `total_bytes`, run size + age eviction.
+fn commit_one_blocking(
+    db: &Database,
+    block_number: u64,
+    compressed: Vec<u8>,
+    max_cold_bytes: u64,
+    max_age: Option<u64>,
+) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut cold = write_txn.open_table(COLD_TABLE)?;
+        let mut meta = write_txn.open_table(META_TABLE)?;
 
         let compressed_len = compressed.len() as u64;
-        let tmp_path = dir.join(format!("{block_number}.bin.tmp"));
-        let final_path = dir.join(format!("{block_number}.bin"));
+        cold.insert(block_number, compressed.as_slice())?;
+        let new_total = read_total_bytes(&meta)?.saturating_add(compressed_len);
+        meta.insert(TOTAL_BYTES_KEY, new_total)?;
 
-        match tokio::fs::write(&tmp_path, &compressed).await {
-            Ok(()) => match tokio::fs::rename(&tmp_path, &final_path).await {
-                Ok(()) => {
-                    index
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(block_number, compressed_len);
-                    current_dir_bytes.fetch_add(compressed_len, Relaxed);
-                    info!(block_number, compressed_bytes = compressed_len, "Cold: written");
+        while read_total_bytes(&meta)? > max_cold_bytes {
+            if !evict_oldest(&mut cold, &mut meta)? {
+                break;
+            }
+        }
 
-                    // FIFO eviction — size comes from the index, not fs::metadata.
-                    while current_dir_bytes.load(Relaxed) > max_dir_bytes {
-                        let oldest = {
-                            let idx = index.read().unwrap_or_else(|e| e.into_inner());
-                            idx.iter().next().map(|(&k, &v)| (k, v))
-                        };
-                        let Some((oldest_block, size)) = oldest else { break };
-                        let path = dir.join(format!("{oldest_block}.bin"));
-                        if let Err(e) = tokio::fs::remove_file(&path).await {
-                            error!(oldest_block, err = %e, "Cold eviction: remove failed — dropping from index anyway to prevent eviction loop");
-                        }
-                        index
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&oldest_block);
-                        saturating_sub_atomic(&current_dir_bytes, size);
-                        info!(oldest_block, freed_bytes = size, "Cold: evicted oldest");
-                    }
-
-                    // Age-based eviction.
-                    loop {
-                        let oldest = {
-                            let idx = index.read().unwrap_or_else(|e| e.into_inner());
-                            idx.iter().next().map(|(&k, &v)| (k, v))
-                        };
-                        let Some((oldest_block, size)) = oldest else { break };
-                        if block_number.saturating_sub(oldest_block) < MAX_COLD_AGE {
-                            break;
-                        }
-                        let path = dir.join(format!("{oldest_block}.bin"));
-                        if let Err(e) = tokio::fs::remove_file(&path).await {
-                            error!(oldest_block, err = %e, "Cold age eviction: remove failed — dropping from index anyway");
-                        }
-                        index
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&oldest_block);
-                        saturating_sub_atomic(&current_dir_bytes, size);
-                        info!(
-                            oldest_block,
-                            age = block_number - oldest_block,
-                            "Cold: age-evicted"
-                        );
-                    }
+        if let Some(max_age) = max_age {
+            loop {
+                let Some((oldest_block, _)) = peek_oldest(&cold)? else { break };
+                if block_number.saturating_sub(oldest_block) < max_age {
+                    break;
                 }
-                Err(e) => {
-                    error!(block_number, err = %e, "Cold rename failed");
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                if !evict_oldest(&mut cold, &mut meta)? {
+                    break;
                 }
-            },
-            Err(e) => {
-                error!(block_number, err = %e, "Cold write failed");
             }
         }
     }
+    write_txn.commit()?;
+    info!(block_number, "Cold: committed");
+    Ok(())
+}
+
+/// Commit up to `BACKFILL_BATCH_SIZE` entries in a single write txn.
+/// `newest_block` is the "now" for age eviction; pass `None` on the final
+/// shutdown flush (age eviction is skipped).
+fn commit_batch_blocking(
+    db: &Database,
+    entries: Vec<(u64, Vec<u8>)>,
+    max_cold_bytes: u64,
+    max_age: Option<u64>,
+    newest_block: Option<u64>,
+) -> Result<(), redb::Error> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let len = entries.len();
+    let write_txn = db.begin_write()?;
+    {
+        let mut cold = write_txn.open_table(COLD_TABLE)?;
+        let mut meta = write_txn.open_table(META_TABLE)?;
+
+        let mut added: u64 = 0;
+        for (block_number, compressed) in &entries {
+            cold.insert(*block_number, compressed.as_slice())?;
+            added = added.saturating_add(compressed.len() as u64);
+        }
+        let new_total = read_total_bytes(&meta)?.saturating_add(added);
+        meta.insert(TOTAL_BYTES_KEY, new_total)?;
+
+        while read_total_bytes(&meta)? > max_cold_bytes {
+            if !evict_oldest(&mut cold, &mut meta)? {
+                break;
+            }
+        }
+
+        if let (Some(max_age), Some(newest)) = (max_age, newest_block) {
+            loop {
+                let Some((oldest_block, _)) = peek_oldest(&cold)? else { break };
+                if newest.saturating_sub(oldest_block) < max_age {
+                    break;
+                }
+                if !evict_oldest(&mut cold, &mut meta)? {
+                    break;
+                }
+            }
+        }
+    }
+    write_txn.commit()?;
+    info!(batch = len, "Cold: batch committed");
+    Ok(())
+}
+
+fn read_total_bytes(meta: &redb::Table<'_, &str, u64>) -> Result<u64, redb::Error> {
+    Ok(meta.get(TOTAL_BYTES_KEY)?.map(|v| v.value()).unwrap_or(0))
+}
+
+fn peek_oldest(cold: &redb::Table<'_, u64, &[u8]>) -> Result<Option<(u64, u64)>, redb::Error> {
+    let mut iter = cold.iter()?;
+    match iter.next() {
+        Some(Ok((k, v))) => Ok(Some((k.value(), v.value().len() as u64))),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+fn evict_oldest(
+    cold: &mut redb::Table<'_, u64, &[u8]>,
+    meta: &mut redb::Table<'_, &str, u64>,
+) -> Result<bool, redb::Error> {
+    let oldest = peek_oldest(cold)?;
+    let Some((oldest_block, size)) = oldest else { return Ok(false) };
+    cold.remove(oldest_block)?;
+    let new_total = read_total_bytes(meta)?.saturating_sub(size);
+    meta.insert(TOTAL_BYTES_KEY, new_total)?;
+    info!(oldest_block, freed_bytes = size, "Cold: evicted");
+    Ok(true)
 }
 
 /// Central witness distribution point.
 ///
 /// Shared via `Arc` between the ExEx (writer) and gRPC server (reader).
-/// Thread-safe: the ring buffer is behind a [`RwLock`], the broadcast
-/// channel is lock-free for subscribers.\
 pub struct WitnessHub {
     tx: broadcast::Sender<SharedProveRequest>,
     buffer: RwLock<RingBuffer>,
@@ -183,8 +268,6 @@ impl RingBuffer {
         Self { entries: VecDeque::new(), total_bytes: 0, max_bytes }
     }
 
-    /// Push a new entry, evicting oldest entries until the byte limit is satisfied.
-    /// Returns any evicted entries.
     fn push(&mut self, req: SharedProveRequest) -> Vec<SharedProveRequest> {
         let entry_bytes = req.payload.len();
         let mut evicted = Vec::new();
@@ -204,17 +287,14 @@ impl RingBuffer {
         evicted
     }
 
-    /// Return all entries with `block_number >= from_block`.
     fn snapshot_from(&self, from_block: u64) -> Vec<SharedProveRequest> {
         self.entries.iter().filter(|r| r.block_number >= from_block).cloned().collect()
     }
 
-    /// Returns the block number of the oldest entry, if any.
     fn oldest_block(&self) -> Option<u64> {
         self.entries.front().map(|r| r.block_number)
     }
 
-    /// Current stats for diagnostics.
     fn stats(&self) -> (usize, usize) {
         (self.entries.len(), self.total_bytes)
     }
@@ -222,50 +302,53 @@ impl RingBuffer {
 
 impl WitnessHub {
     /// Create a new hub with a byte-bounded hot ring buffer and optional cold tier.
-    pub fn new(max_bytes: usize, cold_dir: Option<PathBuf>, max_cold_bytes: u64) -> Self {
+    /// `cold_file` is the path to the `.redb` database file.
+    pub fn new(max_bytes: usize, cold_file: Option<PathBuf>, max_cold_bytes: u64) -> Self {
+        Self::new_inner(max_bytes, cold_file, max_cold_bytes, Some(DEFAULT_MAX_COLD_AGE), false)
+    }
+
+    /// Create a new hub configured for one-shot backfill:
+    /// - no age-based eviction,
+    /// - hot ring sized to 1 byte so every push spills straight to cold,
+    /// - commits batched in groups of `BACKFILL_BATCH_SIZE` for fsync amortization.
+    pub fn new_for_backfill(cold_file: PathBuf, max_cold_bytes: u64) -> Self {
+        Self::new_inner(1, Some(cold_file), max_cold_bytes, None, true)
+    }
+
+    fn new_inner(
+        max_bytes: usize,
+        cold_file: Option<PathBuf>,
+        max_cold_bytes: u64,
+        max_age: Option<u64>,
+        batch_mode: bool,
+    ) -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
 
-        let cold = cold_dir.map(|dir| {
-            std::fs::create_dir_all(&dir).expect("failed to create cold witness directory");
-
-            // Clean up leftover .tmp files from previous crash.
-            // Populate index from complete .bin files only (skip empty/corrupt).
-            let mut existing: BTreeMap<u64, u64> = BTreeMap::new();
-            let mut initial_bytes: u64 = 0;
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                for entry in rd.flatten() {
-                    let fname = entry.file_name();
-                    let name = fname.to_string_lossy();
-                    if name.ends_with(".tmp") {
-                        let _ = std::fs::remove_file(entry.path());
-                        continue;
-                    }
-                    if let Some(n) = name.strip_suffix(".bin").and_then(|s| s.parse::<u64>().ok()) {
-                        match entry.metadata() {
-                            Ok(m) if m.len() > 0 => {
-                                initial_bytes += m.len();
-                                existing.insert(n, m.len());
-                            }
-                            _ => {
-                                let _ = std::fs::remove_file(entry.path());
-                            }
-                        }
-                    }
+        let cold = cold_file.map(|path| {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .expect("failed to create cold witness parent directory");
                 }
             }
+            let db = Database::create(&path)
+                .unwrap_or_else(|e| panic!("failed to open cold redb at {path:?}: {e}"));
 
-            let current_dir_bytes = Arc::new(AtomicU64::new(initial_bytes));
-            let index = Arc::new(StdRwLock::new(existing));
-            let (cold_tx, cold_rx) = mpsc::channel(1000);
-            tokio::spawn(run_cold_writer(
-                cold_rx,
-                dir.clone(),
-                Arc::clone(&index),
+            // Ensure both tables exist on a fresh file.
+            {
+                let write_txn = db.begin_write().expect("begin_write on fresh cold db");
+                write_txn.open_table(COLD_TABLE).expect("open COLD_TABLE");
+                write_txn.open_table(META_TABLE).expect("open META_TABLE");
+                write_txn.commit().expect("commit fresh cold schema");
+            }
+
+            ColdTier {
+                db: Arc::new(db),
                 max_cold_bytes,
-                Arc::clone(&current_dir_bytes),
-            ));
-
-            ColdTier { dir, index, tx: cold_tx, current_dir_bytes }
+                max_age,
+                batch: batch_mode
+                    .then(|| Arc::new(StdMutex::new(Vec::with_capacity(BACKFILL_BATCH_SIZE)))),
+            }
         });
 
         Self { tx, buffer: RwLock::new(RingBuffer::new(max_bytes)), cold }
@@ -273,34 +356,27 @@ impl WitnessHub {
 
     /// Push a new witness into the buffer and broadcast it to live subscribers.
     ///
-    /// If the buffer exceeds its byte limit, the oldest entries are evicted
-    /// and forwarded to the cold tier (if configured).
-    /// If there are no active subscribers the broadcast send is silently dropped.
+    /// Returns only after the cold commit (if any) has completed. The await
+    /// is the backpressure signal — callers automatically throttle to the
+    /// cold tier's fsync rate.
     pub async fn push(&self, req: Arc<ProveRequest>) {
         let payload_bytes = req.payload.len();
+        let block_number = req.block_number;
 
-        // Oversized witness: bypass the hot ring entirely. Pushing a
-        // payload larger than the ring's capacity would evict every
-        // existing entry (they all fit, the oversized one doesn't),
-        // nuking the replay buffer for every live subscriber. Send
-        // straight to cold tier and broadcast once.
-        {
-            let max = self.buffer.read().await.max_bytes;
-            if payload_bytes > max {
-                warn!(
-                    block_number = req.block_number,
-                    payload_bytes,
-                    max_bytes = max,
-                    "Oversized witness — bypassing ring buffer, sending to cold tier"
-                );
-                if let Some(cold) = &self.cold {
-                    if cold.tx.try_send(Arc::clone(&req)).is_err() {
-                        warn!("Cold channel full — dropping oversized witness");
-                    }
+        let oversized = payload_bytes > self.buffer.read().await.max_bytes;
+
+        if oversized {
+            warn!(
+                block_number,
+                payload_bytes, "Oversized witness — bypassing ring buffer, sending to cold tier"
+            );
+            if let Some(cold) = &self.cold {
+                if let Err(e) = cold.write_entry(Arc::clone(&req)).await {
+                    error!(block_number, err = %e, "Cold: oversized witness commit failed");
                 }
-                let _ = self.tx.send(req);
-                return;
             }
+            let _ = self.tx.send(req);
+            return;
         }
 
         let evicted = {
@@ -308,7 +384,7 @@ impl WitnessHub {
             let evicted = buf.push(Arc::clone(&req));
             let (entries, total) = buf.stats();
             info!(
-                block_number = req.block_number,
+                block_number,
                 payload_bytes,
                 buffer_entries = entries,
                 buffer_bytes = total,
@@ -319,29 +395,22 @@ impl WitnessHub {
 
         if let Some(cold) = &self.cold {
             for entry in evicted {
-                if cold.tx.try_send(entry).is_err() {
-                    warn!("Cold channel full — dropping evicted witness");
+                let ev_block = entry.block_number;
+                if let Err(e) = cold.write_entry(entry).await {
+                    error!(block_number = ev_block, err = %e, "Cold: evicted witness commit failed");
                 }
             }
         }
 
-        // Broadcast to live subscribers. Err means no active receivers — fine.
         let _ = self.tx.send(req);
     }
 
     /// Subscribe to live witness broadcasts.
-    ///
-    /// Returns a [`broadcast::Receiver`] that yields every witness pushed
-    /// after this call. Use [`snapshot_from`](Self::snapshot_from) first
-    /// to replay buffered history.
     pub fn subscribe(&self) -> broadcast::Receiver<SharedProveRequest> {
         self.tx.subscribe()
     }
 
     /// Return all buffered witnesses with `block_number >= from_block`.
-    ///
-    /// Used by the gRPC server to replay missed witnesses when a courier
-    /// reconnects with a `from_block` offset.
     pub async fn snapshot_from(&self, from_block: u64) -> Vec<SharedProveRequest> {
         let buf = self.buffer.read().await;
         buf.snapshot_from(from_block)
@@ -352,71 +421,29 @@ impl WitnessHub {
         self.buffer.read().await.oldest_block()
     }
 
-    /// Returns sorted block numbers in [from, to) that have cold-tier files.
-    /// Does NOT load payloads — callers read one file at a time via `read_cold_block`.
+    /// Returns sorted block numbers in `[from, to)` that have cold-tier entries.
     pub fn cold_blocks_in_range(&self, from: u64, to: u64) -> Vec<u64> {
-        let Some(cold) = &self.cold else {
-            return vec![];
-        };
-        let idx = cold.index.read().unwrap_or_else(|e| e.into_inner());
-        idx.range(from..to).map(|(&k, _)| k).collect()
+        let Some(cold) = &self.cold else { return vec![] };
+        let Ok(read_txn) = cold.db.begin_read() else { return vec![] };
+        let Ok(table) = read_txn.open_table(COLD_TABLE) else { return vec![] };
+        let Ok(iter) = table.range(from..to) else { return vec![] };
+        iter.filter_map(|r| r.ok().map(|(k, _)| k.value())).collect()
     }
 
-    /// Read one cold-tier file. Returns None if not found (already deleted or never written).
+    /// Read one cold-tier entry. Returns None if not found or decode fails.
     pub async fn read_cold_block(&self, block_number: u64) -> Option<SharedProveRequest> {
         let cold = self.cold.as_ref()?;
-        let path = cold.dir.join(format!("{block_number}.bin"));
-        match tokio::fs::read(&path).await {
-            Ok(compressed) => {
-                match tokio::task::spawn_blocking(move || zstd::decode_all(compressed.as_slice()))
-                    .await
-                {
-                    Ok(Ok(payload)) => Some(Arc::new(ProveRequest { block_number, payload })),
-                    Ok(Err(e)) => {
-                        warn!(block_number, err = %e, "Cold: Zstd decompression failed — deleting corrupt file");
-                        let removed = cold
-                            .index
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&block_number);
-                        if let Some(size) = removed {
-                            saturating_sub_atomic(&cold.current_dir_bytes, size);
-                        }
-                        if let Err(e) = tokio::fs::remove_file(&path).await {
-                            warn!(block_number, err = %e, "Failed to delete corrupt cold file");
-                        }
-                        None
-                    }
-                    Err(e) => {
-                        warn!(block_number, err = %e, "Cold: spawn_blocking failed during decompression");
-                        None
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let removed = cold
-                    .index
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&block_number);
-                if let Some(size) = removed {
-                    saturating_sub_atomic(&cold.current_dir_bytes, size);
-                }
-                None
-            }
-            Err(e) => {
-                warn!(block_number, err = %e, "Failed to read cold witness — removing from index");
-                let removed = cold
-                    .index
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&block_number);
-                if let Some(size) = removed {
-                    saturating_sub_atomic(&cold.current_dir_bytes, size);
-                }
-                None
-            }
-        }
+        let db = Arc::clone(&cold.db);
+
+        tokio::task::spawn_blocking(move || -> Option<SharedProveRequest> {
+            let read_txn = db.begin_read().ok()?;
+            let table = read_txn.open_table(COLD_TABLE).ok()?;
+            let compressed = table.get(block_number).ok()??.value().to_vec();
+            let payload = zstd::decode_all(compressed.as_slice()).ok()?;
+            Some(Arc::new(ProveRequest { block_number, payload }))
+        })
+        .await
+        .ok()?
     }
 
     /// Get a single block witness from hot buffer by block number.
@@ -433,65 +460,50 @@ impl WitnessHub {
         self.read_cold_block(block_number).await
     }
 
-    /// Delete cold-tier files for the given block numbers.
-    async fn delete_cold_blocks(&self, blocks: Vec<u64>) {
-        let Some(cold) = &self.cold else {
-            return;
-        };
-
-        for block_number in blocks {
-            let path = cold.dir.join(format!("{block_number}.bin"));
-            let removed = cold
-                .index
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&block_number);
-            if let Some(size) = removed {
-                saturating_sub_atomic(&cold.current_dir_bytes, size);
-            }
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => warn!(block_number, err = %e, "Failed to delete cold witness"),
-            }
-        }
-    }
-
-    /// Deletes cold-tier files for blocks in [from_block, to_block].
+    /// Deletes cold-tier entries for blocks in `[from_block, to_block]`.
     pub async fn acknowledge_range(&self, from_block: u64, to_block: u64) {
-        let blocks = self
-            .cold
-            .as_ref()
-            .map(|c| {
-                c.index
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .range(from_block..=to_block)
-                    .map(|(&k, _)| k)
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.delete_cold_blocks(blocks).await;
+        self.delete_cold_range(from_block, to_block.saturating_add(1)).await;
         info!(from_block, to_block, "Cold witnesses acknowledged (range)");
     }
 
-    /// Called by the courier (via gRPC) after checkpoint advances.
-    /// Deletes all cold-tier files with block_number <= up_to_block.
+    /// Deletes all cold-tier entries with block_number <= up_to_block.
     pub async fn acknowledge(&self, up_to_block: u64) {
-        let blocks = self
-            .cold
-            .as_ref()
-            .map(|c| {
-                c.index
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .range(..=up_to_block)
-                    .map(|(&k, _)| k)
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.delete_cold_blocks(blocks).await;
+        self.delete_cold_range(0, up_to_block.saturating_add(1)).await;
         info!(up_to_block, "Cold witnesses acknowledged");
+    }
+
+    /// One-shot delete of all entries in `[from, to)` inside a single write txn.
+    async fn delete_cold_range(&self, from: u64, to: u64) {
+        let Some(cold) = &self.cold else { return };
+        let db = Arc::clone(&cold.db);
+        let join = tokio::task::spawn_blocking(move || -> Result<u64, redb::Error> {
+            let write_txn = db.begin_write()?;
+            let freed = {
+                let mut cold_table = write_txn.open_table(COLD_TABLE)?;
+                let mut meta = write_txn.open_table(META_TABLE)?;
+
+                let keys: Vec<(u64, u64)> = cold_table
+                    .range(from..to)?
+                    .filter_map(|r| r.ok().map(|(k, v)| (k.value(), v.value().len() as u64)))
+                    .collect();
+                let mut freed: u64 = 0;
+                for (k, size) in &keys {
+                    cold_table.remove(*k)?;
+                    freed = freed.saturating_add(*size);
+                }
+                let new_total = read_total_bytes(&meta)?.saturating_sub(freed);
+                meta.insert(TOTAL_BYTES_KEY, new_total)?;
+                freed
+            };
+            write_txn.commit()?;
+            Ok(freed)
+        })
+        .await;
+        match join {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(err = %e, "Cold: acknowledge commit failed"),
+            Err(e) => warn!(err = %e, "Cold: acknowledge spawn_blocking failed"),
+        }
     }
 }
 
@@ -503,8 +515,6 @@ impl Default for WitnessHub {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     const TEST_MAX_BYTES: usize = 1024 * 1024 * 1024;
@@ -516,8 +526,6 @@ mod tests {
     #[test]
     fn evicts_by_bytes() {
         let mut buf = RingBuffer::new(TEST_MAX_BYTES);
-
-        // Fill with entries that together exceed TEST_MAX_BYTES.
         let chunk = TEST_MAX_BYTES / 4;
         for i in 0..4 {
             let _ = buf.push(make_req(i, chunk));
@@ -525,10 +533,8 @@ mod tests {
         assert_eq!(buf.entries.len(), 4);
         assert_eq!(buf.total_bytes, chunk * 4);
 
-        // Next push should evict oldest to make room.
         let _ = buf.push(make_req(4, chunk));
         assert!(buf.total_bytes <= TEST_MAX_BYTES);
-        // Block 0 should be evicted.
         assert!(buf.entries.iter().all(|r| r.block_number != 0));
     }
 
@@ -544,136 +550,124 @@ mod tests {
         assert_eq!(numbers, vec![12, 13, 14]);
     }
 
-    fn unique_cold_dir(tag: &str) -> PathBuf {
+    fn unique_cold_file(tag: &str) -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("witness_hub_{tag}_{nanos}"));
+        // Use target/ instead of /tmp so tests work in sandboxes with
+        // tiny tmpfs quotas.
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/witness_hub_tests");
+        let dir = base.join(format!("{tag}_{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        dir.join("cold.redb")
     }
 
-    /// Drive the cold writer long enough for queued writes to hit disk
-    /// and show up in the index. `run_cold_writer` is a spawned task —
-    /// tests need to yield to let it drain.
-    async fn wait_for_cold_index_size(hub: &WitnessHub, expected: usize) {
-        for _ in 0..100 {
-            let n = hub
-                .cold
-                .as_ref()
-                .map(|c| c.index.read().unwrap().len())
-                .unwrap_or(0);
-            if n == expected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("cold index did not reach expected size {expected}");
-    }
-
-    /// A1 fix: after the cold file is deleted out-of-band, `read_cold_block`
-    /// must still deduct the recorded size from the counter — otherwise the
-    /// counter drifts upward and FIFO eventually nukes the entire tier.
+    /// After a sequence of oversized pushes and a range ack, the `total_bytes`
+    /// meta entry must match the sum of value lengths in the cold table.
     #[tokio::test]
-    async fn cold_drift_not_found_deducts_counter() {
-        let dir = unique_cold_dir("drift_not_found");
-        let hub = WitnessHub::new(1024 * 1024, Some(dir.clone()), 10 * 1024 * 1024);
+    async fn cold_meta_matches_sum_of_values() {
+        let file = unique_cold_file("meta_matches");
+        let hub = WitnessHub::new(256 * 1024, Some(file.clone()), 10 * 1024 * 1024);
 
-        // Push a single witness small enough to stay in the hot ring — we
-        // need it in cold explicitly, so evict it by pushing enough data
-        // to overflow the 1MiB hot buffer.
-        hub.push(Arc::new(ProveRequest { block_number: 1, payload: vec![0u8; 800 * 1024] })).await;
-        hub.push(Arc::new(ProveRequest { block_number: 2, payload: vec![0u8; 800 * 1024] })).await;
-
-        wait_for_cold_index_size(&hub, 1).await;
-
-        let bytes_before = hub.cold.as_ref().unwrap().current_dir_bytes.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(bytes_before > 0, "counter should be non-zero after cold write");
-
-        // Yank the file out from under the tier, then call read_cold_block.
-        let file = dir.join("1.bin");
-        std::fs::remove_file(&file).unwrap();
-
-        let got = hub.read_cold_block(1).await;
-        assert!(got.is_none());
-
-        let bytes_after = hub.cold.as_ref().unwrap().current_dir_bytes.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(bytes_after, 0, "NotFound branch must deduct using index size, not fs::metadata");
-        assert!(hub.cold.as_ref().unwrap().index.read().unwrap().get(&1).is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `sum(index.values()) == current_dir_bytes` must hold after any
-    /// sequence of inserts and evictions.
-    #[tokio::test]
-    async fn cold_index_btreemap_tracks_sizes() {
-        let dir = unique_cold_dir("index_tracks");
-        // Small hot buffer so every push spills to cold; small cold cap
-        // so FIFO kicks in after a few pushes.
-        let hub = WitnessHub::new(256 * 1024, Some(dir.clone()), 512 * 1024);
-
-        for i in 1..=6u64 {
+        for i in 1..=10u64 {
             hub.push(Arc::new(ProveRequest {
                 block_number: i,
-                payload: vec![i as u8; 200 * 1024],
+                payload: vec![i as u8; 300 * 1024],
             }))
             .await;
         }
+        hub.acknowledge_range(1, 3).await;
 
-        // Poll until the cold writer has drained and counter matches the
-        // index — avoids a fixed sleep that flakes on slow CI runners.
         let cold = hub.cold.as_ref().unwrap();
-        let (sum, counter) = {
-            let mut result = (0u64, 1u64);
-            for _ in 0..200 {
-                let idx = cold.index.read().unwrap();
-                let sum: u64 = idx.values().copied().sum();
-                drop(idx);
-                let counter = cold.current_dir_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                if sum == counter && sum > 0 {
-                    result = (sum, counter);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            result
-        };
-        assert_eq!(sum, counter, "index sizes must match counter after evictions");
-        assert!(sum > 0, "expected at least one entry in cold tier");
+        let read_txn = cold.db.begin_read().unwrap();
+        let table = read_txn.open_table(COLD_TABLE).unwrap();
+        let meta = read_txn.open_table(META_TABLE).unwrap();
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let sum: u64 =
+            table.iter().unwrap().filter_map(|r| r.ok().map(|(_, v)| v.value().len() as u64)).sum();
+        let total = meta.get(TOTAL_BYTES_KEY).unwrap().unwrap().value();
+        assert_eq!(sum, total, "meta[total_bytes] must equal sum of value lengths");
+
+        drop(read_txn);
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
     }
 
-    /// An oversized payload must not evict the entire hot ring.
     #[tokio::test]
     async fn oversized_witness_bypasses_hot_buffer() {
-        let dir = unique_cold_dir("oversized");
-        let hub = WitnessHub::new(64 * 1024, Some(dir.clone()), 10 * 1024 * 1024);
+        let file = unique_cold_file("oversized");
+        let hub = WitnessHub::new(64 * 1024, Some(file.clone()), 10 * 1024 * 1024);
 
-        // Warm the hot ring with a few normal entries.
         for i in 1..=3u64 {
             hub.push(Arc::new(ProveRequest { block_number: i, payload: vec![0u8; 10 * 1024] }))
                 .await;
         }
         assert_eq!(hub.buffer.read().await.entries.len(), 3);
 
-        // Push something too large for the ring.
-        hub.push(Arc::new(ProveRequest {
-            block_number: 100,
-            payload: vec![7u8; 128 * 1024],
-        }))
-        .await;
+        hub.push(Arc::new(ProveRequest { block_number: 100, payload: vec![7u8; 128 * 1024] }))
+            .await;
 
-        // Hot ring must still hold the original three.
         let buf = hub.buffer.read().await;
         assert_eq!(buf.entries.len(), 3);
         assert!(buf.entries.iter().all(|r| r.block_number != 100));
         drop(buf);
 
-        // Oversized one should have landed in cold.
-        wait_for_cold_index_size(&hub, 1).await;
-        assert!(hub.cold.as_ref().unwrap().index.read().unwrap().contains_key(&100));
+        // Sync commit → block is visible immediately, no polling needed.
+        let cold_blocks = hub.cold_blocks_in_range(0, u64::MAX);
+        assert_eq!(cold_blocks, vec![100]);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Backfill hubs disable age eviction and batch commits — drop the hub
+    /// to force the final flush, then re-open and verify both blocks persist.
+    #[tokio::test]
+    async fn cold_tier_no_age_eviction_when_disabled() {
+        let file = unique_cold_file("no_age_evict");
+        {
+            let hub = WitnessHub::new_for_backfill(file.clone(), 10 * 1024 * 1024);
+            hub.push(Arc::new(ProveRequest { block_number: 1, payload: vec![1u8; 1024] })).await;
+            hub.push(Arc::new(ProveRequest {
+                block_number: DEFAULT_MAX_COLD_AGE + 2,
+                payload: vec![2u8; 1024],
+            }))
+            .await;
+            // hub drops here → ColdTier::Drop flushes the trailing batch.
+        }
+
+        let hub = WitnessHub::new_for_backfill(file.clone(), 10 * 1024 * 1024);
+        let blocks = hub.cold_blocks_in_range(0, u64::MAX);
+        assert!(blocks.contains(&1), "block 1 must not be age-evicted");
+        assert!(blocks.contains(&(DEFAULT_MAX_COLD_AGE + 2)));
+
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Durability end-to-end: write, drop, reopen, range scan, single read.
+    #[tokio::test]
+    async fn cold_survives_hub_drop_and_reopen() {
+        let file = unique_cold_file("reopen");
+        {
+            let hub = WitnessHub::new(256 * 1024, Some(file.clone()), 10 * 1024 * 1024);
+            for i in 1..=5u64 {
+                hub.push(Arc::new(ProveRequest {
+                    block_number: i,
+                    payload: vec![i as u8; 300 * 1024],
+                }))
+                .await;
+            }
+        }
+
+        let hub = WitnessHub::new(256 * 1024, Some(file.clone()), 10 * 1024 * 1024);
+        let blocks = hub.cold_blocks_in_range(0, u64::MAX);
+        assert_eq!(blocks, vec![1, 2, 3, 4, 5]);
+
+        let got = hub.read_cold_block(3).await.expect("block 3 in cold");
+        assert_eq!(got.payload.len(), 300 * 1024);
+        assert_eq!(got.payload[0], 3u8);
+
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
     }
 }

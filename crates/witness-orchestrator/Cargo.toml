@@ -17,6 +17,7 @@ tonic.workspace = true
 tonic-prost.workspace = true
 tracing.workspace = true
 zstd.workspace = true
+redb.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 nitro-types.workspace = true

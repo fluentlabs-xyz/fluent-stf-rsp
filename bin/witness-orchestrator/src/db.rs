@@ -166,10 +166,9 @@ impl Db {
             }
         };
         for &block in blocks {
-            if let Err(e) = tx.execute(
-                "DELETE FROM block_responses WHERE block_number = ?1",
-                params![block],
-            ) {
+            if let Err(e) =
+                tx.execute("DELETE FROM block_responses WHERE block_number = ?1", params![block])
+            {
                 error!(err = %e, block_number = block, "delete_responses_batch: row delete failed");
             }
         }

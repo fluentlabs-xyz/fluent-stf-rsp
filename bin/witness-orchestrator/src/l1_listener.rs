@@ -191,8 +191,7 @@ async fn poll_once(
                 if prev == MIN_PAGE {
                     warn!(
                         current,
-                        page_end,
-                        "RPC limit hit at MIN_PAGE — returning partial progress"
+                        page_end, "RPC limit hit at MIN_PAGE — returning partial progress"
                     );
                     return Ok(PollOutcome::Partial(last_ok));
                 }
@@ -236,10 +235,7 @@ async fn process_page(
 
         if topic0 == BatchCommitted::SIGNATURE_HASH {
             let event = BatchCommitted::decode_log_data(&log.inner.data).map_err(|e| {
-                eyre!(
-                    "Failed to decode BatchCommitted at L1 block {:?}: {e}",
-                    log.block_number
-                )
+                eyre!("Failed to decode BatchCommitted at L1 block {:?}: {e}", log.block_number)
             })?;
             let batch_index: u64 = event
                 .batchIndex
@@ -261,10 +257,7 @@ async fn process_page(
             }
         } else if topic0 == BatchSubmitted::SIGNATURE_HASH {
             let event = BatchSubmitted::decode_log_data(&log.inner.data).map_err(|e| {
-                eyre!(
-                    "Failed to decode BatchSubmitted at L1 block {:?}: {e}",
-                    log.block_number
-                )
+                eyre!("Failed to decode BatchSubmitted at L1 block {:?}: {e}", log.block_number)
             })?;
             let batch_index: u64 = event
                 .batchIndex
@@ -276,10 +269,7 @@ async fn process_page(
             }
         } else if topic0 == BatchPreconfirmed::SIGNATURE_HASH {
             let event = BatchPreconfirmed::decode_log_data(&log.inner.data).map_err(|e| {
-                eyre!(
-                    "Failed to decode BatchPreconfirmed at L1 block {:?}: {e}",
-                    log.block_number
-                )
+                eyre!("Failed to decode BatchPreconfirmed at L1 block {:?}: {e}", log.block_number)
             })?;
             let batch_index: u64 = event
                 .batchIndex

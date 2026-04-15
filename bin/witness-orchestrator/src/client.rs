@@ -244,7 +244,12 @@ async fn execution_worker(
             {
                 Ok(response) => {
                     if attempts > 1 {
-                        info!(worker_id, block = task.block_number, attempts, "Block succeeded after retries");
+                        info!(
+                            worker_id,
+                            block = task.block_number,
+                            attempts,
+                            "Block succeeded after retries"
+                        );
                     }
                     if result_tx
                         .send(BlockResult { block_number: task.block_number, response })
@@ -1012,12 +1017,11 @@ impl<P: Provider + Clone + 'static> StreamState<P> {
         for (fb, tb) in finalized_ranges {
             let mut ack = self.ack_client.clone();
             tokio::spawn(async move {
-                let mut req = tonic::Request::new(
-                    witness_orchestrator::proto::AcknowledgeRangeRequest {
+                let mut req =
+                    tonic::Request::new(witness_orchestrator::proto::AcknowledgeRangeRequest {
                         from_block: fb,
                         to_block: tb,
-                    },
-                );
+                    });
                 req.set_timeout(Duration::from_secs(10));
                 if let Err(e) = ack.acknowledge_range(req).await {
                     warn!(fb, tb, err = %e, "Safety-net acknowledge_range failed");
@@ -1124,8 +1128,7 @@ async fn check_finalized_batches(
             }
             Ok(false) => {
                 let now = tokio::time::Instant::now();
-                let first =
-                    *missing_receipt_first_seen.entry(batch_index).or_insert(now);
+                let first = *missing_receipt_first_seen.entry(batch_index).or_insert(now);
                 let elapsed = now.duration_since(first);
                 warn!(
                     batch_index,
@@ -1487,27 +1490,25 @@ async fn call_sign_batch_root(
         .json(&body)
         .send()
         .await
-        .map_err(
-            |e| {
-                use std::error::Error;
-                let kind = if e.is_connect() {
-                    "connect"
-                } else if e.is_timeout() {
-                    "timeout"
-                } else if e.is_request() {
-                    "request"
-                } else {
-                    "unknown"
-                };
-                let mut chain = format!("{e}");
-                let mut source = e.source();
-                while let Some(cause) = source {
-                    chain.push_str(&format!(" → {cause}"));
-                    source = cause.source();
-                }
-                SignBatchError::Other(eyre::eyre!("sign-batch-root failed ({kind}): {chain}"))
-            },
-        )?;
+        .map_err(|e| {
+            use std::error::Error;
+            let kind = if e.is_connect() {
+                "connect"
+            } else if e.is_timeout() {
+                "timeout"
+            } else if e.is_request() {
+                "request"
+            } else {
+                "unknown"
+            };
+            let mut chain = format!("{e}");
+            let mut source = e.source();
+            while let Some(cause) = source {
+                chain.push_str(&format!(" → {cause}"));
+                source = cause.source();
+            }
+            SignBatchError::Other(eyre::eyre!("sign-batch-root failed ({kind}): {chain}"))
+        })?;
 
     let status = resp.status();
 
@@ -1645,14 +1646,13 @@ mod tests {
     use crate::accumulator::BatchAccumulator;
     use crate::db::Db;
     use std::collections::HashMap;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex as StdMutex;
 
     fn temp_db() -> Arc<StdMutex<Db>> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("client_test_{id}_{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("client_test_{id}_{}.db", std::process::id()));
         let db = Db::open(&path).unwrap();
         Arc::new(StdMutex::new(db))
     }
@@ -1704,16 +1704,14 @@ mod tests {
         let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
 
         // First tick: records first_seen, must NOT undispatch.
-        let (changed, _) =
-            check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        let (changed, _) = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
         assert!(!changed, "first missing receipt must not cause undispatch");
         assert!(acc.has_dispatched(), "batch must remain dispatched");
         assert!(first_seen.contains_key(&1));
 
         // Advance past the window, then tick again: undispatch expected.
         tokio::time::advance(RECEIPT_MISSING_WINDOW + Duration::from_secs(1)).await;
-        let (changed, _) =
-            check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        let (changed, _) = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
         assert!(changed, "elapsed window must trigger undispatch");
         assert!(!acc.has_dispatched(), "batch must be undispatched after window");
         assert!(!first_seen.contains_key(&1), "first_seen entry cleared on undispatch");

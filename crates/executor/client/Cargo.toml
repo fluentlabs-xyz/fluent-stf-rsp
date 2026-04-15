@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [features]
+default = ["mainnet"]
 sp1 = []
 nitro = ["fluentbase-revm/wasmtime"]
 wasmtime = ["fluentbase-revm/wasmtime"]

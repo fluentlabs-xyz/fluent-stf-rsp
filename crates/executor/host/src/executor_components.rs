@@ -2,7 +2,6 @@ use std::marker::PhantomData;
 
 use alloy_network::Ethereum;
 use alloy_provider::Network;
-use eyre::Ok;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::ConfigureEvm;
@@ -50,21 +49,6 @@ impl MaybeProveWithCycles for sp1_sdk::CpuProver {
     ) -> Result<(sp1_sdk::SP1ProofWithPublicValues, Option<u64>), eyre::Error> {
         use sp1_sdk::{ProveRequest, Prover};
         let proof = self.prove(pk, stdin).mode(mode).await.map_err(|err| eyre::eyre!("{err}"))?;
-        Ok((proof, None))
-    }
-}
-
-#[cfg(feature = "sp1")]
-impl MaybeProveWithCycles for sp1_sdk::CudaProver {
-    async fn prove_with_cycles(
-        &self,
-        pk: &Self::ProvingKey,
-        stdin: sp1_sdk::SP1Stdin,
-        mode: sp1_sdk::SP1ProofMode,
-    ) -> Result<(sp1_sdk::SP1ProofWithPublicValues, Option<u64>), eyre::Error> {
-        use sp1_sdk::{ProveRequest, Prover};
-        let proof = self.prove(pk, stdin).mode(mode).await.map_err(|err| eyre::eyre!("{err}"))?;
-        // CudaProver in SP1 v6 no longer returns cycles directly
         Ok((proof, None))
     }
 }

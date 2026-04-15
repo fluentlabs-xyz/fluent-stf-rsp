@@ -27,6 +27,7 @@ use crate::executor_components::MaybeProveWithCycles;
 #[cfg(all(feature = "nitro", not(feature = "sp1")))]
 use tracing::info;
 
+#[allow(unused_imports)]
 use crate::{Config, ExecutionHooks, ExecutorComponents, HostExecutor};
 
 #[cfg(feature = "sp1")]
@@ -594,6 +595,7 @@ where
 }
 
 #[cfg(not(feature = "sp1"))]
+#[allow(dead_code)]
 pub struct FullExecutor<C: ExecutorComponents, P> {
     provider: P,
     host_executor: HostExecutor<C::EvmConfig, reth_chainspec::ChainSpec>,
@@ -674,6 +676,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn load_client_input(
         &self,
         block_number: u64,
@@ -688,6 +691,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 async fn load_client_input_inner<C, P>(
     config: &Config,
     host_executor: &HostExecutor<C::EvmConfig, reth_chainspec::ChainSpec>,
@@ -835,6 +839,7 @@ where
 }
 
 #[cfg(not(feature = "sp1"))]
+#[allow(dead_code)]
 pub struct CachedExecutor<C>
 where
     C: ExecutorComponents,
@@ -933,6 +938,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 fn try_load_input_from_cache<P: NodePrimitives + DeserializeOwned>(
     cache_dir: &Path,
     chain_id: u64,

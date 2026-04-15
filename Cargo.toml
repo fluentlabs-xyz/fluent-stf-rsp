@@ -13,6 +13,7 @@ members = [
     "crates/l1-rollup-client",
     "crates/witness-orchestrator",
     "bin/witness-orchestrator",
+    "bin/forward-backfiller",
 ]
 exclude = []
 resolver = "2"
@@ -57,6 +58,7 @@ strum = "0.27"
 csv = "1.1"
 axum = "0.8.8"
 zstd = "0.13"
+redb = "2.1"
 vsock = "0.5.2"
 derive_more = { version = "2.0.1", features = ["full"] }
 
@@ -121,6 +123,13 @@ reth-ethereum-primitives = { git = "https://github.com/fluentlabs-xyz/reth", def
 reth-optimism-forks = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-provider = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-revm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-node-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-ethereum-engine-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-tasks = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-db-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-chain-state = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-trie-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 
 # --- revm ---
 revm = { version = "34.0.0", default-features = false }
