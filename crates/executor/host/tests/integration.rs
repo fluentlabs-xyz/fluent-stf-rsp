@@ -20,7 +20,7 @@ use url::Url;
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_fluent() {
-    run_eth_e2e("http://207.154.218.23:8545", 21846700, None).await;
+    run_eth_e2e("", 21846700, None).await;
 }
 
 async fn run_eth_e2e(env_var_key: &str, block_number: u64, custom_beneficiary: Option<Address>) {
@@ -145,7 +145,7 @@ async fn run_e2e<C, CS, N>(
         .try_init();
 
     // Setup the provider.
-    let rpc_url = Url::parse("http://207.154.218.23:8545").expect("invalid rpc url");
+    let rpc_url = Url::parse("").expect("invalid rpc url");
     let provider = RootProvider::<N>::new_http(rpc_url);
 
     // Execute the host.

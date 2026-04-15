@@ -1,5 +1,5 @@
 .PHONY: build-client build-client-docker build-nitro-validator build-nitro-validator-docker \
-        build-enclave build-proxy run run-sp1-only run-enclave download-genesis clean help \
+        build-enclave build-proxy run run-sp1-only run-enclave clean help \
         compose-build compose-up compose-down compose-logs
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
@@ -28,7 +28,6 @@ ELF_PATH     ?= $(ELF)
 API_KEY      ?= secret
 LISTEN_ADDR  ?= 0.0.0.0:8080
 SP1_PROVER   ?= network          # cpu | network
-TAG          ?= v0.5.7
 RUST_LOG 	 ?= info
 
 # ─── SP1 ELF ──────────────────────────────────────────────────────────────────
@@ -127,14 +126,6 @@ run-sp1-only: build-client build-proxy
 	NETWORK_PRIVATE_KEY=$(NETWORK_PRIVATE_KEY) \
 	./target/release/proxy
 
-# ─── Misc ─────────────────────────────────────────────────────────────────────
-
-download-genesis:
-	mkdir -p ./bin/host/genesis
-	curl -L -o ./bin/host/genesis/genesis-$(TAG).json.gz \
-		https://github.com/fluentlabs-xyz/fluentbase/releases/download/$(TAG)/genesis-$(TAG).json.gz
-	gunzip -f ./bin/host/genesis/genesis-$(TAG).json.gz
-
 clean:
 	cargo clean
 	rm -f rsp-client-enclave-*.eif rsp-client-enclave-*.eif.pcrs.json \
@@ -155,7 +146,6 @@ help:
 	@echo "  compose-up                    Start proxy + witness-orchestrator in background"
 	@echo "  compose-down                  Stop the compose stack (volumes preserved)"
 	@echo "  compose-logs                  Tail compose logs"
-	@echo "  download-genesis              Download genesis file (TAG=$(TAG))"
 	@echo "  clean                         Remove build artifacts"
 	@echo ""
 	@echo "Overrides:"
@@ -165,7 +155,6 @@ help:
 	@echo "  API_KEY=$(API_KEY)"
 	@echo "  LISTEN_ADDR=$(LISTEN_ADDR)"
 	@echo "  SP1_PROVER=$(SP1_PROVER)"
-	@echo "  TAG=$(TAG)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build-client                      # mainnet (default)"

@@ -1739,12 +1739,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "az"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be5eb007b7cacc6c660343e96f650fedf4b5a77512399eb952ca6642cf8d13f7"
-
-[[package]]
 name = "backoff"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2770,27 +2764,6 @@ dependencies = [
  "sha3",
  "streebog",
  "whirlpool",
-]
-
-[[package]]
-name = "csv"
-version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
-dependencies = [
- "csv-core",
- "itoa",
- "ryu",
- "serde_core",
-]
-
-[[package]]
-name = "csv-core"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
@@ -4098,16 +4071,6 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
-name = "gmp-mpfr-sys"
-version = "1.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8cfc928d8ff4ab3767a3674cf55f81186436fb6070866bb1443ffe65a640d2d6"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "gost94"
@@ -8513,36 +8476,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsp"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-network",
- "alloy-primitives",
- "alloy-provider",
- "cargo_metadata",
- "clap",
- "csv",
- "dotenv",
- "eyre",
- "fluent-stf-primitives",
- "reth-primitives-traits",
- "revm-bytecode",
- "rsp-client-executor",
- "rsp-host-executor",
- "rsp-provider",
- "serde",
- "serde_json",
- "sp1-build",
- "sp1-core-executor",
- "sp1-sdk",
- "strum 0.27.2",
- "tokio",
- "tracing-subscriber 0.3.23",
- "url",
-]
-
-[[package]]
 name = "rsp-blob-builder"
 version = "0.1.0"
 dependencies = [
@@ -8597,25 +8530,17 @@ dependencies = [
 name = "rsp-host-executor"
 version = "0.1.0"
 dependencies = [
- "alloy-chains",
  "alloy-consensus",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types",
  "alloy-transport",
- "anyhow",
  "bincode 1.3.3",
  "dotenv",
- "either",
- "eyre",
  "fluent-stf-primitives",
- "hex",
- "nitro-types",
- "reqwest 0.12.28",
  "reth-chainspec",
  "reth-errors",
- "reth-ethereum-primitives",
  "reth-evm",
  "reth-primitives-traits",
  "reth-provider",
@@ -8627,13 +8552,11 @@ dependencies = [
  "rsp-rpc-db",
  "serde",
  "serde_json",
- "sp1-sdk",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
  "url",
- "vsock",
 ]
 
 [[package]]
@@ -8698,18 +8621,6 @@ dependencies = [
  "revm-primitives",
  "revm-state",
  "serde",
-]
-
-[[package]]
-name = "rug"
-version = "1.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25f6c8f906c90b48e0c1745c9f814c3a31c5eba847043b05c3e9a934dec7c4b3"
-dependencies = [
- "az",
- "gmp-mpfr-sys",
- "libc",
- "libm",
 ]
 
 [[package]]
@@ -10169,7 +10080,6 @@ dependencies = [
  "k256",
  "num",
  "p256",
- "rug",
  "serde",
  "slop-algebra",
  "snowbridge-amcl",

@@ -11,71 +11,44 @@ repository.workspace = true
 workspace = true
 
 [features]
-default = ["sp1", "mainnet"]
-sp1 = ["dep:sp1-sdk"]
-alerting = ["dep:reqwest"]
+default = ["mainnet"]
 execution-witness = [
     "rsp-mpt/execution-witness",
     "rsp-rpc-db/execution-witness",
-]
-nitro = [
-    "dep:vsock",
-    "dep:anyhow",
-    "dep:hex",
-    "dep:nitro-types",
-    "rsp-client-executor/nitro",
-    "tokio/process",
 ]
 mainnet = ["fluent-stf-primitives/mainnet", "rsp-client-executor/mainnet"]
 testnet = ["fluent-stf-primitives/testnet", "rsp-client-executor/testnet"]
 devnet  = ["fluent-stf-primitives/devnet",  "rsp-client-executor/devnet"]
 
 [dependencies]
-tokio = { workspace = true, features = ["time", "rt"] }
 thiserror.workspace = true
 tracing.workspace = true
-serde.workspace = true
-url.workspace = true
-eyre.workspace = true
-bincode.workspace = true
-either.workspace = true
-hex = { workspace = true, optional = true }
-
-reqwest = { workspace = true, features = ["json"], optional = true }
-vsock = { workspace = true, optional = true }
-anyhow = { workspace = true, optional = true }
-nitro-types = { workspace = true, optional = true }
 
 # workspace crates
 rsp-rpc-db.workspace = true
-rsp-client-executor = {workspace = true, features =["wasmtime"]}
+rsp-client-executor = { workspace = true, features = ["wasmtime"] }
 rsp-mpt.workspace = true
 fluent-stf-primitives = { workspace = true, default-features = false }
 
-# sp1
-sp1-sdk = { workspace = true, optional = true }
-
 # reth
 reth-evm.workspace = true
-reth-ethereum-primitives.workspace = true
 reth-primitives-traits = { workspace = true, features = ["secp256k1"] }
 reth-trie.workspace = true
 reth-errors.workspace = true
 reth-chainspec.workspace = true
+reth-provider = { workspace = true, default-features = false }
 
 # revm
 revm.workspace = true
 revm-primitives.workspace = true
 
 # alloy
-alloy-chains.workspace = true
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 alloy-network.workspace = true
 alloy-provider.workspace = true
 alloy-transport.workspace = true
 alloy-rpc-types.workspace = true
-reth-provider = { workspace = true, default-features = false }
 
 [dev-dependencies]
 alloy-primitives.workspace = true
