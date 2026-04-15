@@ -14,7 +14,7 @@ pub struct AwsCredentials {
 pub struct EthExecutionResponse {
     pub block_number: u64,
     pub leaf: [u8; 32],
-    pub tx_data_hash: B256,
+    pub block_hash: B256,
     #[serde(with = "BigArray")]
     pub signature: [u8; 64],
 }

@@ -73,7 +73,7 @@ pub(crate) async fn ensure_initialized(config: &NitroConfig) -> eyre::Result<()>
     Ok(())
 }
 
-/// Normal block execution — enclave signs with tx_data_hash in the hash.
+/// Normal block execution — enclave signs with block_hash in the payload.
 pub(crate) async fn execute_block(
     input: EthClientExecutorInput,
     config: NitroConfig,

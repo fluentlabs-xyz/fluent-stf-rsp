@@ -332,7 +332,7 @@ mod tests {
         EthExecutionResponse {
             block_number,
             leaf: [0u8; 32],
-            tx_data_hash: B256::ZERO,
+            block_hash: B256::ZERO,
             signature: [0u8; 64],
         }
     }

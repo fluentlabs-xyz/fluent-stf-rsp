@@ -18,7 +18,6 @@ use k256::ecdsa::{
 use k256::elliptic_curve::scalar::IsHigh;
 use k256::SecretKey;
 
-use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::B256;
 use c_kzg::{Blob, KzgSettings, BYTES_PER_BLOB};
 
@@ -81,7 +80,7 @@ fn compute_versioned_hashes(blobs: &[Vec<u8>]) -> anyhow::Result<Vec<B256>> {
 }
 
 // ---------------------------------------------------------------------------
-// BlockStore — keeps the last MAX_ENTRIES Merkle leaves + tx_data_hashes
+// BlockStore — keeps the last MAX_ENTRIES Merkle leaves + block_hashes
 // ---------------------------------------------------------------------------
 
 const MAX_ENTRIES: usize = 10_000;
@@ -91,8 +90,8 @@ const MAX_ENTRIES: usize = 10_000;
 pub(crate) struct BlockEntry {
     /// keccak256(parent ‖ block ‖ withdrawal ‖ deposit)
     leaf: [u8; 32],
-    /// SHA256(rlp-encoded transactions)
-    tx_data_hash: B256,
+    /// alloy_consensus::Header::hash_slow() of the executed block.
+    block_hash: B256,
 }
 
 pub(crate) struct BlockStore {
@@ -186,18 +185,18 @@ fn compute_leaf(
 // ---------------------------------------------------------------------------
 
 /// Payload layout signed by `sign_execution` / checked by `verify_response`.
-/// `block_number` is committed alongside `(leaf, tx_data_hash)` so a response
+/// `block_number` is committed alongside `(leaf, block_hash)` so a response
 /// signed for block N cannot be replayed under a different block number when
 /// SubmitBatch falls back to responses on cache miss.
 fn execution_sign_payload(
     block_number: u64,
     leaf: &[u8; 32],
-    tx_data_hash: &B256,
+    block_hash: &B256,
 ) -> [u8; 72] {
     let mut payload = [0u8; 72];
     payload[..8].copy_from_slice(&block_number.to_be_bytes());
     payload[8..40].copy_from_slice(leaf);
-    payload[40..].copy_from_slice(tx_data_hash.as_slice());
+    payload[40..].copy_from_slice(block_hash.as_slice());
     payload
 }
 
@@ -207,7 +206,7 @@ fn verify_response(
     resp: &EthExecutionResponse,
     verifying_key: &VerifyingKey,
 ) -> anyhow::Result<()> {
-    let payload = execution_sign_payload(resp.block_number, &resp.leaf, &resp.tx_data_hash);
+    let payload = execution_sign_payload(resp.block_number, &resp.leaf, &resp.block_hash);
     let signature = Signature::from_slice(&resp.signature).context("invalid signature encoding")?;
     verifying_key.verify(&payload, &signature).context("signature verification failed")?;
     Ok(())
@@ -218,65 +217,38 @@ fn verify_response(
 // Blob verification
 // ---------------------------------------------------------------------------
 
-/// Verifies all blobs against known tx_data_hashes, returns versioned hashes.
+/// Verifies all blobs against a trusted list of per-block `block_hash`es and
+/// returns versioned hashes.
 ///
-/// `tx_data_hashes` come from trusted sources: the in-memory BlockStore
-/// (cache hit) or verified signed EthExecutionResponses (cache miss).
+/// `block_hashes[i]` is the trusted hash for the i-th block in the blob
+/// payload. Sources: the in-memory BlockStore (cache hit) or verified
+/// EthExecutionResponses (cache miss). The payload is
+/// `brotli(rlp(Block_1) || ... || rlp(Block_N))` — we walk it in lockstep
+/// with `block_hashes` and assert per-position equality.
 fn verify_blobs(
     blobs: &[Vec<u8>],
-    leaves: &[[u8; 32]],
-    tx_data_hashes: &[B256],
-    from: u64,
-    to: u64,
+    block_hashes: &[B256],
 ) -> anyhow::Result<Vec<B256>> {
-    let (header, all_raw) =
+    let decompressed =
         blob::decode_blob_payload(blobs).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    anyhow::ensure!(
-        header.from_block == from,
-        "DA header from_block mismatch: header={}, expected={from}",
-        header.from_block,
-    );
-    anyhow::ensure!(
-        header.to_block == to,
-        "DA header to_block mismatch: header={}, expected={to}",
-        header.to_block,
-    );
-
-    let num_blocks = header.num_blocks();
-    anyhow::ensure!(
-        num_blocks == tx_data_hashes.len(),
-        "header declares {num_blocks} blocks but {} tx_data_hashes provided",
-        tx_data_hashes.len(),
-    );
-    anyhow::ensure!(
-        num_blocks == leaves.len(),
-        "header declares {num_blocks} blocks but {} leaves provided",
-        leaves.len(),
-    );
-
-    for block_num in header.from_block..=header.to_block {
-        let (l2_header, tx_data) = blob::extract_block(&header, &all_raw, block_num)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let idx = (block_num - header.from_block) as usize;
-
-        let hash = B256::from_slice(&Sha256::digest(tx_data));
+    let mut iter = blob::iter_blocks(&decompressed);
+    for (i, expected) in block_hashes.iter().enumerate() {
+        let view = iter
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("blob truncated: missing block at index {i}"))?
+            .map_err(|e| anyhow::anyhow!("blob decode at index {i}: {e}"))?;
         anyhow::ensure!(
-            hash == tx_data_hashes[idx],
-            "tx_data_hash mismatch at block {block_num}",
-        );
-
-        let recomputed_leaf = compute_leaf(
-            l2_header.previous_block_hash.as_slice(),
-            l2_header.block_hash.as_slice(),
-            l2_header.withdrawal_root.as_slice(),
-            l2_header.deposit_root.as_slice(),
-        );
-        anyhow::ensure!(
-            recomputed_leaf == leaves[idx],
-            "leaf mismatch at block {block_num}",
+            view.block_hash == *expected,
+            "block_hash mismatch at index {i}: blob={}, expected={}",
+            view.block_hash,
+            expected,
         );
     }
+    anyhow::ensure!(
+        iter.next().is_none(),
+        "blob has trailing blocks beyond the trusted list",
+    );
 
     compute_versioned_hashes(blobs)
 }
@@ -411,20 +383,20 @@ pub(crate) fn handle_submit_batch(
     };
 
     let mut leaves = Vec::with_capacity((to - from + 1) as usize);
-    let mut tx_data_hashes = Vec::with_capacity((to - from + 1) as usize);
+    let mut block_hashes = Vec::with_capacity((to - from + 1) as usize);
     let mut invalid_blocks: Vec<u64> = Vec::new();
 
     for (idx, block) in (from..=to).enumerate() {
         if let Some(resp) = response_map.get(&block) {
             if verify_response(resp, &verifying_key).is_ok() {
                 leaves.push(resp.leaf);
-                tx_data_hashes.push(resp.tx_data_hash);
+                block_hashes.push(resp.block_hash);
             } else {
                 invalid_blocks.push(block);
             }
         } else if let Some(entry) = cached[idx] {
             leaves.push(entry.leaf);
-            tx_data_hashes.push(entry.tx_data_hash);
+            block_hashes.push(entry.block_hash);
         } else {
             invalid_blocks.push(block);
         }
@@ -436,7 +408,7 @@ pub(crate) fn handle_submit_batch(
 
     let batch_root = calculate_merkle_root(&leaves)
         .map_err(SubmitBatchError::Other)?;
-    let versioned_hashes = verify_blobs(blobs, &leaves, &tx_data_hashes, from, to)
+    let versioned_hashes = verify_blobs(blobs, &block_hashes)
         .map_err(SubmitBatchError::Other)?;
     Ok(sign_batch(batch_root, versioned_hashes, signing_key))
 }
@@ -448,19 +420,13 @@ pub(crate) fn handle_submit_batch(
 struct ExecutionResult {
     block_number: u64,
     leaf: [u8; 32],
-    tx_data_hash: B256,
+    block_hash: B256,
 }
 
 fn run_block(
     input: EthClientExecutorInput,
     block_store: &Mutex<BlockStore>,
 ) -> anyhow::Result<ExecutionResult> {
-    let tx_data_hash = {
-        let tx_data: Vec<u8> =
-            input.current_block.body.transactions.iter().flat_map(|tx| tx.encoded_2718()).collect();
-        B256::from_slice(&Sha256::digest(&tx_data))
-    };
-
     let executor = EthClientExecutor::eth(
         Arc::new(fluent_stf_primitives::fluent_chainspec()),
         input.custom_beneficiary,
@@ -482,9 +448,9 @@ fn run_block(
     block_store
         .lock()
         .map_err(|e| anyhow::anyhow!("block_store mutex poisoned: {e}"))?
-        .insert(block_number, BlockEntry { leaf, tx_data_hash });
+        .insert(block_number, BlockEntry { leaf, block_hash });
 
-    Ok(ExecutionResult { block_number, leaf, tx_data_hash })
+    Ok(ExecutionResult { block_number, leaf, block_hash })
 }
 
 fn sign_execution(
@@ -492,13 +458,13 @@ fn sign_execution(
     signing_key: &SigningKey,
 ) -> EthExecutionResponse {
     let payload =
-        execution_sign_payload(result.block_number, &result.leaf, &result.tx_data_hash);
+        execution_sign_payload(result.block_number, &result.leaf, &result.block_hash);
     let signature: Signature = signing_key.sign(&payload);
 
     EthExecutionResponse {
         block_number: result.block_number,
         leaf: result.leaf,
-        tx_data_hash: result.tx_data_hash,
+        block_hash: result.block_hash,
         signature: signature.to_bytes().into(),
     }
 }
@@ -869,7 +835,7 @@ mod tests {
     #[test]
     fn block_store_eviction() {
         let mut store = BlockStore::new();
-        let dummy = BlockEntry { leaf: [0u8; 32], tx_data_hash: B256::ZERO };
+        let dummy = BlockEntry { leaf: [0u8; 32], block_hash: B256::ZERO };
         for i in 0..(MAX_ENTRIES as u64 + 100) {
             store.insert(i, dummy);
         }
@@ -887,21 +853,21 @@ mod tests {
 
         // Create one valid response (signed by our key) and one invalid (bad signature)
         let leaf = [0x01u8; 32];
-        let tx_data_hash = B256::ZERO;
-        let payload = execution_sign_payload(10, &leaf, &tx_data_hash);
+        let block_hash = B256::ZERO;
+        let payload = execution_sign_payload(10, &leaf, &block_hash);
         let sig: Signature = signing_key.sign(&payload);
 
         let valid_resp = EthExecutionResponse {
             block_number: 10,
             leaf,
-            tx_data_hash,
+            block_hash,
             signature: sig.to_bytes().into(),
         };
 
         let invalid_resp = EthExecutionResponse {
             block_number: 11,
             leaf,
-            tx_data_hash,
+            block_hash,
             signature: [0u8; 64], // garbage signature
         };
 

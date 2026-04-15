@@ -20,7 +20,6 @@ sp1 = [
     "rsp-client-executor/sp1",
     "sp1-build",
     "dep:brotli",
-    "dep:bytes",
     "dep:kzg-rs",
 ]
 nitro = [
@@ -71,12 +70,12 @@ rustls = { version = "0.21.12", default-features = false, features = ["tls12"], 
 webpki-roots = { version = "0.26", optional = true }
 alloy-eips = "1.7.3"
 alloy-primitives = "1.5.7"
+alloy-rlp = "0.3.10"
 c-kzg = { version = "2.1.7", optional = true }
 brotli = {version = "8.0.2", optional = true }
 
 # sp1 (optional)
 kzg-rs = { version = "0.2.8", optional = true }
-bytes = { version = "1.5", optional = true }
 
 # nitro (optional)
 hkdf = { version = "0.12.4", optional = true }
@@ -113,6 +112,7 @@ reth-chainspec     = { git = "https://github.com/fluentlabs-xyz/reth", default-f
 tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
 alloy-provider     = { version = "1.8.1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
 alloy-network      = { version = "1.8.1", default-features = false }
+alloy-consensus    = { version = "1.8.1", default-features = false }
 url                = { version = "2" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

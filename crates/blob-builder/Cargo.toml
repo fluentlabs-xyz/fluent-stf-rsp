@@ -9,19 +9,15 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[features]
-mainnet = ["fluent-stf-primitives/mainnet"]
-testnet = ["fluent-stf-primitives/testnet"]
-devnet  = ["fluent-stf-primitives/devnet"]
-
 [dependencies]
-alloy-eips.workspace = true
-alloy-primitives.workspace = true
+alloy-consensus.workspace = true
 alloy-provider.workspace = true
-alloy-rpc-types.workspace = true
+alloy-rlp.workspace = true
 brotlic.workspace = true
 eyre.workspace = true
-fluent-stf-primitives = { workspace = true, default-features = false }
 futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+brotli = "8.0.2"

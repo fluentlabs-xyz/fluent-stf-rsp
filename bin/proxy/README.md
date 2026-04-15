@@ -148,7 +148,6 @@ If `Content-Encoding: zstd` is present, the proxy decompresses first. Otherwise 
   "block_hash":  "0x…",
   "withdrawal_hash": "0x…",
   "deposit_hash": "0x…",
-  "tx_data_hash": "0x…",
   "result_hash": "0x…",
   "signature":   "0x…"
 }
@@ -229,7 +228,6 @@ Either `block_number` or `block_hash` must be provided (not both).
   "block_hash":  "0x…",
   "withdrawal_hash": "0x…",
   "deposit_hash": "0x…",
-  "tx_data_hash": "0x…",
   "result_hash": "0x…",
   "signature":   "0x…"
 }

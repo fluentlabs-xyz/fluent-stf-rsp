@@ -1,59 +1,25 @@
-//! Shared blob decanonicalization and DA header parsing.
+//! Shared blob decanonicalization and RLP-block streaming.
 //!
 //! Used by both SP1 (zkVM) and Nitro (enclave) runtimes.
-//! All functions return Result — SP1 calls .unwrap(), Nitro propagates errors.
+//! SP1 call sites `.unwrap()`, Nitro propagates errors.
 
 use std::io::Read;
 
-use alloy_primitives::B256;
+use alloy_primitives::{keccak256, B256};
+use alloy_rlp::Header;
 
 pub(crate) const BYTES_PER_FIELD: usize = 31;
 #[cfg(test)]
 const FIELD_SIZE: usize = 32;
-pub(crate) const FIELDS_PER_BLOB: usize = 4096; // EIP-4844: fixed at 4096 field elements per blob
+pub(crate) const FIELDS_PER_BLOB: usize = 4096;
 pub(crate) const MAX_RAW_BYTES_PER_BLOB: usize = FIELDS_PER_BLOB * BYTES_PER_FIELD;
 
-/// 16 bytes: from_block(u64BE) | to_block(u64BE).
-const RANGE_PREFIX_SIZE: usize = 16;
-/// 130 bytes: previousBlockHash(32) | blockHash(32) | withdrawalRoot(32)
-/// | depositRoot(32) | depositCount(u16BE).
-/// Mirrors `crates/blob-builder::header::L2BlockHeader::write_packed`.
-const PACKED_L2_HEADER_SIZE: usize = 32 * 4 + 2;
-/// Per-block tx_len entry size (u32BE).
-const TX_LEN_SIZE: usize = 4;
-
-/// Per-block L2 header carried in the blob payload.
-///
-/// `deposit_count` is wire-present (parsed and skipped) but not exposed —
-/// it has no consumer in the client and is not part of `compute_leaf`.
+/// View of one RLP-encoded Ethereum block inside the decompressed blob payload.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct L2BlockHeader {
-    pub(crate) previous_block_hash: B256,
+pub(crate) struct BlockView {
+    /// keccak256 over the raw RLP-encoded block header (bytes identical to
+    /// `alloy_consensus::Header::hash_slow()`).
     pub(crate) block_hash: B256,
-    pub(crate) withdrawal_root: B256,
-    pub(crate) deposit_root: B256,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BlockEntry {
-    header: L2BlockHeader,
-    tx_start: usize,
-    tx_end: usize,
-}
-
-/// Parsed blob payload header — owns per-block entries with precomputed
-/// tx-data offsets for O(1) per-block extraction.
-#[derive(Debug)]
-pub(crate) struct BlobHeader {
-    pub(crate) from_block: u64,
-    pub(crate) to_block: u64,
-    blocks: Vec<BlockEntry>,
-}
-
-impl BlobHeader {
-    pub(crate) fn num_blocks(&self) -> usize {
-        self.blocks.len()
-    }
 }
 
 /// Extracts raw bytes from a single blob's KZG field elements.
@@ -77,290 +43,164 @@ pub(crate) fn decanonicalize(blob: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Decanonicalize all blobs, concatenate, and brotli-decompress.
-/// Returns (BlobHeader, full_decompressed_payload).
-pub(crate) fn decode_blob_payload(blobs: &[Vec<u8>]) -> Result<(BlobHeader, Vec<u8>), String> {
+pub(crate) fn decode_blob_payload(blobs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     if blobs.is_empty() {
         return Err("no blobs provided".into());
     }
-
     let mut all_raw = Vec::with_capacity(blobs.len() * MAX_RAW_BYTES_PER_BLOB);
     for blob in blobs {
         let raw = decanonicalize(blob)?;
         all_raw.extend_from_slice(&raw);
     }
-
     let mut decompressed = Vec::new();
-    let mut decompressor = brotli::Decompressor::new(all_raw.as_slice(), 4096);
-    decompressor
+    brotli::Decompressor::new(all_raw.as_slice(), 4096)
         .read_to_end(&mut decompressed)
         .map_err(|e| format!("brotli decompression failed: {e}"))?;
-
-    let header = parse_header(&decompressed)?;
-    Ok((header, decompressed))
+    Ok(decompressed)
 }
 
-fn parse_header(data: &[u8]) -> Result<BlobHeader, String> {
-    if data.len() < RANGE_PREFIX_SIZE {
-        return Err("blob payload too short for range prefix".into());
-    }
-    let from_block = u64::from_be_bytes(data[0..8].try_into().unwrap());
-    let to_block = u64::from_be_bytes(data[8..16].try_into().unwrap());
-
-    if from_block > to_block {
-        return Err(format!("invalid block range: from ({from_block}) > to ({to_block})"));
-    }
-    let span = to_block
-        .checked_sub(from_block)
-        .and_then(|d| d.checked_add(1))
-        .ok_or_else(|| "block range span overflow".to_string())?;
-    let num_blocks: usize = span
-        .try_into()
-        .map_err(|_| format!("block range span ({span}) exceeds usize"))?;
-
-    let headers_bytes = num_blocks
-        .checked_mul(PACKED_L2_HEADER_SIZE)
-        .ok_or_else(|| "headers region overflow".to_string())?;
-    let lens_bytes = num_blocks
-        .checked_mul(TX_LEN_SIZE)
-        .ok_or_else(|| "tx_lens region overflow".to_string())?;
-    let prefix_end = RANGE_PREFIX_SIZE
-        .checked_add(headers_bytes)
-        .and_then(|n| n.checked_add(lens_bytes))
-        .ok_or_else(|| "fixed prefix overflow".to_string())?;
-    if data.len() < prefix_end {
-        return Err(format!(
-            "blob payload too short: have {}, need {prefix_end} for {num_blocks} block headers + tx_lens",
-            data.len(),
-        ));
-    }
-
-    let mut headers = Vec::with_capacity(num_blocks);
-    let mut off = RANGE_PREFIX_SIZE;
-    for _ in 0..num_blocks {
-        let h = L2BlockHeader {
-            previous_block_hash: B256::from_slice(&data[off..off + 32]),
-            block_hash: B256::from_slice(&data[off + 32..off + 64]),
-            withdrawal_root: B256::from_slice(&data[off + 64..off + 96]),
-            deposit_root: B256::from_slice(&data[off + 96..off + 128]),
-        };
-        // data[off+128..off+130] is deposit_count(u16BE) — parsed-and-skipped.
-        headers.push(h);
-        off += PACKED_L2_HEADER_SIZE;
-    }
-
-    let mut blocks = Vec::with_capacity(num_blocks);
-    let mut tx_cursor = prefix_end;
-    for header in headers {
-        let len_bytes: [u8; 4] = data[off..off + 4].try_into().unwrap();
-        off += 4;
-        let tx_len = u32::from_be_bytes(len_bytes) as usize;
-
-        let tx_end = tx_cursor
-            .checked_add(tx_len)
-            .ok_or_else(|| "tx_data offset overflow".to_string())?;
-        blocks.push(BlockEntry { header, tx_start: tx_cursor, tx_end });
-        tx_cursor = tx_end;
-    }
-
-    if tx_cursor != data.len() {
-        return Err(format!(
-            "tx_data region size mismatch: end={tx_cursor}, payload={}",
-            data.len(),
-        ));
-    }
-
-    Ok(BlobHeader { from_block, to_block, blocks })
-}
-
-/// Extracts the per-block L2 header and the tx_data slice for a given block.
+/// Streaming iterator over RLP-encoded blocks in `payload`.
 ///
-/// `payload` MUST be the same buffer that was returned by `decode_blob_payload`
-/// alongside `header` — offsets stored in `header` are byte-positions into
-/// that exact buffer.
-pub(crate) fn extract_block<'a>(
-    header: &BlobHeader,
-    payload: &'a [u8],
-    block_number: u64,
-) -> Result<(L2BlockHeader, &'a [u8]), String> {
-    if block_number < header.from_block || block_number > header.to_block {
-        return Err(format!(
-            "block {block_number} outside blob range [{}, {}]",
-            header.from_block, header.to_block,
-        ));
+/// Each item yields a `BlockView` whose `block_hash` is the keccak of the
+/// first inner RLP list (the block header), or an error that terminates
+/// iteration. Does not allocate — advances a byte cursor across `payload`.
+pub(crate) fn iter_blocks(payload: &[u8]) -> BlockIter<'_> {
+    BlockIter { cursor: payload, done: false }
+}
+
+pub(crate) struct BlockIter<'a> {
+    cursor: &'a [u8],
+    done: bool,
+}
+
+impl<'a> Iterator for BlockIter<'a> {
+    type Item = Result<BlockView, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.cursor.is_empty() {
+            return None;
+        }
+
+        // Outer list: [Header, Transactions, Uncles, Withdrawals?, ...]
+        let block_start = self.cursor;
+        let mut peek = self.cursor;
+        let outer = match Header::decode(&mut peek) {
+            Ok(h) => h,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(format!("outer RLP decode failed: {e}")));
+            }
+        };
+        if !outer.list {
+            self.done = true;
+            return Some(Err("outer RLP item is not a list".into()));
+        }
+        let outer_header_len = block_start.len() - peek.len();
+        let outer_total = outer_header_len + outer.payload_length;
+        if outer_total > block_start.len() {
+            self.done = true;
+            return Some(Err("outer RLP item exceeds payload bounds".into()));
+        }
+
+        // Inner: first item of the outer list must be the header list.
+        let inner_start = &block_start[outer_header_len..outer_total];
+        let mut inner = inner_start;
+        let header_meta = match Header::decode(&mut inner) {
+            Ok(h) => h,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(format!("header RLP decode failed: {e}")));
+            }
+        };
+        if !header_meta.list {
+            self.done = true;
+            return Some(Err("block header is not an RLP list".into()));
+        }
+        let header_prefix_len = inner_start.len() - inner.len();
+        let header_total = header_prefix_len + header_meta.payload_length;
+        if header_total > inner_start.len() {
+            self.done = true;
+            return Some(Err("header RLP exceeds block bounds".into()));
+        }
+        let header_bytes = &inner_start[..header_total];
+        let block_hash = keccak256(header_bytes);
+
+        self.cursor = &block_start[outer_total..];
+        Some(Ok(BlockView { block_hash }))
     }
-    let idx = (block_number - header.from_block) as usize;
-    let entry = header.blocks[idx];
-    if entry.tx_end > payload.len() {
-        return Err("tx_data exceeds blob payload".into());
-    }
-    Ok((entry.header, &payload[entry.tx_start..entry.tx_end]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{Block, BlockBody, Header as ConsensusHeader, TxEnvelope};
+    use alloy_rlp::Encodable;
 
-    fn canonicalize(input: &[u8]) -> Vec<u8> {
-        if input.is_empty() {
-            return Vec::new();
-        }
-        let chunks = input.len().div_ceil(BYTES_PER_FIELD);
-        let mut result = vec![0u8; chunks * FIELD_SIZE];
-        let mut inp = 0;
-        let mut out = 0;
-        while inp < input.len() {
-            out += 1; // skip 0x00 padding byte
-            let n = BYTES_PER_FIELD.min(input.len() - inp);
-            result[out..out + n].copy_from_slice(&input[inp..inp + n]);
-            inp += n;
-            out += BYTES_PER_FIELD;
-        }
-        result
+    fn encode_two_blocks() -> (Vec<u8>, B256, B256) {
+        let h1 = ConsensusHeader { number: 100, ..Default::default() };
+        let h2 = ConsensusHeader { number: 101, ..Default::default() };
+        let empty_body: BlockBody<TxEnvelope> = BlockBody {
+            transactions: vec![],
+            ommers: vec![],
+            withdrawals: None,
+        };
+        let b1 = Block { header: h1.clone(), body: empty_body.clone() };
+        let b2 = Block { header: h2.clone(), body: empty_body };
+        let mut payload = Vec::new();
+        b1.encode(&mut payload);
+        b2.encode(&mut payload);
+        (payload, h1.hash_slow(), h2.hash_slow())
     }
 
-    fn mk_header(seed: u8) -> L2BlockHeader {
-        L2BlockHeader {
-            previous_block_hash: B256::from([seed; 32]),
-            block_hash: B256::from([seed.wrapping_add(1); 32]),
-            withdrawal_root: B256::from([seed.wrapping_add(2); 32]),
-            deposit_root: B256::from([seed.wrapping_add(3); 32]),
-        }
+    #[test]
+    fn iter_blocks_yields_block_hashes_in_order() {
+        let (payload, hash1, hash2) = encode_two_blocks();
+        let mut it = iter_blocks(&payload);
+        assert_eq!(it.next().unwrap().unwrap().block_hash, hash1);
+        assert_eq!(it.next().unwrap().unwrap().block_hash, hash2);
+        assert!(it.next().is_none());
     }
 
-    /// Hand-rolled raw payload (no brotli, no canonicalize) for parser tests.
-    /// Layout: from(u64BE) | to(u64BE) | header*N | tx_len*N | tx_data
-    /// Each header is 130 bytes including the trailing deposit_count u16.
-    fn build_payload(
-        from_block: u64,
-        to_block: u64,
-        per_block: &[(L2BlockHeader, u16, &[u8])],
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&from_block.to_be_bytes());
-        buf.extend_from_slice(&to_block.to_be_bytes());
-        for (h, dep_count, _) in per_block {
-            buf.extend_from_slice(h.previous_block_hash.as_slice());
-            buf.extend_from_slice(h.block_hash.as_slice());
-            buf.extend_from_slice(h.withdrawal_root.as_slice());
-            buf.extend_from_slice(h.deposit_root.as_slice());
-            buf.extend_from_slice(&dep_count.to_be_bytes());
-        }
-        for (_, _, tx) in per_block {
-            buf.extend_from_slice(&(tx.len() as u32).to_be_bytes());
-        }
-        for (_, _, tx) in per_block {
-            buf.extend_from_slice(tx);
-        }
-        buf
+    #[test]
+    fn iter_blocks_rejects_trailing_garbage() {
+        let (mut payload, _, _) = encode_two_blocks();
+        payload.push(0xFF);
+        let mut it = iter_blocks(&payload);
+        let _ = it.next().unwrap().unwrap();
+        let _ = it.next().unwrap().unwrap();
+        assert!(it.next().unwrap().is_err());
+    }
+
+    #[test]
+    fn iter_blocks_rejects_truncated_stream() {
+        let (payload, _, _) = encode_two_blocks();
+        let truncated = &payload[..payload.len() - 5];
+        let mut it = iter_blocks(truncated);
+        let _ = it.next().unwrap().unwrap();
+        assert!(it.next().unwrap().is_err());
     }
 
     #[test]
     fn canonicalize_decanonicalize_roundtrip() {
-        let cases: &[&[u8]] = &[b"hello", &[0xFFu8; 31], &[0xAB; 62], &[0x01; 100]];
-        for input in cases {
-            let encoded = canonicalize(input);
-            let decoded = decanonicalize(&encoded).expect("decanonicalize failed");
-            assert_eq!(
-                &decoded[..input.len()],
-                *input,
-                "roundtrip failed for len {}",
-                input.len()
-            );
+        let raw: Vec<u8> = (0..MAX_RAW_BYTES_PER_BLOB).map(|i| (i % 251) as u8).collect();
+        let mut blob = vec![0u8; FIELDS_PER_BLOB * FIELD_SIZE];
+        let mut src_off = 0;
+        let mut dst_off = 0;
+        while src_off < raw.len() {
+            dst_off += 1;
+            let take = BYTES_PER_FIELD.min(raw.len() - src_off);
+            blob[dst_off..dst_off + take].copy_from_slice(&raw[src_off..src_off + take]);
+            src_off += take;
+            dst_off += BYTES_PER_FIELD;
         }
+        let decoded = decanonicalize(&blob).unwrap();
+        assert_eq!(decoded, raw);
     }
 
     #[test]
     fn decanonicalize_rejects_non_canonical() {
-        let mut blob = vec![0u8; 64];
+        let mut blob = vec![0u8; FIELDS_PER_BLOB * FIELD_SIZE];
         blob[0] = 0x01;
         assert!(decanonicalize(&blob).is_err());
-    }
-
-    #[test]
-    fn decanonicalize_extracts_raw_bytes() {
-        let mut blob = vec![0u8; FIELDS_PER_BLOB * FIELD_SIZE];
-        for f in 0..FIELDS_PER_BLOB {
-            blob[f * FIELD_SIZE] = 0x00;
-            for b in 0..BYTES_PER_FIELD {
-                blob[f * FIELD_SIZE + 1 + b] = ((f * BYTES_PER_FIELD + b) % 256) as u8;
-            }
-        }
-        let raw = decanonicalize(&blob).unwrap();
-        assert_eq!(raw.len(), MAX_RAW_BYTES_PER_BLOB);
-        assert_eq!(raw[0], 0);
-        assert_eq!(raw[1], 1);
-    }
-
-    #[test]
-    fn parse_header_single_block() {
-        let h0 = mk_header(0x10);
-        let tx = b"hello-tx-data";
-        let payload = build_payload(42, 42, &[(h0, 7, tx)]);
-        let header = parse_header(&payload).expect("parse_header");
-        assert_eq!(header.from_block, 42);
-        assert_eq!(header.to_block, 42);
-        assert_eq!(header.num_blocks(), 1);
-
-        let (l2, slice) = extract_block(&header, &payload, 42).expect("extract_block");
-        assert_eq!(l2.previous_block_hash, h0.previous_block_hash);
-        assert_eq!(l2.block_hash, h0.block_hash);
-        assert_eq!(l2.withdrawal_root, h0.withdrawal_root);
-        assert_eq!(l2.deposit_root, h0.deposit_root);
-        assert_eq!(slice, tx.as_slice());
-    }
-
-    #[test]
-    fn parse_header_multi_block_offsets() {
-        let h0 = mk_header(0x20);
-        let h1 = mk_header(0x30);
-        let h2 = mk_header(0x40);
-        let tx0: &[u8] = b"first";
-        let tx1: &[u8] = b"second-block";
-        let tx2: &[u8] = b"third!";
-        let payload = build_payload(100, 102, &[(h0, 0, tx0), (h1, 1, tx1), (h2, 2, tx2)]);
-        let header = parse_header(&payload).expect("parse_header");
-        assert_eq!(header.num_blocks(), 3);
-
-        let (l0, s0) = extract_block(&header, &payload, 100).unwrap();
-        let (l1, s1) = extract_block(&header, &payload, 101).unwrap();
-        let (l2, s2) = extract_block(&header, &payload, 102).unwrap();
-        assert_eq!(l0.block_hash, h0.block_hash);
-        assert_eq!(l1.block_hash, h1.block_hash);
-        assert_eq!(l2.block_hash, h2.block_hash);
-        assert_eq!(s0, tx0);
-        assert_eq!(s1, tx1);
-        assert_eq!(s2, tx2);
-    }
-
-    #[test]
-    fn parse_header_rejects_short_payload() {
-        assert!(parse_header(&[0u8; 8]).is_err());
-    }
-
-    #[test]
-    fn parse_header_rejects_bad_range() {
-        let mut buf = vec![0u8; 16];
-        buf[0..8].copy_from_slice(&100u64.to_be_bytes());
-        buf[8..16].copy_from_slice(&50u64.to_be_bytes());
-        assert!(parse_header(&buf).is_err());
-    }
-
-    #[test]
-    fn parse_header_rejects_truncated_tx_region() {
-        let h0 = mk_header(0x50);
-        let tx = b"data-here";
-        let mut payload = build_payload(7, 7, &[(h0, 0, tx)]);
-        payload.truncate(payload.len() - 3);
-        assert!(parse_header(&payload).is_err());
-    }
-
-    #[test]
-    fn extract_block_rejects_out_of_range() {
-        let h0 = mk_header(0x60);
-        let tx = b"x";
-        let payload = build_payload(10, 10, &[(h0, 0, tx)]);
-        let header = parse_header(&payload).unwrap();
-        assert!(extract_block(&header, &payload, 9).is_err());
-        assert!(extract_block(&header, &payload, 11).is_err());
     }
 }
