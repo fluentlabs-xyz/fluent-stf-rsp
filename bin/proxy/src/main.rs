@@ -652,7 +652,7 @@ async fn main() -> eyre::Result<()> {
             let contract_addr: Address =
                 l1_addr.parse().map_err(|e| eyre::eyre!("Invalid L1_ROLLUP_ADDR: {e}"))?;
             let deploy_block: u64 =
-                env::var("FLUENT_L1_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                env::var("L1_ROLLUP_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
             info!(
                 l1_rpc = %l1_rpc,

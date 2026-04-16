@@ -52,8 +52,7 @@ services:
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
       L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}
       L1_ROLLUP_ADDR: ${L1_ROLLUP_ADDR:?L1_ROLLUP_ADDR is required in .env}
-      FLUENT_L1_DEPLOY_BLOCK: ${FLUENT_L1_DEPLOY_BLOCK}
-      NITRO_VERIFIER_ADDR: ${NITRO_VERIFIER_ADDR:?NITRO_VERIFIER_ADDR is required in .env}
+      L1_ROLLUP_DEPLOY_BLOCK: ${L1_ROLLUP_DEPLOY_BLOCK}
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
     # TCP-only liveness probe. This verifies only that proxy has bound the
     # socket — it does NOT verify that the enclave handshake succeeded or that
@@ -118,21 +117,20 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
-      FLUENT_DATADIR: ${FLUENT_DATADIR}
-      FLUENT_WITNESS_COLD_FILE: ${FLUENT_WITNESS_COLD_FILE}
-      FLUENT_MAX_COLD_BYTES: ${FLUENT_MAX_COLD_BYTES}
-      FLUENT_MDBX_MAX_SIZE: ${FLUENT_MDBX_MAX_SIZE}
-      FLUENT_PRUNE_FULL: ${FLUENT_PRUNE_FULL}
-      FLUENT_DB_PATH: ${FLUENT_DB_PATH}
-      FLUENT_PROXY_URL: ${FLUENT_PROXY_URL}
-      FLUENT_HTTP_TIMEOUT_SECS: ${FLUENT_HTTP_TIMEOUT_SECS}
-      FLUENT_API_KEY: ${API_KEY:?API_KEY is required in .env}
+      DATADIR: ${DATADIR}
+      WITNESS_COLD_FILE: ${WITNESS_COLD_FILE}
+      MAX_COLD_BYTES: ${MAX_COLD_BYTES}
+      MDBX_MAX_SIZE: ${MDBX_MAX_SIZE}
+      PRUNE_FULL: ${PRUNE_FULL}
+      DB_PATH: ${DB_PATH}
+      PROXY_URL: ${PROXY_URL}
+      HTTP_TIMEOUT_SECS: ${HTTP_TIMEOUT_SECS}
+      API_KEY: ${API_KEY:?API_KEY is required in .env}
       L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}
       L1_ROLLUP_ADDR: ${L1_ROLLUP_ADDR:?L1_ROLLUP_ADDR is required in .env}
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
-      NITRO_VERIFIER_ADDR: ${NITRO_VERIFIER_ADDR:?NITRO_VERIFIER_ADDR is required in .env}
-      FLUENT_START_BATCH_ID: ${FLUENT_START_BATCH_ID}
-      FLUENT_L1_DEPLOY_BLOCK: ${FLUENT_L1_DEPLOY_BLOCK}
+      L1_START_BATCH_ID: ${L1_START_BATCH_ID}
+      L1_ROLLUP_DEPLOY_BLOCK: ${L1_ROLLUP_DEPLOY_BLOCK}
     logging:
       driver: json-file
       options:

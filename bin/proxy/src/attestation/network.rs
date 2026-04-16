@@ -54,17 +54,12 @@ impl AttestationConfig {
         let l1_signer: PrivateKeySigner =
             key_hex.parse().map_err(|e| eyre!("Invalid L1_SUBMITTER_KEY: {e}"))?;
 
-        let addr_str = std::env::var("NITRO_VERIFIER_ADDR")
-            .map_err(|_| eyre!("NITRO_VERIFIER_ADDR not set"))?;
-        let nitro_verifier_addr: Address =
-            addr_str.parse().map_err(|e| eyre!("Invalid NITRO_VERIFIER_ADDR: {e}"))?;
-
         Ok(Self {
             prover: Arc::new(client),
             pk: Arc::new(pk),
             l1_provider,
             l1_signer,
-            nitro_verifier_addr,
+            nitro_verifier_addr: fluent_stf_primitives::NITRO_VERIFIER_ADDR,
         })
     }
 }

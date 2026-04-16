@@ -18,21 +18,21 @@
 //! | Variable | Default | Description |
 //! |----------|---------|-------------|
 //! | `RPC_URL` | — | L2 RPC URL — drives forward sync and blob construction |
-//! | `FLUENT_DATADIR` | `./forward-driver` | Driver datadir (MDBX + static_files + RocksDB) |
-//! | `FLUENT_WITNESS_COLD_FILE` | `<datadir>/cold.redb` | redb file for cold witness store |
-//! | `FLUENT_MAX_COLD_BYTES` | `34359738368` (32 GiB) | Size cap for cold witness store |
-//! | `FLUENT_MDBX_MAX_SIZE` | `549755813888` (512 GiB) | MDBX max size |
-//! | `FLUENT_PROXY_URL` | `http://127.0.0.1:8080` | Remote proxy base URL |
-//! | `FLUENT_DB_PATH` | `./witness_orchestrator.db` | SQLite DB for crash recovery |
-//! | `FLUENT_HTTP_TIMEOUT_SECS` | `120` | HTTP POST timeout (seconds) |
+//! | `DATADIR` | `./forward-driver` | Driver datadir (MDBX + static_files + RocksDB) |
+//! | `WITNESS_COLD_FILE` | `<datadir>/cold.redb` | redb file for cold witness store |
+//! | `MAX_COLD_BYTES` | `34359738368` (32 GiB) | Size cap for cold witness store |
+//! | `MDBX_MAX_SIZE` | `549755813888` (512 GiB) | MDBX max size |
+//! | `PROXY_URL` | `http://127.0.0.1:8080` | Remote proxy base URL |
+//! | `DB_PATH` | `./witness_orchestrator.db` | SQLite DB for crash recovery |
+//! | `HTTP_TIMEOUT_SECS` | `120` | HTTP POST timeout (seconds) |
 //! | `L1_RPC_URL` | — | L1 Ethereum RPC URL |
-//! | `L1_ROLLUP_ADDR` | — | Rollup contract address on L1 |
+//! | `l1_rollup_addr` | — | Rollup contract address on L1 |
 //! | `L1_SUBMITTER_KEY` | — | Private key for signing `preconfirmBatch` txs |
-//! | `NITRO_VERIFIER_ADDR` | — | NitroVerifier contract address on L1 |
-//! | `FLUENT_START_BATCH_ID` | — | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
-//! | `FLUENT_L1_DEPLOY_BLOCK` | `0` | L1 block where Rollup contract was deployed (lower bound for event scans) |
-//! | `FLUENT_API_KEY` | — | API key forwarded to the proxy |
-//! | `FLUENT_PRUNE_FULL` | `false` | If `true`, prune MDBX/static-files using the same defaults as `reth --full` (sender_recovery=Full, receipts/account_history/storage_history distance=10064 blocks, bodies_history=Before(Paris)) |
+//! | — | — | `NITRO_VERIFIER_ADDR` removed: now compile-time constant from `fluent_stf_primitives` |
+//! | `L1_START_BATCH_ID` | — | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
+//! | `L1_ROLLUP_DEPLOY_BLOCK` | `0` | L1 block where Rollup contract was deployed (lower bound for event scans) |
+//! | `API_KEY` | — | API key forwarded to the proxy |
+//! | `PRUNE_FULL` | `false` | If `true`, prune MDBX/static-files using the same defaults as `reth --full` (sender_recovery=Full, receipts/account_history/storage_history distance=10064 blocks, bodies_history=Before(Paris)) |
 
 mod accumulator;
 mod db;
@@ -86,43 +86,40 @@ async fn main() {
 
     let rpc_url = std::env::var("RPC_URL").expect("RPC_URL is required");
     let datadir =
-        PathBuf::from(std::env::var("FLUENT_DATADIR").unwrap_or_else(|_| DEFAULT_DATADIR.into()));
-    let cold_file = std::env::var("FLUENT_WITNESS_COLD_FILE")
+        PathBuf::from(std::env::var("DATADIR").unwrap_or_else(|_| DEFAULT_DATADIR.into()));
+    let cold_file = std::env::var("WITNESS_COLD_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| datadir.join("cold.redb"));
-    let max_cold_bytes: u64 = std::env::var("FLUENT_MAX_COLD_BYTES")
+    let max_cold_bytes: u64 = std::env::var("MAX_COLD_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_MAX_COLD_BYTES);
-    let mdbx_max_size: u64 = std::env::var("FLUENT_MDBX_MAX_SIZE")
+    let mdbx_max_size: u64 = std::env::var("MDBX_MAX_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_MDBX_MAX_SIZE);
 
-    let proxy_url = std::env::var("FLUENT_PROXY_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.into());
+    let proxy_url = std::env::var("PROXY_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.into());
     let db_path =
-        PathBuf::from(std::env::var("FLUENT_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.into()));
-    let http_timeout_secs: u64 = std::env::var("FLUENT_HTTP_TIMEOUT_SECS")
+        PathBuf::from(std::env::var("DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.into()));
+    let http_timeout_secs: u64 = std::env::var("HTTP_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS);
 
     // L1 configuration
     let l1_rpc_url = std::env::var("L1_RPC_URL").expect("L1_RPC_URL is required");
-    let L1_ROLLUP_ADDR: Address = std::env::var("L1_ROLLUP_ADDR")
-        .expect("L1_ROLLUP_ADDR is required")
+    let l1_rollup_addr: Address = std::env::var("l1_rollup_addr")
+        .expect("l1_rollup_addr is required")
         .parse()
-        .expect("Invalid L1_ROLLUP_ADDR");
+        .expect("Invalid l1_rollup_addr");
     let l1_submitter_key = std::env::var("L1_SUBMITTER_KEY").expect("L1_SUBMITTER_KEY is required");
-    let nitro_verifier_addr: Address = std::env::var("NITRO_VERIFIER_ADDR")
-        .expect("NITRO_VERIFIER_ADDR is required")
-        .parse()
-        .expect("Invalid NITRO_VERIFIER_ADDR");
+    let nitro_verifier_addr: Address = fluent_stf_primitives::NITRO_VERIFIER_ADDR;
     let start_batch_id: Option<u64> =
-        std::env::var("FLUENT_START_BATCH_ID").ok().and_then(|s| s.parse().ok());
+        std::env::var("L1_START_BATCH_ID").ok().and_then(|s| s.parse().ok());
     let l1_deploy_block: u64 =
-        std::env::var("FLUENT_L1_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let api_key = std::env::var("FLUENT_API_KEY").expect("FLUENT_API_KEY is required");
+        std::env::var("L1_ROLLUP_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let api_key = std::env::var("API_KEY").expect("API_KEY is required");
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(http_timeout_secs))
@@ -142,12 +139,12 @@ async fn main() {
             if db_startup.get_checkpoint() == 0 {
                 info!(
                     batch_id,
-                    "FLUENT_START_BATCH_ID set — resolving L2 start checkpoint from L1"
+                    "L1_START_BATCH_ID set — resolving L2 start checkpoint from L1"
                 );
                 let (l2_from_block, l1_event_block, _num_blocks) =
                     l1_rollup_client::resolve_l2_start_checkpoint(
                         &l1_read_provider,
-                        L1_ROLLUP_ADDR,
+                        l1_rollup_addr,
                         batch_id,
                         l1_deploy_block,
                     )
@@ -196,7 +193,7 @@ async fn main() {
         %proxy_url,
         ?db_path,
         http_timeout_secs,
-        %L1_ROLLUP_ADDR,
+        %l1_rollup_addr,
         %nitro_verifier_addr,
         listener_from_block,
         start_batch_id,
@@ -245,7 +242,7 @@ async fn main() {
         tasks.spawn(async move {
             let r = l1_listener::run(
                 l1_read_provider,
-                L1_ROLLUP_ADDR,
+                l1_rollup_addr,
                 listener_from_block,
                 l1_tx,
                 shutdown,
@@ -280,7 +277,7 @@ async fn main() {
     let host_executor = Arc::new(EthHostExecutor::eth(chain_spec.clone(), None));
 
     // Optional pruner: mirror `reth --full` semantics exactly.
-    let prune_full: bool = std::env::var("FLUENT_PRUNE_FULL")
+    let prune_full: bool = std::env::var("PRUNE_FULL")
         .ok()
         .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
@@ -331,7 +328,7 @@ async fn main() {
         proxy_url,
         db_path,
         http_client,
-        L1_ROLLUP_ADDR,
+        l1_rollup_addr,
         nitro_verifier_addr,
         l1_provider: l1_write_provider,
         api_key,

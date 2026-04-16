@@ -92,6 +92,10 @@ mod network {
 
 pub use network::*;
 
+/// `NITRO_VERIFIER_ADDRESS` as an `Address` for host-side code.
+pub const NITRO_VERIFIER_ADDR: alloy_primitives::Address =
+    alloy_primitives::Address::new(NITRO_VERIFIER_ADDRESS);
+
 pub mod account_proof;
 pub(crate) mod fluent_genesis;
 

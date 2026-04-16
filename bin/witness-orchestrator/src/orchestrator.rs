@@ -83,7 +83,7 @@ pub(crate) struct OrchestratorConfig {
     pub proxy_url: String,
     pub db_path: PathBuf,
     pub http_client: reqwest::Client,
-    pub L1_ROLLUP_ADDR: Address,
+    pub l1_rollup_addr: Address,
     pub nitro_verifier_addr: Address,
     pub l1_provider: L1WriteProvider,
     pub api_key: String,
@@ -672,7 +672,7 @@ impl OrchestratorState {
         self.dispatching_batch = Some(batch_index);
 
         let provider = self.config.l1_provider.clone();
-        let contract = self.config.L1_ROLLUP_ADDR;
+        let contract = self.config.l1_rollup_addr;
         let verifier = self.config.nitro_verifier_addr;
         let tx = self.dispatch_done_tx.clone();
 

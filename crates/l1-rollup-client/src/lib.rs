@@ -119,7 +119,7 @@ pub async fn find_batch_log(
 /// - `num_blocks`: number of L2 block headers in this batch
 ///
 /// Note: this is O(batch_id) on cold start. Callers should treat it as a
-/// rare manual operation (e.g., explicit `FLUENT_START_BATCH_ID`).
+/// rare manual operation (e.g., explicit `L1_START_BATCH_ID`).
 pub async fn resolve_l2_start_checkpoint(
     l1_provider: &RootProvider,
     contract_addr: Address,
@@ -183,7 +183,7 @@ pub async fn resolve_l2_start_checkpoint(
         eyre!(
             "BatchCommitted for batch {batch_id} not found in L1 blocks \
              [{l1_deploy_block}..{latest}]. \
-             Ensure FLUENT_L1_DEPLOY_BLOCK is ≤ the block where batch 0 was committed."
+             Ensure L1_ROLLUP_DEPLOY_BLOCK is ≤ the block where batch 0 was committed."
         )
     })?;
 
