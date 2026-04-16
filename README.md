@@ -30,7 +30,7 @@ the host's `/dev/vsock` device.
 - AWS EC2 instance with Nitro Enclave support, `nitro-cli` installed, and the
   allocator service running.
 - Host-side Fluent node exposing its gRPC witness server on `127.0.0.1:10000`.
-- L2 archive RPC available (set via `FLUENT_FALLBACK_LOCAL_RPC`).
+- L2 RPC available (set via `RPC_URL`).
 - Build-time: `cargo-prove` (SP1 toolchain) + Docker for the reproducible ELF
   build. See [Makefile](Makefile) `build-client-docker` and
   `build-nitro-validator-docker`.
@@ -41,7 +41,7 @@ the host's `/dev/vsock` device.
 cp .env.example .env
 chmod 600 .env
 # edit .env — fill in API_KEY, L1_SUBMITTER_KEY, RPC_URL, L1_RPC_URL,
-# L1_CONTRACT_ADDR, NITRO_VERIFIER_ADDR, FLUENT_FALLBACK_LOCAL_RPC, etc.
+# L1_CONTRACT_ADDR, NITRO_VERIFIER_ADDR, etc.
 
 # Build reproducible ELFs + both docker images
 make compose-build NETWORK=mainnet

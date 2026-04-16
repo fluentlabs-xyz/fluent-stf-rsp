@@ -13,7 +13,7 @@ revm-primitives.workspace = true
 serde = { workspace = true,  features = ["derive", "alloc"] }
 serde-big-array = "0.5"
 alloy-primitives = { workspace = true, features = ["serde"] }
-rsp-client-executor.workspace = true
+rsp-client-executor = { workspace = true, default-features = false }
 base64 = { workspace = true }
 
 [lints]

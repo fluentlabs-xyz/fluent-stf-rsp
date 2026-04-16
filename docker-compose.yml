@@ -1,9 +1,12 @@
 # Production docker-compose for Fluent STF proxy + witness-orchestrator.
 #
+# All environment variables and their defaults live in `.env.example` — copy it
+# to `.env`, fill in the blanks, and this file will pick them up automatically.
+# Do NOT duplicate defaults here; `.env.example` is the single source of truth.
+#
 # Runtime assumptions:
 #   - AWS Nitro Enclave is launched OUTSIDE Docker on the same EC2 host via
 #     `nitro-cli run-enclave` with --enclave-cid 10 (see Makefile run-enclave).
-#   - Fluent node's gRPC witness server is running on the EC2 host at :10000.
 #   - SP1 client ELF and nitro-validator ELF have been built on the host
 #     before `docker compose build`: run `make compose-build` for the full chain.
 #   - Secrets (API_KEY, L1_SUBMITTER_KEY) are provided via `.env` (chmod 600,
@@ -21,8 +24,8 @@ services:
       dockerfile: Dockerfile
       target: rsp-proxy
       args:
-        NETWORK: ${NETWORK:-mainnet}
-    image: fluent-stf/proxy:${NETWORK:-mainnet}
+        NETWORK: ${NETWORK}
+    image: fluent-stf/proxy:${NETWORK}
     container_name: fluent-proxy
     restart: unless-stopped
     init: true
@@ -44,12 +47,12 @@ services:
     # Rust-side support for `*_FILE` env var pattern (out of scope here).
     environment:
       API_KEY: ${API_KEY:?API_KEY is required in .env}
-      LISTEN_ADDR: ${PROXY_LISTEN_ADDR:-127.0.0.1:8080}
-      RUST_LOG: ${RUST_LOG:-info}
+      LISTEN_ADDR: ${PROXY_LISTEN_ADDR}
+      RUST_LOG: ${RUST_LOG}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
       L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}
       L1_CONTRACT_ADDR: ${L1_CONTRACT_ADDR:?L1_CONTRACT_ADDR is required in .env}
-      L1_CONTRACT_DEPLOY_BLOCK: ${L1_CONTRACT_DEPLOY_BLOCK:-0}
+      L1_CONTRACT_DEPLOY_BLOCK: ${L1_CONTRACT_DEPLOY_BLOCK}
       NITRO_VERIFIER_ADDR: ${NITRO_VERIFIER_ADDR:?NITRO_VERIFIER_ADDR is required in .env}
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
     # TCP-only liveness probe. This verifies only that proxy has bound the
@@ -100,8 +103,8 @@ services:
       dockerfile: Dockerfile
       target: rsp-witness-orchestrator
       args:
-        NETWORK: ${NETWORK:-mainnet}
-    image: fluent-stf/witness-orchestrator:${NETWORK:-mainnet}
+        NETWORK: ${NETWORK}
+    image: fluent-stf/witness-orchestrator:${NETWORK}
     container_name: fluent-witness-orchestrator
     restart: unless-stopped
     init: true
@@ -113,24 +116,24 @@ services:
     volumes:
       - witness_state:/var/lib/witness
     environment:
-      RUST_LOG: ${RUST_LOG:-info}
+      RUST_LOG: ${RUST_LOG}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
-      FLUENT_DATADIR: ${FLUENT_DATADIR:-/var/lib/witness/forward-driver}
-      FLUENT_WITNESS_COLD_FILE: ${FLUENT_WITNESS_COLD_FILE:-/var/lib/witness/forward-driver/cold.redb}
-      FLUENT_MAX_COLD_BYTES: ${FLUENT_MAX_COLD_BYTES:-34359738368}
-      FLUENT_MDBX_MAX_SIZE: ${FLUENT_MDBX_MAX_SIZE:-549755813888}
-      FLUENT_PRUNE_FULL: ${FLUENT_PRUNE_FULL:-false}
-      FLUENT_DB_PATH: ${FLUENT_DB_PATH:-/var/lib/witness/witness_orchestrator.db}
-      FLUENT_PROXY_URL: ${FLUENT_PROXY_URL:-http://127.0.0.1:8080}
-      FLUENT_HTTP_TIMEOUT_SECS: ${FLUENT_HTTP_TIMEOUT_SECS:-120}
+      FLUENT_DATADIR: ${FLUENT_DATADIR}
+      FLUENT_WITNESS_COLD_FILE: ${FLUENT_WITNESS_COLD_FILE}
+      FLUENT_MAX_COLD_BYTES: ${FLUENT_MAX_COLD_BYTES}
+      FLUENT_MDBX_MAX_SIZE: ${FLUENT_MDBX_MAX_SIZE}
+      FLUENT_PRUNE_FULL: ${FLUENT_PRUNE_FULL}
+      FLUENT_DB_PATH: ${FLUENT_DB_PATH}
+      FLUENT_PROXY_URL: ${FLUENT_PROXY_URL}
+      FLUENT_HTTP_TIMEOUT_SECS: ${FLUENT_HTTP_TIMEOUT_SECS}
       FLUENT_API_KEY: ${API_KEY:?API_KEY is required in .env}
       L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}
       L1_CONTRACT_ADDR: ${L1_CONTRACT_ADDR:?L1_CONTRACT_ADDR is required in .env}
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
       NITRO_VERIFIER_ADDR: ${NITRO_VERIFIER_ADDR:?NITRO_VERIFIER_ADDR is required in .env}
-      L1_START_BLOCK: ${L1_START_BLOCK:-0}
-      FLUENT_START_BATCH_ID: ${FLUENT_START_BATCH_ID:-}
-      FLUENT_L1_DEPLOY_BLOCK: ${FLUENT_L1_DEPLOY_BLOCK:-0}
+      L1_START_BLOCK: ${L1_START_BLOCK}
+      FLUENT_START_BATCH_ID: ${FLUENT_START_BATCH_ID}
+      FLUENT_L1_DEPLOY_BLOCK: ${FLUENT_L1_DEPLOY_BLOCK}
     logging:
       driver: json-file
       options:

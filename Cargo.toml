@@ -87,7 +87,7 @@ rsp-blob-builder = { path = "./crates/blob-builder" }
 l1-rollup-client = { path = "./crates/l1-rollup-client" }
 rsp-rpc-db = { path = "./crates/storage/rpc-db" }
 rsp-witness-db = { path = "./crates/storage/witness-db" }
-rsp-client-executor = { path = "./crates/executor/client" }
+rsp-client-executor = { path = "./crates/executor/client", default-features = false }
 rsp-host-executor = { path = "./crates/executor/host", default-features = false }
 rsp-mpt = { path = "./crates/mpt" }
 fluent-stf-primitives = { path = "./crates/primitives", default-features = false }
