@@ -23,20 +23,24 @@ COPY Cargo.toml Cargo.lock ./
 
 # Copy manifests and lockfile first for layer caching
 COPY bin/client/Cargo.toml bin/client/Cargo.lock bin/client/
-COPY crates/ crates/
 
 # Copy source
+COPY crates/ crates/
 COPY bin/client/src/ bin/client/src/
 COPY bin/client/trusted_setup.txt bin/client/trusted_setup.txt
 
-RUN cargo build \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/bin/client/target \
+    cargo build \
     --locked \
     --release \
     --target x86_64-unknown-linux-musl \
     --manifest-path bin/client/Cargo.toml \
     --no-default-features \
-    --features "nitro ${NETWORK}"
+    --features "nitro ${NETWORK}" \
+    && cp bin/client/target/x86_64-unknown-linux-musl/release/rsp-client /rsp-client
 
 FROM scratch
-COPY --from=builder /build/bin/client/target/x86_64-unknown-linux-musl/release/rsp-client /rsp-client
+COPY --from=builder /rsp-client /rsp-client
 ENTRYPOINT ["/rsp-client"]

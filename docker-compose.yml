@@ -51,8 +51,8 @@ services:
       RUST_LOG: ${RUST_LOG}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
       L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}
-      L1_CONTRACT_ADDR: ${L1_CONTRACT_ADDR:?L1_CONTRACT_ADDR is required in .env}
-      L1_CONTRACT_DEPLOY_BLOCK: ${L1_CONTRACT_DEPLOY_BLOCK}
+      L1_ROLLUP_ADDR: ${L1_ROLLUP_ADDR:?L1_ROLLUP_ADDR is required in .env}
+      FLUENT_L1_DEPLOY_BLOCK: ${FLUENT_L1_DEPLOY_BLOCK}
       NITRO_VERIFIER_ADDR: ${NITRO_VERIFIER_ADDR:?NITRO_VERIFIER_ADDR is required in .env}
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
     # TCP-only liveness probe. This verifies only that proxy has bound the
@@ -128,10 +128,9 @@ services:
       FLUENT_HTTP_TIMEOUT_SECS: ${FLUENT_HTTP_TIMEOUT_SECS}
       FLUENT_API_KEY: ${API_KEY:?API_KEY is required in .env}
       L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}
-      L1_CONTRACT_ADDR: ${L1_CONTRACT_ADDR:?L1_CONTRACT_ADDR is required in .env}
+      L1_ROLLUP_ADDR: ${L1_ROLLUP_ADDR:?L1_ROLLUP_ADDR is required in .env}
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
       NITRO_VERIFIER_ADDR: ${NITRO_VERIFIER_ADDR:?NITRO_VERIFIER_ADDR is required in .env}
-      L1_START_BLOCK: ${L1_START_BLOCK}
       FLUENT_START_BATCH_ID: ${FLUENT_START_BATCH_ID}
       FLUENT_L1_DEPLOY_BLOCK: ${FLUENT_L1_DEPLOY_BLOCK}
     logging:

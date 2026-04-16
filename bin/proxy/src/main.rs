@@ -234,7 +234,7 @@ fn require_l1(state: &AppState) -> Result<&L1State, HandlerError> {
     state
         .l1
         .as_ref()
-        .ok_or_else(|| internal("L1 not configured (set L1_RPC_URL, L1_CONTRACT_ADDR)"))
+        .ok_or_else(|| internal("L1 not configured (set L1_RPC_URL, L1_ROLLUP_ADDR)"))
 }
 
 /// Generates KZG commitments and proofs on the host using Fiat-Shamir.
@@ -645,14 +645,14 @@ async fn main() -> eyre::Result<()> {
     let chain = ChainContext { block_execution_strategy_factory, chain_spec };
 
     // ── L1 context (for batch metadata lookup in challenge endpoints) ────
-    let l1 = match (env::var("L1_RPC_URL"), env::var("L1_CONTRACT_ADDR")) {
+    let l1 = match (env::var("L1_RPC_URL"), env::var("L1_ROLLUP_ADDR")) {
         (Ok(l1_rpc), Ok(l1_addr)) => {
             let l1_url = Url::parse(&l1_rpc).map_err(|e| eyre::eyre!("Invalid L1_RPC_URL: {e}"))?;
             let l1_provider: RootProvider = create_provider(l1_url);
             let contract_addr: Address =
-                l1_addr.parse().map_err(|e| eyre::eyre!("Invalid L1_CONTRACT_ADDR: {e}"))?;
+                l1_addr.parse().map_err(|e| eyre::eyre!("Invalid L1_ROLLUP_ADDR: {e}"))?;
             let deploy_block: u64 =
-                env::var("L1_CONTRACT_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                env::var("FLUENT_L1_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
             info!(
                 l1_rpc = %l1_rpc,
@@ -664,7 +664,7 @@ async fn main() -> eyre::Result<()> {
             Some(L1State { l1_provider, contract_addr, deploy_block })
         }
         _ => {
-            info!("L1_RPC_URL/L1_CONTRACT_ADDR not set — challenge endpoints disabled");
+            info!("L1_RPC_URL/L1_ROLLUP_ADDR not set — challenge endpoints disabled");
             None
         }
     };

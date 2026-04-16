@@ -98,7 +98,7 @@ proxy --eif_path /path/to/enclave.eif
 | `RPC_URL` | `http://localhost:8545` | L2 RPC endpoint URL used to fetch block data |
 | `LISTEN_ADDR` | `0.0.0.0:8080` | TCP address to bind |
 | `L1_RPC_URL` | *(unset)* | L1 RPC endpoint for blob fetching. Required for `/sign-batch-root` and challenge endpoints |
-| `L1_CONTRACT_ADDR` | *(unset)* | L1 rollup contract address. Required with `L1_RPC_URL` |
+| `L1_ROLLUP_ADDR` | *(unset)* | L1 rollup contract address. Required with `L1_RPC_URL` |
 | `L1_BEACON_URL` | *(unset)* | Beacon API endpoint for blob sidecars. Required with `L1_RPC_URL` |
 | `BEACON_GENESIS_TIMESTAMP` | `1606824023` | Beacon chain genesis timestamp (mainnet default) |
 | `AWS_SESSION_TOKEN` | *(unset)* | Temporary session token (required when using STS / assumed roles) |
@@ -157,7 +157,7 @@ If `Content-Encoding: zstd` is present, the proxy decompresses first. Otherwise 
 
 ### POST /sign-batch-root
 
-Fetches blobs from L1 + Beacon API using `batch_index`, then sends them to the enclave for batch root signing. Requires `--eif_path` and L1 context (`L1_RPC_URL`, `L1_CONTRACT_ADDR`, `L1_BEACON_URL`).
+Fetches blobs from L1 + Beacon API using `batch_index`, then sends them to the enclave for batch root signing. Requires `--eif_path` and L1 context (`L1_RPC_URL`, `L1_ROLLUP_ADDR`, `L1_BEACON_URL`).
 
 **Request**
 ```json
@@ -181,7 +181,7 @@ Fetches blobs from L1 + Beacon API using `batch_index`, then sends them to the e
 
 ### POST /sign-batch-root-from-responses
 
-Signs a batch root from pre-signed block execution responses. Fetches blobs from L1 + Beacon API using `batch_index`. Requires `--eif_path` and L1 context (`L1_RPC_URL`, `L1_CONTRACT_ADDR`, `L1_BEACON_URL`).
+Signs a batch root from pre-signed block execution responses. Fetches blobs from L1 + Beacon API using `batch_index`. Requires `--eif_path` and L1 context (`L1_RPC_URL`, `L1_ROLLUP_ADDR`, `L1_BEACON_URL`).
 
 **Request**
 ```json
@@ -352,7 +352,7 @@ Without the `prove-key-attestation` feature, returns `"status": "proving_disable
 
 ### POST /mock/sp1/request
 
-Executes the SP1 zkVM program locally on the CPU without submitting to the prover network. Takes the same payload as `/challenge/sp1/request`. Requires `SP1_ELF_PATH` and L1 context (`L1_RPC_URL`, `L1_CONTRACT_ADDR`, `L1_BEACON_URL`).
+Executes the SP1 zkVM program locally on the CPU without submitting to the prover network. Takes the same payload as `/challenge/sp1/request`. Requires `SP1_ELF_PATH` and L1 context (`L1_RPC_URL`, `L1_ROLLUP_ADDR`, `L1_BEACON_URL`).
 
 The endpoint performs the full pipeline: fetches blobs from L1 + Beacon, builds `ClientInput` from L2 RPC, prepares KZG witnesses, and runs the SP1 guest program via CPU executor. Returns synchronously whether execution succeeded or failed.
 
@@ -470,7 +470,7 @@ The SP1 backend uses the [Succinct prover network](https://docs.succinct.xyz/gen
 SP1_ELF_PATH=./guest.elf \
 SP1_PRIVATE_KEY=0x… \
 L1_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/… \
-L1_CONTRACT_ADDR=0x… \
+L1_ROLLUP_ADDR=0x… \
 L1_BEACON_URL=https://beacon.example.com \
   proxy --eif_path enclave.eif
 ```

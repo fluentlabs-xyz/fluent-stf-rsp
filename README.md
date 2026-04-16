@@ -41,7 +41,7 @@ the host's `/dev/vsock` device.
 cp .env.example .env
 chmod 600 .env
 # edit .env — fill in API_KEY, L1_SUBMITTER_KEY, RPC_URL, L1_RPC_URL,
-# L1_CONTRACT_ADDR, NITRO_VERIFIER_ADDR, etc.
+# L1_ROLLUP_ADDR, NITRO_VERIFIER_ADDR, etc.
 
 # Build reproducible ELFs + both docker images
 make compose-build NETWORK=mainnet

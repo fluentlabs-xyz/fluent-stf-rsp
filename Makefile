@@ -6,6 +6,9 @@
 CLIENT_DIR   := bin/client
 PROXY_DIR    := bin/proxy
 
+# ─── Docker Compose (v2 plugin or standalone) ─────────────────────────────────
+DOCKER_COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
+
 # ─── Network (mainnet | testnet | devnet) ────────────────────────────────────
 NETWORK      ?= mainnet
 ifeq ($(filter $(NETWORK),mainnet testnet devnet),)
@@ -168,16 +171,16 @@ help:
 ## developer machines — critical because the enclave hardcodes EXPECTED_PCR0
 ## and a non-reproducible build will cause attestation verification to fail.
 compose-build: build-client-docker build-nitro-validator-docker
-	NETWORK=$(NETWORK) docker compose build
+	NETWORK=$(NETWORK) $(DOCKER_COMPOSE) build
 
 ## Start the compose stack in the background.
 compose-up:
-	NETWORK=$(NETWORK) docker compose up -d
+	NETWORK=$(NETWORK) $(DOCKER_COMPOSE) up -d
 
 ## Stop and remove the compose stack (volumes preserved).
 compose-down:
-	docker compose down
+	$(DOCKER_COMPOSE) down
 
 ## Tail compose logs.
 compose-logs:
-	docker compose logs -f --tail=200
+	$(DOCKER_COMPOSE) logs -f --tail=200

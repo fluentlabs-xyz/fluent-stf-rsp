@@ -26,12 +26,11 @@
 //! | `FLUENT_DB_PATH` | `./witness_orchestrator.db` | SQLite DB for crash recovery |
 //! | `FLUENT_HTTP_TIMEOUT_SECS` | `120` | HTTP POST timeout (seconds) |
 //! | `L1_RPC_URL` | — | L1 Ethereum RPC URL |
-//! | `L1_CONTRACT_ADDR` | — | Rollup contract address on L1 |
+//! | `L1_ROLLUP_ADDR` | — | Rollup contract address on L1 |
 //! | `L1_SUBMITTER_KEY` | — | Private key for signing `preconfirmBatch` txs |
 //! | `NITRO_VERIFIER_ADDR` | — | NitroVerifier contract address on L1 |
-//! | `L1_START_BLOCK` | `0` | L1 block to start listening for events |
 //! | `FLUENT_START_BATCH_ID` | — | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
-//! | `FLUENT_L1_DEPLOY_BLOCK` | `0` | L1 block where Rollup contract was deployed |
+//! | `FLUENT_L1_DEPLOY_BLOCK` | `0` | L1 block where Rollup contract was deployed (lower bound for event scans) |
 //! | `FLUENT_API_KEY` | — | API key forwarded to the proxy |
 //! | `FLUENT_PRUNE_FULL` | `false` | If `true`, prune MDBX/static-files using the same defaults as `reth --full` (sender_recovery=Full, receipts/account_history/storage_history distance=10064 blocks, bodies_history=Before(Paris)) |
 
@@ -110,17 +109,15 @@ async fn main() {
 
     // L1 configuration
     let l1_rpc_url = std::env::var("L1_RPC_URL").expect("L1_RPC_URL is required");
-    let l1_contract_addr: Address = std::env::var("L1_CONTRACT_ADDR")
-        .expect("L1_CONTRACT_ADDR is required")
+    let L1_ROLLUP_ADDR: Address = std::env::var("L1_ROLLUP_ADDR")
+        .expect("L1_ROLLUP_ADDR is required")
         .parse()
-        .expect("Invalid L1_CONTRACT_ADDR");
+        .expect("Invalid L1_ROLLUP_ADDR");
     let l1_submitter_key = std::env::var("L1_SUBMITTER_KEY").expect("L1_SUBMITTER_KEY is required");
     let nitro_verifier_addr: Address = std::env::var("NITRO_VERIFIER_ADDR")
         .expect("NITRO_VERIFIER_ADDR is required")
         .parse()
         .expect("Invalid NITRO_VERIFIER_ADDR");
-    let l1_start_block: u64 =
-        std::env::var("L1_START_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let start_batch_id: Option<u64> =
         std::env::var("FLUENT_START_BATCH_ID").ok().and_then(|s| s.parse().ok());
     let l1_deploy_block: u64 =
@@ -150,7 +147,7 @@ async fn main() {
                 let (l2_from_block, l1_event_block, _num_blocks) =
                     l1_rollup_client::resolve_l2_start_checkpoint(
                         &l1_read_provider,
-                        l1_contract_addr,
+                        L1_ROLLUP_ADDR,
                         batch_id,
                         l1_deploy_block,
                     )
@@ -182,9 +179,9 @@ async fn main() {
         }
 
         let lfb = if let Some(ckpt) = db_startup.get_l1_checkpoint() {
-            (ckpt + 1).max(l1_start_block)
+            (ckpt + 1).max(l1_deploy_block)
         } else {
-            l1_start_block
+            l1_deploy_block
         };
 
         drop(db_startup);
@@ -199,9 +196,8 @@ async fn main() {
         %proxy_url,
         ?db_path,
         http_timeout_secs,
-        %l1_contract_addr,
+        %L1_ROLLUP_ADDR,
         %nitro_verifier_addr,
-        l1_start_block,
         listener_from_block,
         start_batch_id,
         l1_deploy_block,
@@ -249,7 +245,7 @@ async fn main() {
         tasks.spawn(async move {
             let r = l1_listener::run(
                 l1_read_provider,
-                l1_contract_addr,
+                L1_ROLLUP_ADDR,
                 listener_from_block,
                 l1_tx,
                 shutdown,
@@ -335,7 +331,7 @@ async fn main() {
         proxy_url,
         db_path,
         http_client,
-        l1_contract_addr,
+        L1_ROLLUP_ADDR,
         nitro_verifier_addr,
         l1_provider: l1_write_provider,
         api_key,
