@@ -137,10 +137,7 @@ async fn main() {
 
         if let Some(batch_id) = start_batch_id {
             if db_startup.get_checkpoint() == 0 {
-                info!(
-                    batch_id,
-                    "L1_START_BATCH_ID set — resolving L2 start checkpoint from L1"
-                );
+                info!(batch_id, "L1_START_BATCH_ID set — resolving L2 start checkpoint from L1");
                 let (l2_from_block, l1_event_block, _num_blocks) =
                     l1_rollup_client::resolve_l2_start_checkpoint(
                         &l1_read_provider,

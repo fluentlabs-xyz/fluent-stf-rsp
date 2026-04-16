@@ -147,7 +147,7 @@ op-revm = { version = "9.0.0", default-features = false }
 # --- alloy ---
 alloy-chains = { version = "0.2.5", default-features = false }
 alloy-evm = { version = "0.27.2", default-features = false }
-alloy-primitives = { version = "1.5.7", default-features = false, features = ["sha3-keccak", "map-foldhash"] }
+alloy-primitives = { version = "1.5.7", default-features = false, features = ["sha3-keccak", "map-foldhash", "getrandom"] }
 alloy-provider = { version = "1.8.1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
 alloy-rpc-types = { version = "1.8.1", default-features = false, features = ["eth"] }
 alloy-rpc-types-debug = { version = "1.8.1", default-features = false }

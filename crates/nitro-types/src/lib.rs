@@ -45,10 +45,7 @@ pub enum EnclaveIncoming {
 /// Response body when `/sign-batch-root` returns 409: the enclave key was
 /// rotated since these responses were signed and they must be re-executed.
 ///
-/// Wire shape exchanged between proxy and orchestrator. The enclave-local
-/// variant [`EnclaveResponse::InvalidSignatures`] carries only
-/// `invalid_blocks`; the proxy injects `enclave_address` when assembling
-/// the HTTP response.
+/// Wire shape exchanged between proxy and orchestrator over HTTP/JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvalidSignaturesResponse {
     pub invalid_blocks: Vec<u64>,
@@ -95,6 +92,6 @@ pub enum EnclaveResponse {
     NotInitialized,
     ExecutionResult(EthExecutionResponse),
     SubmitBatchResult(SubmitBatchResponse),
-    InvalidSignatures { invalid_blocks: Vec<u64> },
+    InvalidSignatures { invalid_blocks: Vec<u64>, enclave_address: Address },
     Error(String),
 }

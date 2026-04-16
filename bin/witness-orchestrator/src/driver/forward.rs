@@ -235,15 +235,13 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
                 if block_number % 1000 == 0 {
                     info!(
                         block_number,
-                        witness_from_block,
-                        "Catch-up: committed block (no witness)"
+                        witness_from_block, "Catch-up: committed block (no witness)"
                     );
                 }
                 if block_number + 1 == witness_from_block {
                     info!(
                         block_number,
-                        witness_from_block,
-                        "Catch-up complete — switching to full witness mode"
+                        witness_from_block, "Catch-up complete — switching to full witness mode"
                     );
                 }
 

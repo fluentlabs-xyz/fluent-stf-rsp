@@ -18,16 +18,19 @@
 //!
 //! All endpoints are protected by `x-api-key` header.
 
+mod attestation;
+mod challenge;
+mod db;
 mod enclave;
 mod types;
-
-mod attestation;
 
 use crate::{
     enclave::ensure_initialized,
     types::{NitroConfig, Sp1ProofResponse},
 };
-use nitro_types::{EthExecutionResponse, InvalidSignaturesResponse, SignBatchRootRequest};
+use nitro_types::{
+    EnclaveResponse, EthExecutionResponse, InvalidSignaturesResponse, SignBatchRootRequest,
+};
 
 use std::{env, sync::Arc};
 use tokio::sync::OnceCell;
@@ -60,7 +63,7 @@ use rsp_provider::create_provider;
 
 use sp1_sdk::{
     network::{prover::NetworkProver, NetworkMode},
-    Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey, SP1ProvingKey, SP1Stdin,
+    Elf, HashableKey, Prover, ProverClient, ProvingKey, SP1ProvingKey, SP1Stdin,
 };
 
 use c_kzg::{Blob as CKzgBlob, KzgSettings};
@@ -368,18 +371,13 @@ async fn sign_batch_root(
             .map_err(|e| internal(format!("Batch submission failed: {e}")))?;
 
     match outcome {
-        enclave::SubmitBatchOutcome::Success(resp) => {
-            Ok(Json(serde_json::to_value(resp).unwrap()).into_response())
-        }
-        enclave::SubmitBatchOutcome::InvalidSignatures { invalid_blocks } => {
-            let address = enclave::enclave_address()
-                .ok_or_else(|| internal("Enclave address not available"))?;
-            Ok((
-                StatusCode::CONFLICT,
-                Json(InvalidSignaturesResponse { invalid_blocks, enclave_address: address }),
-            )
-                .into_response())
-        }
+        EnclaveResponse::SubmitBatchResult(resp) => Ok(Json(resp).into_response()),
+        EnclaveResponse::InvalidSignatures { invalid_blocks, enclave_address } => Ok((
+            StatusCode::CONFLICT,
+            Json(InvalidSignaturesResponse { invalid_blocks, enclave_address }),
+        )
+            .into_response()),
+        other => Err(internal(format!("Unexpected enclave response: {other:?}"))),
     }
 }
 
@@ -414,70 +412,68 @@ async fn challenge_sp1_request(
         .map_err(|e| internal(format!("Failed to serialize blob input: {e}")))?;
     stdin.write_slice(&serialized_blobs);
 
-    info!(block_number, "Submitting async SP1 Groth16 proof request");
+    let challenge_id = B256::random();
 
-    let request_id: B256 = sp1
-        .client
-        .prove(sp1.pk.as_ref(), stdin)
-        .groth16()
-        .max_price_per_pgu(500_000_000u64)
-        .request()
-        .await
-        .map_err(|e| internal(format!("Failed to submit proof request: {e}")))?;
+    if let Some(db) = db::db() {
+        db.create_challenge(challenge_id, block_number);
+    }
 
-    info!(block_number, request_id = %hex::encode(request_id), "SP1 proof request submitted");
+    info!(
+        block_number,
+        challenge_id = %hex::encode(challenge_id),
+        "Challenge proof request accepted, starting background retry loop"
+    );
 
-    Ok(Json(Sp1RequestResponse { request_id }))
+    let client = sp1.client.clone();
+    let pk = sp1.pk.clone();
+    tokio::spawn(challenge::run_challenge_proof(client, pk, stdin, challenge_id, block_number));
+
+    Ok(Json(Sp1RequestResponse { request_id: challenge_id }))
 }
 
 /// `POST /challenge/sp1/status`
 /// Body: `{ request_id }`
 /// Returns: `Sp1ProofResponse` (200) | 202 Accepted (pending) | 404 (not found)
-async fn challenge_sp1_status(
-    State(state): State<AppState>,
-    Json(req): Json<Sp1StatusRequest>,
-) -> impl IntoResponse {
-    let sp1 = match require_sp1(&state).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
+async fn challenge_sp1_status(Json(req): Json<Sp1StatusRequest>) -> impl IntoResponse {
+    let challenge_id = req.request_id;
 
-    let (status, maybe_proof) = match sp1.client.get_proof_status(req.request_id).await {
-        Ok(r) => r,
-        Err(e) => {
+    let row = match db::db().and_then(|db| db.get_challenge(challenge_id)) {
+        Some(r) => r,
+        None => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: format!(
-                        "Proof not found for request_id {}: {e}",
-                        hex::encode(req.request_id)
-                    ),
+                    error: format!("Challenge not found: {}", hex::encode(challenge_id)),
                 }),
             )
                 .into_response();
         }
     };
 
-    let proof = match maybe_proof {
-        None => {
-            info!(request_id = %hex::encode(req.request_id), ?status, "SP1 proof still pending");
-            return StatusCode::ACCEPTED.into_response();
+    match row.status.as_str() {
+        "completed" => {
+            let proof_bytes = row.proof_bytes.unwrap_or_default();
+            let public_values = row.public_values.unwrap_or_default();
+            let vk_hash = row
+                .vk_hash
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .map(FixedBytes::from)
+                .unwrap_or_default();
+
+            info!(challenge_id = %hex::encode(challenge_id), "Challenge proof ready");
+
+            (StatusCode::OK, Json(Sp1ProofResponse { vk_hash, public_values, proof_bytes }))
+                .into_response()
         }
-        Some(p) => p,
-    };
-
-    info!(request_id = %hex::encode(req.request_id), "SP1 proof ready");
-
-    let public_values = proof.public_values.as_slice().to_vec();
-
-    let proof_bytes = match bincode::serialize(&proof.proof) {
-        Ok(b) => b,
-        Err(e) => return internal(format!("Failed to serialize proof: {e}")).into_response(),
-    };
-
-    let vk_hash = FixedBytes::from(sp1.pk.verifying_key().hash_bytes());
-
-    (StatusCode::OK, Json(Sp1ProofResponse { vk_hash, public_values, proof_bytes })).into_response()
+        "failed" => {
+            let error = row.error.unwrap_or_else(|| "Unknown error".into());
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error })).into_response()
+        }
+        _ => {
+            info!(challenge_id = %hex::encode(challenge_id), "Challenge proof still pending");
+            StatusCode::ACCEPTED.into_response()
+        }
+    }
 }
 
 // ===========================================================================
@@ -553,6 +549,9 @@ async fn mock_sp1_request(
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
+
+    let db_path = std::env::var("PROXY_DB_PATH").unwrap_or_else(|_| "./proxy.db".into());
+    db::init(&db_path)?;
 
     // ── Nitro enclave ────────────────────────────────────────────────────
     let eif_path = std::env::args().skip_while(|a| a != "--eif_path").nth(1);

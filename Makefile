@@ -97,10 +97,9 @@ build-enclave:
 run-enclave:
 	nitro-cli run-enclave \
 		--eif-path $(EIF_PATH) \
-		--cpu-count 2 \
-		--memory 512 \
+		--cpu-count 4 \
+		--memory 4096 \
 		--enclave-cid 10 \
-		--debug-mode
 
 # ─── Proxy ────────────────────────────────────────────────────────────────────
 

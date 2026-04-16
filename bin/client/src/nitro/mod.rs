@@ -18,7 +18,7 @@ use k256::ecdsa::{
 use k256::elliptic_curve::scalar::IsHigh;
 use k256::SecretKey;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use c_kzg::{Blob, KzgSettings, BYTES_PER_BLOB};
 
 use fluent_stf_primitives::{FLUENT_CHAIN_ID, NITRO_VERIFIER_ADDRESS};
@@ -413,6 +413,22 @@ pub(crate) fn handle_submit_batch(
     Ok(sign_batch(batch_root, versioned_hashes, signing_key))
 }
 
+fn submit_batch_to_response(
+    result: Result<SubmitBatchResponse, SubmitBatchError>,
+    public_key: &[u8],
+) -> EnclaveResponse {
+    match result {
+        Ok(r) => EnclaveResponse::SubmitBatchResult(r),
+        Err(SubmitBatchError::InvalidSignatures(invalid_blocks)) => {
+            EnclaveResponse::InvalidSignatures {
+                invalid_blocks,
+                enclave_address: pubkey_to_eth_address(public_key),
+            }
+        }
+        Err(SubmitBatchError::Other(e)) => EnclaveResponse::Error(format!("{e:#}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Block execution — shared core
 // ---------------------------------------------------------------------------
@@ -674,22 +690,17 @@ impl Enclave {
                         continue;
                     };
 
-                    let resp = match handle_submit_batch(
-                        from,
-                        to,
-                        &responses,
-                        &blobs,
-                        &id.signing_key,
-                        &block_store,
-                    ) {
-                        Ok(result) => EnclaveResponse::SubmitBatchResult(result),
-                        Err(SubmitBatchError::InvalidSignatures(blocks)) => {
-                            EnclaveResponse::InvalidSignatures { invalid_blocks: blocks }
-                        }
-                        Err(SubmitBatchError::Other(e)) => {
-                            EnclaveResponse::Error(format!("{e:#}"))
-                        }
-                    };
+                    let resp = submit_batch_to_response(
+                        handle_submit_batch(
+                            from,
+                            to,
+                            &responses,
+                            &blobs,
+                            &id.signing_key,
+                            &block_store,
+                        ),
+                        &id.public_key,
+                    );
                     send_response(&mut channel, &resp);
                 }
 
@@ -727,6 +738,15 @@ fn signing_key_from_bytes(bytes: &[u8]) -> anyhow::Result<SigningKey> {
 
 fn encode_public_key(key: &SigningKey) -> Vec<u8> {
     key.verifying_key().to_encoded_point(false).as_bytes().to_vec()
+}
+
+/// Derive Ethereum address from uncompressed secp256k1 public key.
+fn pubkey_to_eth_address(public_key: &[u8]) -> Address {
+    if public_key.len() < 2 {
+        return Address::ZERO;
+    }
+    let hash = Keccak256::digest(&public_key[1..]);
+    Address::from_slice(&hash[12..32])
 }
 
 fn get_nsm_entropy() -> anyhow::Result<Vec<u8>> {

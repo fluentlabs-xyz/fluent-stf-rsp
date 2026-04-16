@@ -52,7 +52,8 @@ reth-ethereum-primitives.workspace = true
 
 # sp1
 sp1-sdk = {workspace = true, features =["network"]}
-
+tonic = "0.12"
+rusqlite.workspace = true
 
 aws-config = { version = "1"}
 aws-credential-types = "1"

@@ -68,12 +68,7 @@ mod tests {
 
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
 
-        // Try network-specific ELF, fall back to generic name.
-        let elf_path = ["testnet", "mainnet", "devnet"]
-            .iter()
-            .map(|net| format!("{manifest_dir}/../../nitro-validator-{net}.elf"))
-            .find(|p| std::path::Path::new(p).exists())
-            .expect("no nitro-validator ELF found — build one first");
+        let elf_path = format!("{manifest_dir}/../../nitro-validator-testnet.elf");
 
         let elf_bytes = std::fs::read(&elf_path).expect("failed to read ELF");
 

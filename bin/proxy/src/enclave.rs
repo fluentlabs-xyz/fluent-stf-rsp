@@ -1,24 +1,15 @@
-use std::{
-    fs,
-    io::{Read, Write},
-    path::Path,
-};
+use std::io::{Read, Write};
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::ProvideCredentials;
 use eyre::WrapErr;
-use revm_primitives::hex;
 use tokio::task;
 use tracing::info;
 
 use vsock::{VsockAddr, VsockStream};
 
-use nitro_types::{
-    AwsCredentials, EnclaveIncoming, EnclaveResponse, EthExecutionResponse, SubmitBatchResponse,
-};
+use nitro_types::{AwsCredentials, EnclaveIncoming, EnclaveResponse, EthExecutionResponse};
 use rsp_client_executor::io::EthClientExecutorInput;
-
-use alloy_primitives::Address;
 
 use crate::types::NitroConfig;
 
@@ -55,8 +46,9 @@ async fn do_initialize(config: NitroConfig) -> eyre::Result<()> {
     let (public_key, attestation, is_new_key) = handshake_with_enclave(&config).await?;
 
     if is_new_key {
-        save_artifacts(&public_key, &attestation)?;
-        crate::attestation::delete_request_id();
+        if let Some(db) = crate::db::db() {
+            db.delete_attestation_request_id();
+        }
 
         info!("New enclave key — starting attestation proving");
         match crate::attestation::AttestationConfig::from_env().await {
@@ -70,9 +62,7 @@ async fn do_initialize(config: NitroConfig) -> eyre::Result<()> {
             }
             Err(e) => tracing::error!("Attestation config unavailable: {e}"),
         }
-    } else if crate::attestation::load_request_id().is_some() {
-        save_artifacts(&public_key, &attestation)?;
-
+    } else if crate::db::db().and_then(|db| db.load_attestation_request_id()).is_some() {
         info!("Found pending attestation request — resuming");
         match crate::attestation::AttestationConfig::from_env().await {
             Ok(att_config) => {
@@ -105,12 +95,6 @@ pub(crate) async fn execute_block(
     execute_block_inner(msg, &config).await
 }
 
-/// Result of batch submission.
-pub(crate) enum SubmitBatchOutcome {
-    Success(SubmitBatchResponse),
-    InvalidSignatures { invalid_blocks: Vec<u64> },
-}
-
 /// Batch signing.
 pub(crate) async fn submit_batch(
     from: u64,
@@ -118,7 +102,7 @@ pub(crate) async fn submit_batch(
     responses: Vec<EthExecutionResponse>,
     blobs: Vec<Vec<u8>>,
     config: NitroConfig,
-) -> eyre::Result<SubmitBatchOutcome> {
+) -> eyre::Result<EnclaveResponse> {
     let msg = EnclaveIncoming::SubmitBatch { from, to, responses, blobs };
     submit_batch_inner(msg, &config).await
 }
@@ -157,23 +141,19 @@ async fn execute_block_inner(
 async fn submit_batch_inner(
     msg: EnclaveIncoming,
     config: &NitroConfig,
-) -> eyre::Result<SubmitBatchOutcome> {
+) -> eyre::Result<EnclaveResponse> {
     let resp = send_to_enclave(config.enclave_cid, config.enclave_port, &msg).await?;
 
     match resp {
-        EnclaveResponse::SubmitBatchResult(r) => Ok(SubmitBatchOutcome::Success(r)),
-        EnclaveResponse::InvalidSignatures { invalid_blocks } => {
-            Ok(SubmitBatchOutcome::InvalidSignatures { invalid_blocks })
-        }
+        r @ EnclaveResponse::SubmitBatchResult(_) => Ok(r),
+        r @ EnclaveResponse::InvalidSignatures { .. } => Ok(r),
         EnclaveResponse::NotInitialized => {
             info!("Enclave not initialised — triggering key generation");
             ensure_initialized(config).await?;
             let retry = send_to_enclave(config.enclave_cid, config.enclave_port, &msg).await?;
             match retry {
-                EnclaveResponse::SubmitBatchResult(r) => Ok(SubmitBatchOutcome::Success(r)),
-                EnclaveResponse::InvalidSignatures { invalid_blocks } => {
-                    Ok(SubmitBatchOutcome::InvalidSignatures { invalid_blocks })
-                }
+                r @ EnclaveResponse::SubmitBatchResult(_) => Ok(r),
+                r @ EnclaveResponse::InvalidSignatures { .. } => Ok(r),
                 EnclaveResponse::Error(e) => Err(eyre::eyre!("Enclave error on retry: {e}")),
                 other => Err(eyre::eyre!("Unexpected response on retry: {other:?}")),
             }
@@ -233,27 +213,6 @@ async fn resolve_aws_credentials() -> eyre::Result<AwsCredentials> {
 // Storage
 // ---------------------------------------------------------------------------
 
-pub(crate) fn storage_path(var: &str, default: &str) -> String {
-    std::env::var(var).unwrap_or_else(|_| default.to_string())
-}
-
-fn attestation_path() -> String {
-    storage_path("ATTESTATION_STORAGE", "./attestation.bin")
-}
-
-fn public_key_path() -> String {
-    storage_path("PUBLIC_KEY_STORAGE", "./public_key.hex")
-}
-
-fn save_artifacts(public_key: &[u8], attestation: &[u8]) -> eyre::Result<()> {
-    let pk_hex = hex::encode(public_key);
-    write_file(&public_key_path(), pk_hex.as_bytes())?;
-    info!("Public key: {pk_hex}");
-    write_file(&attestation_path(), attestation)?;
-    info!("Attestation document saved");
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // VSOCK communication
 // ---------------------------------------------------------------------------
@@ -301,26 +260,4 @@ fn read_frame(stream: &mut VsockStream) -> eyre::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).wrap_err("Failed to read payload")?;
     Ok(buf)
-}
-
-// ---------------------------------------------------------------------------
-// File helpers
-// ---------------------------------------------------------------------------
-
-fn write_file(path: &str, data: &[u8]) -> eyre::Result<()> {
-    if let Some(parent) = Path::new(path).parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, data).wrap_err_with(|| format!("Failed to write {path}"))
-}
-
-// ---------------------------------------------------------------------------
-// Enclave address derivation
-// ---------------------------------------------------------------------------
-
-/// Returns the current enclave's Ethereum address derived from its public key.
-pub(crate) fn enclave_address() -> Option<Address> {
-    let pk_hex = std::fs::read_to_string(public_key_path()).ok()?;
-    let pk_bytes = hex::decode(pk_hex.trim()).ok()?;
-    crate::attestation::pubkey_to_address(&pk_bytes).ok()
 }
