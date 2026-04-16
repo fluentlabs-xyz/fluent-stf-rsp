@@ -33,7 +33,7 @@ RUN cargo chef cook --profile release --recipe-path recipe.json
 
 # Install SP1
 RUN curl -L https://sp1.succinct.xyz | bash && \
-    ~/.sp1/bin/sp1up -v v5.0.5 && \
+    ~/.sp1/bin/sp1up -v v6.1.0 && \
     ~/.sp1/bin/cargo-prove prove --version
 
 ###############################################################################
@@ -49,7 +49,7 @@ COPY . .
 RUN cargo build --profile release --locked \
     -p proxy \
     --no-default-features \
-    --features "${NETWORK},prove-key-attestation"
+    --features "${NETWORK}"
 
 RUN cp /app/target/release/proxy /app/proxy
 

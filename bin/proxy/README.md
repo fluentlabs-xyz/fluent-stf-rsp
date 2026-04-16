@@ -18,11 +18,6 @@ An HTTP proxy that sits between callers and execution backends, managing the Mul
 | `POST /challenge/sp1/request` | SP1 zkVM (network) | `request_id` for async Groth16 proof |
 | `POST /challenge/sp1/status` | SP1 zkVM (network) | Proof result by `request_id` |
 
-### Attestation retry
-| Endpoint | Backend | Output |
-|---|---|---|
-| `POST /retry-attestation` | SP1 zkVM (network) + L1 | Retry attestation proof or check status |
-
 ### Mock endpoints (testing, local SP1 execution)
 | Endpoint | Backend | Output |
 |---|---|---|
@@ -306,50 +301,6 @@ ISP1Verifier(verifier).verifyProof(
 
 ---
 
-### POST /retry-attestation
-
-Manually retry the attestation proof flow. Reads the enclave's public key and attestation document from disk. Requires `prove-key-attestation` feature and related env vars (`NITRO_VALIDATOR_ELF_PATH`, `NITRO_VERIFIER_ADDR`, `L1_SUBMITTER_KEY`).
-
-**Mode 1 — Submit new proof** (no `request_id` in body):
-
-```json
-{}
-```
-
-Submits a new SP1 proof request, saves the `request_id` to disk, and returns immediately. Proof wait + L1 submission happens in background.
-
-**Response** `200 OK`
-```json
-{
-  "request_id": "0x…",
-  "status": "proof_requested",
-  "public_key": "04…"
-}
-```
-
-**Mode 2 — Check existing proof** (with `request_id`):
-
-```json
-{
-  "request_id": "0x…"
-}
-```
-
-Checks SP1 for proof status. If the proof is ready, submits to L1 and returns `"proof_submitted_to_l1"`. If still pending, returns the current status.
-
-**Response** `200 OK`
-```json
-{
-  "request_id": "0x…",
-  "status": "proof_submitted_to_l1",
-  "public_key": "04…"
-}
-```
-
-Without the `prove-key-attestation` feature, returns `"status": "proving_disabled"`.
-
----
-
 ### POST /mock/sp1/request
 
 Executes the SP1 zkVM program locally on the CPU without submitting to the prover network. Takes the same payload as `/challenge/sp1/request`. Requires `SP1_ELF_PATH` and L1 context (`L1_RPC_URL`, `L1_ROLLUP_ADDR`, `L1_BEACON_URL`).
@@ -385,13 +336,15 @@ The endpoint performs the full pipeline: fetches blobs from L1 + Beacon, builds 
 
 ## Enclave lifecycle
 
-On startup the proxy calls `ensure_initialized`, which communicates with the enclave over VSOCK to set up the signing key:
+On startup the proxy calls `ensure_initialized`, which communicates with the enclave over VSOCK to set up the signing key and handle attestation proving:
 
-| Running enclave | Key exists? | Action |
+| Enclave state | Disk state | Action |
 |---|---|---|
-| None | — | Start enclave, initialise signing key |
-| Yes | No | Generate new key via KMS, store attestation |
-| Yes | Yes | Load existing encrypted key, decrypt via KMS |
+| New key generated | — | Save artifacts, delete stale `request_id`, submit SP1 proof → L1 |
+| Already initialized | `attestation_request_id.hex` exists | Resume pending SP1 proof → L1 |
+| Already initialized | No `request_id` | Nothing to do (already attested) |
+
+Attestation proving blocks startup — the HTTP server won't start until attestation completes. If attestation fails, it is logged and the proxy starts anyway. On next restart, a pending `request_id` will be resumed.
 
 ### Nitro configuration
 
@@ -455,8 +408,9 @@ src/
 ├── types.rs          # Shared request/response structs and configuration types
 ├── enclave.rs        # Nitro enclave VSOCK communication and key management
 ├── blob.rs           # EIP-4844 blob fetching from L1 contract + Beacon API
-└── attestation/      # Attestation proving via SP1 + L1 submission (prove-key-attestation feature)
-    ├── mod.rs        # SP1 proof request/wait/submit, request-id persistence
+└── attestation/      # Attestation proving via SP1 + L1 submission
+    ├── mod.rs        # Tests and root cert embedding
+    ├── network.rs    # SP1 proof request/wait/submit, request-id persistence, L1 submission
     └── prepare.rs    # Parse attestation document into SP1 guest input
 ```
 

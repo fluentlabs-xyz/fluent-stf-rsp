@@ -80,8 +80,7 @@ fn save_request_id(id: B256) -> Result<()> {
     std::fs::write(&path, hex::encode(id)).map_err(|e| eyre!("Failed to write request_id: {e}"))
 }
 
-#[cfg(feature = "prove-key-attestation")]
-fn load_request_id() -> Option<B256> {
+pub(crate) fn load_request_id() -> Option<B256> {
     let path = request_id_path();
     let hex_str = std::fs::read_to_string(&path).ok()?;
     let bytes = hex::decode(hex_str.trim()).ok()?;
@@ -92,81 +91,63 @@ pub(crate) fn delete_request_id() {
     let _ = std::fs::remove_file(request_id_path());
 }
 
-/// Submit new attestation proof request to SP1. Returns request_id.
-/// Saves request_id to disk for resilience.
-async fn submit_attestation_proof(config: &AttestationConfig, attestation: &[u8]) -> Result<B256> {
-    let guest_input = prepare::prepare_guest_input(attestation, ROOT_CERT_DER)
-        .map_err(|e| eyre!("Failed to prepare guest input: {e}"))?;
+// ---------------------------------------------------------------------------
+// Proving flow
+// ---------------------------------------------------------------------------
 
-    let mut stdin = SP1Stdin::new();
-    stdin.write(&guest_input);
-
-    info!("Submitting attestation proof to SP1 network...");
-    let request_id = config
-        .prover
-        .prove(config.pk.as_ref(), stdin)
-        .groth16()
-        .request()
-        .await
-        .map_err(|e| eyre!("SP1 attestation proof request failed: {e}"))?;
-
-    save_request_id(request_id)?;
-    info!(request_id = %hex::encode(request_id), "Attestation proof submitted, request_id saved");
-
-    Ok(request_id)
-}
-
-/// Wait for an existing proof and submit to L1. Deletes request_id file on success.
-async fn wait_and_submit_to_l1(
+/// Submit attestation proof to SP1 network, wait for result, submit to L1.
+///
+/// If `attestation_request_id.hex` exists on disk, resumes the existing
+/// proof request instead of submitting a new one.
+pub(crate) async fn prove_and_submit(
     config: &AttestationConfig,
-    request_id: B256,
     public_key: &[u8],
+    attestation: &[u8],
 ) -> Result<()> {
-    info!(request_id = %hex::encode(request_id), "Waiting for attestation proof...");
+    let request_id = match load_request_id() {
+        Some(saved_id) => {
+            info!(request_id = %hex::encode(saved_id), "Resuming pending attestation proof");
+            saved_id
+        }
+        None => {
+            let guest_input = prepare::prepare_guest_input(attestation, ROOT_CERT_DER)
+                .map_err(|e| eyre!("Failed to prepare guest input: {e}"))?;
 
+            let mut stdin = SP1Stdin::new();
+            stdin.write(&guest_input);
+
+            info!("Submitting attestation proof to SP1 network...");
+            let id = config
+                .prover
+                .prove(config.pk.as_ref(), stdin)
+                .groth16()
+                .request()
+                .await
+                .map_err(|e| eyre!("SP1 attestation proof request failed: {e}"))?;
+
+            save_request_id(id)?;
+            info!(request_id = %hex::encode(id), "Attestation proof submitted");
+            id
+        }
+    };
+
+    info!(request_id = %hex::encode(request_id), "Waiting for attestation proof...");
     let proof = config
         .prover
         .wait_proof(request_id, None, None)
         .await
         .map_err(|e| eyre!("SP1 attestation proof failed: {e}"))?;
 
-    info!("Attestation proof generated successfully");
+    info!("Attestation proof ready, submitting to L1");
     submit_proof_to_l1(config, public_key, &proof).await?;
     delete_request_id();
     Ok(())
 }
 
-/// Check proof status by request_id. Returns (status_string, proof_ready).
-/// If proof is ready, submits to L1 and deletes request_id file.
-async fn check_and_maybe_submit(
-    config: &AttestationConfig,
-    request_id: B256,
-    public_key: &[u8],
-) -> Result<(String, bool)> {
-    let (status, maybe_proof) = config
-        .prover
-        .get_proof_status(request_id)
-        .await
-        .map_err(|e| eyre!("Failed to get proof status: {e}"))?;
+// ---------------------------------------------------------------------------
+// L1 submission
+// ---------------------------------------------------------------------------
 
-    let status_str = format!("{status:?}");
-
-    match maybe_proof {
-        Some(proof) => {
-            info!(request_id = %hex::encode(request_id), "Attestation proof ready, submitting to L1");
-            submit_proof_to_l1(config, public_key, &proof).await?;
-            delete_request_id();
-            Ok((status_str, true))
-        }
-        None => {
-            info!(request_id = %hex::encode(request_id), ?status, "Attestation proof still pending");
-            Ok((status_str, false))
-        }
-    }
-}
-
-/// Decode the proof's committed public values, sanity-check them against the
-/// locally-derived enclave address, and submit `verifyAttestation` to L1.
 async fn submit_proof_to_l1(
     config: &AttestationConfig,
     public_key: &[u8],
@@ -174,10 +155,6 @@ async fn submit_proof_to_l1(
 ) -> Result<()> {
     let local_address = pubkey_to_address(public_key)?;
 
-    // Public values committed by the guest: abi.encode(address, uint64).
-    // Decode locally so we can surface a clear error before the tx goes out,
-    // and so the uint64 timestamp can be forwarded to the contract (the
-    // contract reconstructs the same blob and passes it to `verifyProof`).
     let (committed_address, attestation_time) =
         nitro_verifier::decode_public_values(proof.public_values.as_slice())
             .map_err(|e| eyre!("Failed to decode attestation public values: {e}"))?;
@@ -191,7 +168,7 @@ async fn submit_proof_to_l1(
     info!(
         address = %local_address,
         attestation_time,
-        "Derived address + attestation time from proof public values"
+        "Submitting attestation proof to L1"
     );
 
     let proof_bytes = proof.bytes();
@@ -212,78 +189,8 @@ async fn submit_proof_to_l1(
     Ok(())
 }
 
-/// Resilient prove_and_submit: checks for existing request_id before submitting new.
-#[cfg(feature = "prove-key-attestation")]
-pub(crate) async fn prove_and_submit(
-    config: &AttestationConfig,
-    public_key: &[u8],
-    attestation: &[u8],
-) -> Result<()> {
-    info!("Preparing attestation proof — this may take several minutes");
-
-    if let Some(saved_id) = load_request_id() {
-        info!(request_id = %hex::encode(saved_id), "Found saved attestation request_id, checking status...");
-
-        match check_and_maybe_submit(config, saved_id, public_key).await {
-            Ok((_status, true)) => return Ok(()),
-            Ok((status, false)) => {
-                info!(request_id = %hex::encode(saved_id), %status, "Saved proof still in progress, waiting...");
-                wait_and_submit_to_l1(config, saved_id, public_key).await?;
-                return Ok(());
-            }
-            Err(e) => {
-                info!(request_id = %hex::encode(saved_id), %e, "Saved request_id invalid or expired, submitting new");
-                delete_request_id();
-            }
-        }
-    }
-
-    let request_id = submit_attestation_proof(config, attestation).await?;
-    wait_and_submit_to_l1(config, request_id, public_key).await?;
-    Ok(())
-}
-
-/// Result of a retry-attestation call.
-pub(crate) struct RetryResult {
-    pub request_id: Option<B256>,
-    pub status: String,
-}
-
-/// Retry attestation: either submit new proof or check status of existing one.
-/// When submitting new proof, spawns a background task for wait+L1.
-pub(crate) async fn retry(
-    config: &AttestationConfig,
-    public_key: &[u8],
-    attestation: &[u8],
-    existing_request_id: Option<B256>,
-) -> Result<RetryResult> {
-    match existing_request_id {
-        Some(rid) => {
-            let (status, proof_ready) = check_and_maybe_submit(config, rid, public_key).await?;
-
-            Ok(RetryResult {
-                request_id: Some(rid),
-                status: if proof_ready { "proof_submitted_to_l1".to_string() } else { status },
-            })
-        }
-        None => {
-            let request_id = submit_attestation_proof(config, attestation).await?;
-
-            let pk = public_key.to_vec();
-            let cfg = config.clone();
-            tokio::spawn(async move {
-                if let Err(e) = wait_and_submit_to_l1(&cfg, request_id, &pk).await {
-                    tracing::error!(%e, "Background attestation L1 submission failed");
-                }
-            });
-
-            Ok(RetryResult { request_id: Some(request_id), status: "proof_requested".to_string() })
-        }
-    }
-}
-
 /// Derive Ethereum address from 65-byte uncompressed secp256k1 public key.
-fn pubkey_to_address(pubkey: &[u8]) -> Result<Address> {
+pub(crate) fn pubkey_to_address(pubkey: &[u8]) -> Result<Address> {
     if pubkey.len() != 65 || pubkey[0] != 0x04 {
         return Err(eyre!(
             "Invalid uncompressed pubkey: len={}, first=0x{:02x}",

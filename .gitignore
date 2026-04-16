@@ -20,6 +20,9 @@ proves/latest_proof.json
 # Env
 .env
 
+# Docker compose runtime data
+data/
+
 # SP1 ELF files
 elf
 

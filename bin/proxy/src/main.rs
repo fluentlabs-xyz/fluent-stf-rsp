@@ -12,10 +12,6 @@
 //! - `POST /challenge/sp1/request`    — submit async SP1 zkVM proof request (blobs from beacon)
 //! - `POST /challenge/sp1/status`     — poll for SP1 proof result
 //!
-//! ## Attestation retry
-//!
-//! - `POST /retry-attestation`          — retry attestation proof (SP1 + L1)
-//!
 //! ## Mock endpoints (testing, local SP1 execution)
 //!
 //! - `POST /mock/sp1/request`         — execute SP1 locally (CPU), return success/failure
@@ -160,18 +156,6 @@ struct MockSp1Response {
     error: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct RetryAttestationRequest {
-    request_id: Option<B256>,
-}
-
-#[derive(Serialize)]
-struct RetryAttestationResponse {
-    request_id: Option<B256>,
-    status: String,
-    public_key: String,
-}
-
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
@@ -231,10 +215,7 @@ async fn require_sp1(state: &AppState) -> Result<&Sp1State, HandlerError> {
 }
 
 fn require_l1(state: &AppState) -> Result<&L1State, HandlerError> {
-    state
-        .l1
-        .as_ref()
-        .ok_or_else(|| internal("L1 not configured (set L1_RPC_URL, L1_ROLLUP_ADDR)"))
+    state.l1.as_ref().ok_or_else(|| internal("L1 not configured (set L1_RPC_URL, L1_ROLLUP_ADDR)"))
 }
 
 /// Generates KZG commitments and proofs on the host using Fiat-Shamir.
@@ -500,37 +481,6 @@ async fn challenge_sp1_status(
 }
 
 // ===========================================================================
-// Attestation retry endpoint
-// ===========================================================================
-
-/// `POST /retry-attestation`
-///
-/// Without request_id: submit new SP1 proof, return request_id immediately.
-/// With request_id: check SP1 proof status, submit to L1 if ready.
-async fn retry_attestation(
-    State(_state): State<AppState>,
-    Json(req): Json<RetryAttestationRequest>,
-) -> Result<Json<RetryAttestationResponse>, HandlerError> {
-    let (public_key, attestation) = enclave::load_attestation_artifacts()
-        .map_err(|e| bad_request(format!("Enclave not initialized: {e}")))?;
-
-    let pk_hex = hex::encode(&public_key);
-
-    let config = enclave::attestation_config()
-        .ok_or_else(|| internal("Attestation prover not configured or still initializing"))?;
-
-    let result = attestation::retry(config, &public_key, &attestation, req.request_id)
-        .await
-        .map_err(|e| internal(format!("Attestation retry failed: {e}")))?;
-
-    Ok(Json(RetryAttestationResponse {
-        request_id: result.request_id,
-        status: result.status,
-        public_key: pk_hex,
-    }))
-}
-
-// ===========================================================================
 // Mock endpoints
 // ===========================================================================
 
@@ -669,12 +619,6 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
-    // ── Attestation config (lazy init) ────────────────────────────────
-    // Kicked off in background; `on_new_attestation` and `/retry-attestation`
-    // will also try to init via the same `OnceCell` if they run first.
-    tokio::spawn(enclave::init_attestation_config());
-    info!("Attestation config initialization started in background");
-
     let nitro = match eif_path {
         None => {
             info!("--eif_path not provided — signing endpoints disabled");
@@ -704,8 +648,6 @@ async fn main() -> eyre::Result<()> {
         // ── Challenge (proxy builds input from RPC) ──────
         .route("/challenge/sp1/request", post(challenge_sp1_request))
         .route("/challenge/sp1/status", post(challenge_sp1_status))
-        // ── Attestation retry ────────────────────────────
-        .route("/retry-attestation", post(retry_attestation))
         // ── Mock (testing) ───────────────────────────────
         .route("/mock/sp1/request", post(mock_sp1_request))
         .layer(DefaultBodyLimit::max(usize::MAX))

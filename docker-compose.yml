@@ -38,7 +38,7 @@ services:
     devices:
       - /dev/vsock:/dev/vsock
     volumes:
-      - proxy_state:/var/lib/proxy
+      - ./data/proxy:/var/lib/proxy
     # NOTE: secrets below are visible via `docker inspect fluent-proxy` to
     # anyone with access to the docker socket. This is acceptable on a
     # dedicated EC2 host where the only docker user is root, but must be
@@ -54,6 +54,8 @@ services:
       L1_ROLLUP_ADDR: ${L1_ROLLUP_ADDR:?L1_ROLLUP_ADDR is required in .env}
       L1_ROLLUP_DEPLOY_BLOCK: ${L1_ROLLUP_DEPLOY_BLOCK}
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
+      SP1_PROVER: ${SP1_PROVER}
+      NETWORK_PRIVATE_KEY: ${SP1_PRIVATE_KEY}
     # TCP-only liveness probe. This verifies only that proxy has bound the
     # socket — it does NOT verify that the enclave handshake succeeded or that
     # the signing pipeline is ready. If proxy is stuck retrying vsock handshake
@@ -72,6 +74,10 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+    # SP1 v6 native JIT executor uses /dev/shm for shared memory between
+    # parent and child processes. Docker's default is 64MB which is too
+    # small — SIGBUS at 0x0 when the mapping is exhausted.
+    shm_size: 4g
     deploy:
       resources:
         limits:
@@ -85,16 +91,23 @@ services:
         hard: 65536
     security_opt:
       - no-new-privileges:true
+      # Docker's default seccomp profile blocks socket(AF_VSOCK) — required
+      # for VSOCK communication with the Nitro Enclave. Disabled seccomp is
+      # acceptable here: the container runs as nonroot (UID 65532) with
+      # cap_drop ALL, no-new-privileges, and read_only rootfs.
+      - seccomp:unconfined
     cap_drop:
       - ALL
-    # read_only: true is gated on Phase 5 smoke test. If sp1-sdk / c-kzg
-    # write to $HOME/.sp1/ or other non-/tmp paths, either add a dedicated
-    # tmpfs mount for ~/.sp1/ or drop read_only: true on proxy (keep on
-    # orchestrator). HOME is set to /var/lib/proxy in the image, which should
-    # redirect most caches into the named volume.
+    # Read-only root filesystem for security. SP1 prover caches data in
+    # $HOME/.sp1/ — because the Dockerfile sets HOME=/var/lib/proxy and this
+    # path is a writable bind mount, SP1 operates normally without requiring
+    # a writable rootfs or dedicated tmpfs for its cache.
     read_only: true
     tmpfs:
-      - /tmp:size=1g,mode=1777
+      # `exec` is required: SP1 v6 native executor extracts a JIT runner
+      # binary into /tmp and executes it as a child process. Docker's
+      # default tmpfs is mounted with noexec, which blocks execve().
+      - /tmp:size=1g,mode=1777,exec
 
   witness-orchestrator:
     build:
@@ -113,7 +126,7 @@ services:
       proxy:
         condition: service_healthy
     volumes:
-      - witness_state:/var/lib/witness
+      - ./data/witness:/var/lib/witness
     environment:
       RUST_LOG: ${RUST_LOG}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
@@ -155,8 +168,3 @@ services:
     tmpfs:
       - /tmp:size=128m,mode=1777
 
-volumes:
-  proxy_state:
-    name: fluent_proxy_state
-  witness_state:
-    name: fluent_witness_state
