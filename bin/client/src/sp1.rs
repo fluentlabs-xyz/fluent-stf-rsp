@@ -97,9 +97,16 @@ pub fn main() {
     }
 
     // 6. Commit results for L1 Verifier
-    sp1_zkvm::io::commit(&header.parent_hash);
-    sp1_zkvm::io::commit(&stf_block_hash);
-    sp1_zkvm::io::commit(&events_hash.withdrawal_hash);
-    sp1_zkvm::io::commit(&events_hash.deposit_hash);
-    sp1_zkvm::io::commit(&versioned_hashes);
+    // Use commit_slice (raw bytes) instead of commit (bincode) so the public
+    // values match the flat abi.encodePacked layout expected by
+    // Rollup._proveBlockWithSp1:
+    //   previousBlockHash(32) || blockHash(32) || withdrawalRoot(32)
+    //   || depositRoot(32) || blobHashes[0](32) || … || blobHashes[N](32)
+    sp1_zkvm::io::commit_slice(header.parent_hash.as_slice());
+    sp1_zkvm::io::commit_slice(stf_block_hash.as_slice());
+    sp1_zkvm::io::commit_slice(events_hash.withdrawal_hash.as_slice());
+    sp1_zkvm::io::commit_slice(events_hash.deposit_hash.as_slice());
+    for vh in &versioned_hashes {
+        sp1_zkvm::io::commit_slice(vh.as_slice());
+    }
 }
