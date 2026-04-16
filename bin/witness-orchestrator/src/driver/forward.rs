@@ -119,6 +119,10 @@ pub(crate) struct DriverConfig {
     /// Optional reth pruner. When `Some`, invoked after every successful
     /// block commit — the pruner itself throttles via its `block_interval`.
     pub pruner: Option<DriverPruner>,
+    /// First block that requires a full witness. Blocks below this threshold
+    /// are commit-only (MDBX sync without witness/cold-store/ProveRequest).
+    /// Set to 0 to witness every block (default when L1_START_BATCH_ID is unset).
+    pub witness_from_block: u64,
 }
 
 /// A block fetched from RPC together with the time it took to pull.
@@ -147,11 +151,11 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
     ensure_genesis_initialized(&cfg.factory)?;
     let mut pruner = cfg.pruner;
 
-    // Invariant: every block MDBX-committed by the driver must also have
-    // been cold-store-committed. If `cold_last < mdbx_tip`, a previous run
-    // crashed (or errored) between MDBX commit and the post-commit cold
-    // push — exactly the A2 data-loss window. Refuse to start so the
-    // operator has to roll back or restore.
+    // Invariant: every block MDBX-committed by the driver WITH a witness must
+    // also have been cold-store-committed. Commit-only blocks (below
+    // witness_from_block) do not push to cold store — this is expected.
+    // If `cold_last < mdbx_tip`, a previous run crashed between MDBX commit
+    // and the post-commit cold push for a witness block.
     let mdbx_tip = cfg.factory.best_block_number().map_err(|e| eyre!("best_block_number: {e}"))?;
     let cold_last =
         cfg.hub.last_committed_block().map_err(|e| eyre!("hub.last_committed_block: {e}"))?;
@@ -171,7 +175,8 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
     }
     let start_tip = mdbx_tip;
     let mut next = start_tip + 1;
-    info!(mdbx_tip, cold_last = ?cold_last, next, "Forward driver ready");
+    let witness_from_block = cfg.witness_from_block;
+    info!(mdbx_tip, cold_last = ?cold_last, next, witness_from_block, "Forward driver ready");
 
     loop {
         if shutdown.is_cancelled() {
@@ -204,6 +209,80 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
             }
 
             let block_number = next;
+
+            // ── Commit-only fast path (catch-up before first batch) ────
+            if block_number < witness_from_block {
+                let fetched = match fetch_block(&cfg.rpc, block_number).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(block_number, err = %e, "fetch_block failed — retrying range");
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(RPC_ERROR_BACKOFF) => {}
+                        }
+                        break;
+                    }
+                };
+
+                let factory_clone = cfg.factory.clone();
+                let chain_spec_clone = Arc::clone(&cfg.chain_spec);
+                tokio::task::spawn_blocking(move || {
+                    commit_phase(&factory_clone, &chain_spec_clone, fetched)
+                })
+                .await
+                .map_err(|e| eyre!("commit_phase join: {e}"))??;
+
+                if block_number % 1000 == 0 {
+                    info!(
+                        block_number,
+                        witness_from_block,
+                        "Catch-up: committed block (no witness)"
+                    );
+                }
+                if block_number + 1 == witness_from_block {
+                    info!(
+                        block_number,
+                        witness_from_block,
+                        "Catch-up complete — switching to full witness mode"
+                    );
+                }
+
+                // Pruner still runs during catch-up.
+                if let Some(p) = pruner.take() {
+                    if p.is_pruning_needed(block_number) {
+                        let res = tokio::task::spawn_blocking(move || {
+                            let mut p = p;
+                            let out = p.run(block_number);
+                            (p, out)
+                        })
+                        .await;
+                        match res {
+                            Ok((returned, Ok(out))) => {
+                                info!(block_number, ?out, "Pruner run");
+                                pruner = Some(returned);
+                            }
+                            Ok((returned, Err(e))) => {
+                                warn!(block_number, err = %e, "Pruner run failed");
+                                pruner = Some(returned);
+                            }
+                            Err(e) => {
+                                error!(
+                                    block_number,
+                                    err = %e,
+                                    "Pruner join failed — pruning disabled for this run, restart to restore"
+                                );
+                            }
+                        }
+                    } else {
+                        pruner = Some(p);
+                    }
+                }
+
+                next = block_number + 1;
+                continue;
+            }
+
+            // ── Full witness path (existing behavior) ──────────────────
 
             // Reserve a channel slot BEFORE doing any heavy work. This is
             // the pull-based backpressure point: the driver idles here until

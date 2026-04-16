@@ -132,7 +132,7 @@ async fn main() {
     let l1_read_provider: RootProvider = rsp_provider::create_provider(l1_rpc_url_parsed.clone());
 
     // ── Startup: resolve L2 checkpoint from START_BATCH_ID ───────────────────────
-    let listener_from_block: u64 = {
+    let (listener_from_block, witness_from_block): (u64, u64) = {
         let db_startup = crate::db::Db::open(&db_path).expect("Failed to open DB for startup");
 
         if let Some(batch_id) = start_batch_id {
@@ -175,6 +175,9 @@ async fn main() {
             }
         }
 
+        let checkpoint = db_startup.get_checkpoint();
+        let witness_from = if checkpoint > 0 { checkpoint + 1 } else { 0 };
+
         let lfb = if let Some(ckpt) = db_startup.get_l1_checkpoint() {
             (ckpt + 1).max(l1_deploy_block)
         } else {
@@ -182,7 +185,7 @@ async fn main() {
         };
 
         drop(db_startup);
-        lfb
+        (lfb, witness_from)
     };
 
     info!(
@@ -198,6 +201,7 @@ async fn main() {
         listener_from_block,
         start_batch_id,
         l1_deploy_block,
+        witness_from_block,
         "Starting witness orchestrator"
     );
 
@@ -316,6 +320,7 @@ async fn main() {
                     prove_tx,
                     chain_spec,
                     pruner,
+                    witness_from_block,
                 },
                 shutdown,
             )
