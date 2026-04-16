@@ -8,18 +8,16 @@ name = "witness-orchestrator"
 path = "src/main.rs"
 
 [dependencies]
-witness-orchestrator.workspace = true
-
 tokio = { workspace = true, features = ["full"] }
+zstd.workspace = true
+redb.workspace = true
+nitro-types.workspace = true
 tokio-util.workspace = true
 async-channel.workspace = true
 bincode.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 eyre.workspace = true
-prost.workspace = true
-tonic.workspace = true
-tonic-prost.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
@@ -43,12 +41,32 @@ alloy-consensus.workspace = true
 # workspace crates
 rsp-blob-builder.workspace = true
 l1-rollup-client.workspace = true
-rsp-host-executor = { workspace = true, default-features = false }
-rsp-client-executor.workspace = true
 rsp-provider.workspace = true
+rsp-host-executor = { workspace = true, default-features = false }
+rsp-client-executor = { workspace = true }
 fluent-stf-primitives = { workspace = true, default-features = false }
-reth-chainspec.workspace = true
-reth-evm.workspace = true
+
+# reth — read side
+reth-db = { workspace = true }
+reth-provider = { workspace = true }
+reth-chainspec = { workspace = true }
+reth-node-types = { workspace = true }
+reth-ethereum-primitives = { workspace = true }
+reth-ethereum-engine-primitives = { workspace = true }
+reth-tasks = { workspace = true }
+
+# reth — write side
+reth-db-common = { workspace = true }
+reth-chain-state = { workspace = true }
+reth-trie = { workspace = true }
+reth-evm = { workspace = true }
+reth-revm = { workspace = true }
+reth-primitives-traits = { workspace = true }
+
+# reth — pruning
+reth-prune = { workspace = true }
+reth-prune-types = { workspace = true }
+reth-config = { workspace = true }
 
 [features]
 default = ["mainnet"]

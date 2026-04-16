@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-provider.workspace = true
 alloy-rlp.workspace = true
 brotlic.workspace = true

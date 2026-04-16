@@ -1,8 +1,7 @@
 //! Local `NodeTypes` binding — matches `reth_node_ethereum::EthereumNode`
 //! without pulling in the full `reth-node-ethereum` crate (which
 //! transitively depends on `reth-network` → `reth-discv5` and fails
-//! Cargo feature unification in this workspace). Copied verbatim from
-//! `bin/mdbx-witness-backfiller/src/main.rs`.
+//! Cargo feature unification in this workspace).
 
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;

@@ -1,7 +1,7 @@
-//! SQLite persistence for courier crash recovery.
+//! SQLite persistence for orchestrator crash recovery.
 //!
 //! Stores `EthExecutionResponse` entries and `PendingBatch` state so the
-//! courier can resume without re-requesting already-computed witnesses after
+//! orchestrator can resume without re-requesting already-computed witnesses after
 //! a crash.
 //!
 //! Schema:
@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, Result};
 use tracing::error;
 
 use crate::accumulator::PendingBatch;
-use witness_orchestrator::types::{EthExecutionResponse, SubmitBatchResponse};
+use crate::types::{EthExecutionResponse, SubmitBatchResponse};
 
 pub(crate) struct Db {
     conn: Connection,
@@ -193,6 +193,7 @@ impl Db {
         blobs.into_iter().filter_map(|b| bincode::deserialize(&b).ok()).collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_all_response_block_numbers(&self) -> Vec<u64> {
         let mut stmt = match self
             .conn

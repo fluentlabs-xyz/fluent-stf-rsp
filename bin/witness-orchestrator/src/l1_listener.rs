@@ -86,7 +86,7 @@ pub(crate) async fn run(
     mut from_block: u64,
     tx: mpsc::Sender<L1Event>,
     shutdown: CancellationToken,
-) {
+) -> eyre::Result<()> {
     info!(
         %contract_addr,
         from_block,
@@ -146,6 +146,7 @@ pub(crate) async fn run(
     }
 
     info!("L1 listener exiting");
+    Ok(())
 }
 
 /// Single poll iteration: fetch logs from `from_block` to latest, paginated.

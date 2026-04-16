@@ -1,6 +1,13 @@
 //! Build EIP-4844 blobs from L2 blocks fetched via RPC.
 //!
-//! Pipeline: fetch blocks → into_consensus → rlp encode → concat → brotli → canonicalize.
+//! Wire format (matches Go sequencer `blob.go`):
+//!
+//!   byte 0    : version (0x01)
+//!   bytes 1.. : brotli(rlp([ [headerRLP, [txEnv₀, txEnv₁, ...]], ... ]))
+//!
+//! headerRLP is the already-encoded RLP of the block header, inserted
+//! verbatim (Go's rlp.RawValue). Each txEnv is the EIP-2718 envelope
+//! bytes (tx.MarshalBinary / encoded_2718).
 //!
 //! Uses `brotlic` (C reference libbrotli) for byte-identity with the Go
 //! sequencer. The pure-Rust `brotli` crate produces different output on real
@@ -9,8 +16,9 @@
 use std::io::Write;
 
 use alloy_consensus::{Block, TxEnvelope};
+use alloy_eips::Encodable2718;
 use alloy_provider::{Provider, RootProvider};
-use alloy_rlp::Encodable;
+use alloy_rlp::{Encodable, Header as RlpHeader};
 use brotlic::{BrotliEncoderOptions, CompressorWriter, Quality, WindowSize};
 use eyre::{eyre, Result};
 use tracing::info;
@@ -24,6 +32,15 @@ const MAX_RAW_BYTES_PER_BLOB: usize = FIELD_ELEMENTS_PER_BLOB * BYTES_PER_FIELD_
 
 const FETCH_BATCH_SIZE: u64 = 100;
 
+/// Blob format version byte — cleartext prefix of the raw blob stream.
+/// Placed outside brotli so decoders can dispatch without decompression.
+const BLOB_FORMAT_VERSION: u8 = 0x01;
+
+struct FetchedBlock {
+    header_rlp: Vec<u8>,
+    tx_envelopes: Vec<Vec<u8>>,
+}
+
 /// Fetch L2 blocks and build canonical EIP-4844 blobs.
 ///
 /// Returns `Vec<Vec<u8>>` where each inner Vec is exactly BYTES_PER_BLOB (131072) bytes.
@@ -32,31 +49,35 @@ pub async fn build_blobs_from_l2(
     from_block: u64,
     to_block: u64,
 ) -> Result<Vec<Vec<u8>>> {
-    let rlp_blocks = fetch_blocks(provider, from_block, to_block).await?;
-    let payload: Vec<u8> = rlp_blocks.into_iter().flatten().collect();
-    let compressed = brotli_compress(&payload)?;
+    let blocks = fetch_blocks(provider, from_block, to_block).await?;
+    let rlp_payload = encode_batch_payload(&blocks);
+    let compressed = brotli_compress(&rlp_payload)?;
+
+    // Prepend version byte outside brotli.
+    let mut stream = Vec::with_capacity(1 + compressed.len());
+    stream.push(BLOB_FORMAT_VERSION);
+    stream.extend_from_slice(&compressed);
 
     info!(
         from_block,
         to_block,
-        raw_size = payload.len(),
+        raw_size = rlp_payload.len(),
         compressed_size = compressed.len(),
         "Blob payload compressed",
     );
 
-    compressed.chunks(MAX_RAW_BYTES_PER_BLOB).map(build_single_blob).collect()
+    stream.chunks(MAX_RAW_BYTES_PER_BLOB).map(build_single_blob).collect()
 }
 
 /// Concurrent block fetch batched by `FETCH_BATCH_SIZE`. Each block is
-/// converted from the RPC envelope to `alloy_consensus::Block<TxEnvelope>`
-/// and RLP-encoded.
+/// converted to headerRLP + tx envelopes matching Go's ProcessedBlock.
 async fn fetch_blocks(
     provider: &RootProvider,
     from_block: u64,
     to_block: u64,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Vec<FetchedBlock>> {
     let total: usize = (to_block - from_block + 1) as usize;
-    let mut result: Vec<Vec<u8>> = Vec::with_capacity(total);
+    let mut result: Vec<FetchedBlock> = Vec::with_capacity(total);
     let mut current = from_block;
 
     while current <= to_block {
@@ -75,21 +96,75 @@ async fn fetch_blocks(
                 let consensus: Block<TxEnvelope> =
                     rpc_block.map_transactions(TxEnvelope::from).into_consensus();
 
-                let mut buf = Vec::new();
-                consensus.encode(&mut buf);
-                Ok::<(u64, Vec<u8>), eyre::Report>((bn, buf))
+                let header_rlp = alloy_rlp::encode(&consensus.header);
+                let tx_envelopes: Vec<Vec<u8>> =
+                    consensus.body.transactions.iter().map(|tx| tx.encoded_2718()).collect();
+
+                Ok::<(u64, FetchedBlock), eyre::Report>((
+                    bn,
+                    FetchedBlock { header_rlp, tx_envelopes },
+                ))
             }
         });
 
         let mut batch = futures::future::try_join_all(futs).await?;
         batch.sort_by_key(|(bn, _)| *bn);
-        for (_, rlp) in batch {
-            result.push(rlp);
+        for (_, block) in batch {
+            result.push(block);
         }
         current = batch_end + 1;
     }
 
     Ok(result)
+}
+
+/// Encode blocks into the Go-compatible RLP batch payload.
+///
+/// Produces `rlp([ [headerRLP, [txEnv₀, ...]], ... ])` — matching
+/// Go's `EncodeBatchPayload` with `blobBlock { rlp.RawValue, [][]byte }`.
+fn encode_batch_payload(blocks: &[FetchedBlock]) -> Vec<u8> {
+    // Compute total payload length for the outer list.
+    let mut outer_payload_len = 0;
+    for block in blocks {
+        let txs_payload_len: usize =
+            block.tx_envelopes.iter().map(|tx| tx.as_slice().length()).sum();
+        let txs_list_len =
+            RlpHeader { list: true, payload_length: txs_payload_len }.length() + txs_payload_len;
+        let block_payload_len = block.header_rlp.len() + txs_list_len;
+        let block_total_len = RlpHeader { list: true, payload_length: block_payload_len }.length()
+            + block_payload_len;
+        outer_payload_len += block_total_len;
+    }
+
+    let mut out = Vec::with_capacity(
+        RlpHeader { list: true, payload_length: outer_payload_len }.length() + outer_payload_len,
+    );
+
+    // Outer list header.
+    RlpHeader { list: true, payload_length: outer_payload_len }.encode(&mut out);
+
+    for block in blocks {
+        // Per-block list: [headerRLP, [txEnvelopes...]]
+        let txs_payload_len: usize =
+            block.tx_envelopes.iter().map(|tx| tx.as_slice().length()).sum();
+        let txs_list_len =
+            RlpHeader { list: true, payload_length: txs_payload_len }.length() + txs_payload_len;
+        let block_payload_len = block.header_rlp.len() + txs_list_len;
+
+        // Block list header.
+        RlpHeader { list: true, payload_length: block_payload_len }.encode(&mut out);
+
+        // HeaderRLP — inserted verbatim (Go's rlp.RawValue semantics).
+        out.extend_from_slice(&block.header_rlp);
+
+        // Txs list.
+        RlpHeader { list: true, payload_length: txs_payload_len }.encode(&mut out);
+        for tx in &block.tx_envelopes {
+            tx.as_slice().encode(&mut out);
+        }
+    }
+
+    out
 }
 
 /// Brotli compress via C reference libbrotli (quality=6, lgwin=22, mode=Generic).
@@ -141,32 +216,57 @@ fn canonicalize(raw: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{BlockBody, Header};
     use std::io::Read;
 
     #[test]
-    fn encode_decompress_roundtrip() {
-        let h1 = Header { number: 100, ..Default::default() };
-        let h2 = Header { number: 101, ..Default::default() };
-        let empty_body: BlockBody<TxEnvelope> = BlockBody {
-            transactions: vec![],
-            ommers: vec![],
-            withdrawals: None,
-        };
-        let b1 = Block { header: h1, body: empty_body.clone() };
-        let b2 = Block { header: h2, body: empty_body };
+    fn encode_batch_payload_golden() {
+        // Matches Go's tinyBlocks() test fixture from blob_test.go.
+        let blocks = vec![
+            FetchedBlock {
+                header_rlp: vec![0xc1, 0x80],
+                tx_envelopes: vec![vec![0x01, 0x02], vec![0x03, 0x04]],
+            },
+            FetchedBlock { header_rlp: vec![0xc2, 0x80, 0x80], tx_envelopes: vec![vec![0x05]] },
+        ];
+        let encoded = encode_batch_payload(&blocks);
+        // Golden bytes from Go: d0 c9 c1 80 c6 82 01 02 82 03 04 c5 c2 80 80 c1 05
+        let expected: Vec<u8> = vec![
+            0xd0, 0xc9, 0xc1, 0x80, 0xc6, 0x82, 0x01, 0x02, 0x82, 0x03, 0x04, 0xc5, 0xc2, 0x80,
+            0x80, 0xc1, 0x05,
+        ];
+        assert_eq!(encoded, expected, "must match Go golden bytes");
+    }
 
-        let mut expected = Vec::new();
-        b1.encode(&mut expected);
-        b2.encode(&mut expected);
+    #[test]
+    fn encode_compress_roundtrip() {
+        let blocks = vec![FetchedBlock {
+            header_rlp: vec![0xc1, 0x80],
+            tx_envelopes: vec![vec![0x01, 0x02]],
+        }];
+        let payload = encode_batch_payload(&blocks);
+        let compressed = brotli_compress(&payload).unwrap();
 
-        let compressed = brotli_compress(&expected).unwrap();
+        let mut stream = Vec::with_capacity(1 + compressed.len());
+        stream.push(BLOB_FORMAT_VERSION);
+        stream.extend_from_slice(&compressed);
 
+        // Verify version byte and brotli round-trip.
+        assert_eq!(stream[0], 0x01);
         let mut decompressed = Vec::new();
-        brotli::Decompressor::new(compressed.as_slice(), 4096)
-            .read_to_end(&mut decompressed)
-            .unwrap();
+        brotli::Decompressor::new(&stream[1..], 4096).read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed, payload);
+    }
 
-        assert_eq!(decompressed, expected);
+    #[test]
+    fn empty_blocks_encode() {
+        let blocks = vec![FetchedBlock {
+            header_rlp: vec![0xc0], // empty RLP list
+            tx_envelopes: vec![],
+        }];
+        let encoded = encode_batch_payload(&blocks);
+        // outer list [ block list [ 0xc0, empty txs list ] ]
+        // block payload = 1 (headerRLP) + 1 (empty txs list 0xc0) = 2
+        // outer payload = 1 (block header) + 2 = 3
+        assert_eq!(encoded, vec![0xc3, 0xc2, 0xc0, 0xc0]);
     }
 }

@@ -31,7 +31,7 @@ use crate::{
     enclave::ensure_initialized,
     types::{NitroConfig, Sp1ProofResponse},
 };
-use nitro_types::EthExecutionResponse;
+use nitro_types::{EthExecutionResponse, InvalidSignaturesResponse, SignBatchRootRequest};
 
 use std::{env, sync::Arc};
 use tokio::sync::OnceCell;
@@ -143,15 +143,6 @@ struct ChallengeSp1Request {
     batch_index: u64,
 }
 
-/// `POST /sign-batch-root`
-#[derive(Deserialize)]
-struct SignBatchRootRequest {
-    from_block: u64,
-    to_block: u64,
-    responses: Vec<EthExecutionResponse>,
-    blobs: Vec<Vec<u8>>,
-}
-
 #[derive(Deserialize)]
 struct Sp1StatusRequest {
     request_id: B256,
@@ -184,13 +175,6 @@ struct RetryAttestationResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
-}
-
-/// Response when batch signing fails due to invalid (stale) signatures.
-#[derive(Serialize)]
-struct InvalidSignaturesResponse {
-    invalid_blocks: Vec<u64>,
-    enclave_address: Address,
 }
 
 type HandlerError = (StatusCode, Json<ErrorResponse>);

@@ -1,64 +1,80 @@
 //! Witness orchestrator sidecar binary.
 //!
-//! Connects to the Fluent node's gRPC witness server (localhost), receives
-//! block witnesses, and forwards raw bincode to the remote proxy via HTTP POST.
-//! Orchestrates batch signing and L1 preconfirmation.
+//! Runs an embedded forward-sync driver that re-executes Fluent L2 blocks,
+//! produces witnesses in-process, and feeds them into the orchestrator loop
+//! which dispatches to the Nitro proxy over HTTP and orchestrates L1 batch
+//! signing and preconfirmation.
 //!
 //! ## Data flow
 //!
 //! ```text
-//! gRPC server ──raw bincode──▶ orchestrator ──HTTP POST──▶ proxy ──▶ Nitro
-//!   (localhost)                  (this binary)              (remote)
-//! ```
-//!
-//! ## Orchestration
-//!
-//! ```text
-//! gRPC witnesses ──▶ parallel /sign-block-execution ──▶ BatchAccumulator
-//! L1 events ──────▶ BatchHeadersSubmitted / BatchAccepted ──▶ BatchAccumulator
-//!                              │
-//!                    ALL conditions met
-//!                              ▼
-//!               /sign-batch-root ──▶ preconfirmBatch (L1)
+//! L2 RPC ──▶ forward driver ──mpsc──▶ orchestrator ──HTTP POST──▶ proxy ──▶ Nitro
+//!                   │
+//!                   └──▶ redb cold witness store (for key-rotation replay)
 //! ```
 //!
 //! # Configuration (environment variables)
 //!
 //! | Variable | Default | Description |
 //! |----------|---------|-------------|
-//! | `FLUENT_WITNESS_ADDR` | `http://127.0.0.1:10000` | gRPC server address (local) |
+//! | `RPC_URL` | — | L2 RPC URL — drives forward sync and blob construction |
+//! | `FLUENT_DATADIR` | `./forward-driver` | Driver datadir (MDBX + static_files + RocksDB) |
+//! | `FLUENT_WITNESS_COLD_FILE` | `<datadir>/cold.redb` | redb file for cold witness store |
+//! | `FLUENT_MAX_COLD_BYTES` | `34359738368` (32 GiB) | Size cap for cold witness store |
+//! | `FLUENT_MDBX_MAX_SIZE` | `549755813888` (512 GiB) | MDBX max size |
 //! | `FLUENT_PROXY_URL` | `http://127.0.0.1:8080` | Remote proxy base URL |
-//! | `FLUENT_DB_PATH` | `./witness_courier.db` | SQLite DB for crash recovery |
+//! | `FLUENT_DB_PATH` | `./witness_orchestrator.db` | SQLite DB for crash recovery |
 //! | `FLUENT_HTTP_TIMEOUT_SECS` | `120` | HTTP POST timeout (seconds) |
-//! | `L1_RPC_URL` | — | L1 Ethereum RPC URL (required for batch orchestration) |
+//! | `L1_RPC_URL` | — | L1 Ethereum RPC URL |
 //! | `L1_CONTRACT_ADDR` | — | Rollup contract address on L1 |
 //! | `L1_SUBMITTER_KEY` | — | Private key for signing `preconfirmBatch` txs |
 //! | `NITRO_VERIFIER_ADDR` | — | NitroVerifier contract address on L1 |
 //! | `L1_START_BLOCK` | `0` | L1 block to start listening for events |
-//! | `FLUENT_START_BATCH_ID`   | —  | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
-//! | `FLUENT_L1_DEPLOY_BLOCK`  | `0` | L1 block where Rollup contract was deployed — lower bound for startup scan |
+//! | `FLUENT_START_BATCH_ID` | — | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
+//! | `FLUENT_L1_DEPLOY_BLOCK` | `0` | L1 block where Rollup contract was deployed |
+//! | `FLUENT_API_KEY` | — | API key forwarded to the proxy |
+//! | `FLUENT_PRUNE_FULL` | `false` | If `true`, prune MDBX/static-files using the same defaults as `reth --full` (sender_recovery=Full, receipts/account_history/storage_history distance=10064 blocks, bodies_history=Before(Paris)) |
 
 mod accumulator;
-mod client;
 mod db;
+mod driver;
+mod hub;
 mod l1_listener;
+mod orchestrator;
+mod types;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_network::EthereumWallet;
+use crate::hub::WitnessHub;
+use crate::types::ProveRequest;
+use alloy_network::{Ethereum, EthereumWallet};
 use alloy_primitives::Address;
 use alloy_provider::{ProviderBuilder, RootProvider};
 use alloy_signer_local::PrivateKeySigner;
+use fluent_stf_primitives::fluent_chainspec;
+use reth_chainspec::{ChainSpec, EthereumHardfork, EthereumHardforks};
+use reth_config::PruneConfig;
+use reth_prune::PrunerBuilder;
+use reth_prune_types::{PruneMode, PruneModes, MINIMUM_UNWIND_SAFE_DISTANCE};
+use reth_tasks::Runtime;
+use rsp_host_executor::EthHostExecutor;
+use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use client::OrchestratorConfig;
+use driver::DriverConfig;
+use orchestrator::OrchestratorConfig;
 
-const DEFAULT_SERVER_ADDR: &str = "http://127.0.0.1:10000";
 const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:8080";
-const DEFAULT_DB_PATH: &str = "./witness_courier.db";
+const DEFAULT_DB_PATH: &str = "./witness_orchestrator.db";
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_DATADIR: &str = "./forward-driver";
+/// 32 GiB default cap for cold witness storage.
+const DEFAULT_MAX_COLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// 512 GiB default MDBX geometry max size.
+const DEFAULT_MDBX_MAX_SIZE: u64 = 512 * 1024 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() {
@@ -69,8 +85,21 @@ async fn main() {
         )
         .init();
 
-    let server_addr =
-        std::env::var("FLUENT_WITNESS_ADDR").unwrap_or_else(|_| DEFAULT_SERVER_ADDR.into());
+    let rpc_url = std::env::var("RPC_URL").expect("RPC_URL is required");
+    let datadir =
+        PathBuf::from(std::env::var("FLUENT_DATADIR").unwrap_or_else(|_| DEFAULT_DATADIR.into()));
+    let cold_file = std::env::var("FLUENT_WITNESS_COLD_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| datadir.join("cold.redb"));
+    let max_cold_bytes: u64 = std::env::var("FLUENT_MAX_COLD_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_COLD_BYTES);
+    let mdbx_max_size: u64 = std::env::var("FLUENT_MDBX_MAX_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MDBX_MAX_SIZE);
+
     let proxy_url = std::env::var("FLUENT_PROXY_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.into());
     let db_path =
         PathBuf::from(std::env::var("FLUENT_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.into()));
@@ -97,12 +126,6 @@ async fn main() {
     let l1_deploy_block: u64 =
         std::env::var("FLUENT_L1_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let api_key = std::env::var("FLUENT_API_KEY").expect("FLUENT_API_KEY is required");
-    let fallback_local_rpc = std::env::var("FLUENT_FALLBACK_LOCAL_RPC").ok();
-    let fallback_remote_rpc = std::env::var("FLUENT_FALLBACK_REMOTE_RPC").ok();
-    let max_concurrent_fallbacks: usize = std::env::var("FLUENT_MAX_CONCURRENT_FALLBACKS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(http_timeout_secs))
@@ -120,20 +143,10 @@ async fn main() {
 
         if let Some(batch_id) = start_batch_id {
             if db_startup.get_checkpoint() == 0 {
-                let l2_rpc_url: url::Url = fallback_local_rpc
-                    .as_deref()
-                    .expect(
-                        "FLUENT_FALLBACK_LOCAL_RPC is required when FLUENT_START_BATCH_ID is set",
-                    )
-                    .parse()
-                    .expect("Invalid FLUENT_FALLBACK_LOCAL_RPC URL");
-                let l2_provider: RootProvider = rsp_provider::create_provider(l2_rpc_url);
-
                 info!(
                     batch_id,
                     "FLUENT_START_BATCH_ID set — resolving L2 start checkpoint from L1"
                 );
-                let _ = l2_provider; // L2 lookup no longer required by resolve_l2_start_checkpoint
                 let (l2_from_block, l1_event_block, _num_blocks) =
                     l1_rollup_client::resolve_l2_start_checkpoint(
                         &l1_read_provider,
@@ -146,14 +159,8 @@ async fn main() {
 
                 let l2_checkpoint = l2_from_block.saturating_sub(1);
                 db_startup.save_checkpoint(l2_checkpoint);
-                // Save (l1_event_block - 1) so listener resumes FROM l1_event_block
                 db_startup.save_l1_checkpoint(l1_event_block.saturating_sub(1));
 
-                // Seed last_batch_end so the first BatchCommitted after
-                // startup lands on the correct L2 range. Guarded: never
-                // overwrite progress from a previous run, where `checkpoint`
-                // may reset to 0 while `last_batch_end` still holds a real
-                // value.
                 if db_startup.get_last_batch_end().is_none() {
                     db_startup.save_last_batch_end(l2_checkpoint);
                 }
@@ -174,7 +181,6 @@ async fn main() {
             }
         }
 
-        // Compute L1 listener start from (possibly just updated) checkpoint.
         let lfb = if let Some(ckpt) = db_startup.get_l1_checkpoint() {
             (ckpt + 1).max(l1_start_block)
         } else {
@@ -186,7 +192,10 @@ async fn main() {
     };
 
     info!(
-        %server_addr,
+        %rpc_url,
+        ?datadir,
+        ?cold_file,
+        max_cold_bytes,
         %proxy_url,
         ?db_path,
         http_timeout_secs,
@@ -196,63 +205,133 @@ async fn main() {
         listener_from_block,
         start_batch_id,
         l1_deploy_block,
-        fallback_local_rpc = ?fallback_local_rpc,
-        fallback_remote_rpc = ?fallback_remote_rpc,
         "Starting witness orchestrator"
     );
 
     // Build L1 provider for writing (preconfirmBatch)
     let signer: PrivateKeySigner = l1_submitter_key.parse().expect("Invalid L1_SUBMITTER_KEY");
     let wallet = EthereumWallet::from(signer);
-    let l1_write_provider = ProviderBuilder::new().wallet(wallet).connect_http(l1_rpc_url_parsed);
+    let l1_write_provider: orchestrator::L1WriteProvider =
+        ProviderBuilder::new().wallet(wallet).connect_http(l1_rpc_url_parsed);
 
-    // Root shutdown token — cancelled on SIGTERM/SIGINT. Propagated into
-    // l1_listener and client::run so in-flight work can drain cleanly
-    // instead of being abruptly dropped by runtime teardown.
+    // Root shutdown token — cancelled on SIGTERM/SIGINT or on any
+    // background task exit. Propagated into every spawned task so in-flight
+    // work can drain cleanly instead of being abruptly dropped by runtime
+    // teardown.
     let shutdown = CancellationToken::new();
+    let mut tasks: tokio::task::JoinSet<(&'static str, eyre::Result<()>)> =
+        tokio::task::JoinSet::new();
+
+    // Signal handler
     {
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let mut sigterm =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(err = %e, "Failed to install SIGTERM handler");
-                        return;
-                    }
-                };
-            tokio::select! {
-                _ = sigterm.recv() => info!("SIGTERM received — initiating graceful shutdown"),
-                _ = tokio::signal::ctrl_c() => info!("SIGINT received — initiating graceful shutdown"),
+        tasks.spawn(async move {
+            let r = async {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .map_err(|e| eyre::eyre!("install SIGTERM: {e}"))?;
+                tokio::select! {
+                    _ = sigterm.recv() => info!("SIGTERM received — graceful shutdown"),
+                    _ = tokio::signal::ctrl_c() => info!("SIGINT received — graceful shutdown"),
+                }
+                shutdown.cancel();
+                Ok::<(), eyre::Report>(())
             }
-            shutdown.cancel();
+            .await;
+            ("signal", r)
         });
     }
 
     // Start L1 event listener
     let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(l1_listener::run(
-        l1_read_provider,
-        l1_contract_addr,
-        listener_from_block,
-        l1_tx,
-        shutdown.clone(),
-    ));
+    {
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            let r = l1_listener::run(
+                l1_read_provider,
+                l1_contract_addr,
+                listener_from_block,
+                l1_tx,
+                shutdown,
+            )
+            .await;
+            ("l1_listener", r)
+        });
+    }
 
-    // Build L2 provider for blob construction
-    let l2_provider: RootProvider = {
-        let l2_rpc_url: url::Url = fallback_local_rpc
-            .as_deref()
-            .or(fallback_remote_rpc.as_deref())
-            .expect("FLUENT_FALLBACK_LOCAL_RPC or FLUENT_FALLBACK_REMOTE_RPC required for blob construction")
-            .parse()
-            .expect("Invalid L2 RPC URL for blob construction");
-        rsp_provider::create_provider(l2_rpc_url)
+    // L2 provider for blob construction (and — once the embedded driver
+    // lands in Step B — for forward sync as well).
+    let l2_rpc_parsed: url::Url = rpc_url.parse().expect("Invalid RPC_URL");
+    let l2_provider: RootProvider = rsp_provider::create_provider(l2_rpc_parsed);
+
+    // Cold witness store + in-process witness channel.
+    let hub = Arc::new(WitnessHub::new(cold_file, max_cold_bytes));
+    let (prove_tx, prove_rx) = tokio::sync::mpsc::channel::<ProveRequest>(64);
+
+    // ── Embedded forward-sync driver ─────────────────────────────────────────────
+    let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
+    let driver_rpc: RootProvider<Ethereum> =
+        rsp_provider::create_provider(rpc_url.parse().expect("Invalid RPC_URL"));
+    let runtime = Runtime::with_existing_handle(Handle::current())
+        .expect("failed to build reth_tasks::Runtime from current handle");
+    let factory = driver::open_writable_factory::<driver::FluentMdbxNode>(
+        &datadir,
+        chain_spec.clone(),
+        mdbx_max_size,
+        runtime,
+    )
+    .expect("failed to open writable ProviderFactory");
+    let host_executor = Arc::new(EthHostExecutor::eth(chain_spec.clone(), None));
+
+    // Optional pruner: mirror `reth --full` semantics exactly.
+    let prune_full: bool = std::env::var("FLUENT_PRUNE_FULL")
+        .ok()
+        .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let pruner = if prune_full {
+        let segments = PruneModes {
+            sender_recovery: Some(PruneMode::Full),
+            transaction_lookup: None,
+            receipts: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
+            account_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
+            storage_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
+            bodies_history: chain_spec
+                .ethereum_fork_activation(EthereumHardfork::Paris)
+                .block_number()
+                .map(PruneMode::Before),
+            receipts_log_filter: Default::default(),
+        };
+        let prune_config =
+            PruneConfig { block_interval: PruneConfig::default().block_interval, segments };
+        info!(?prune_config, "Pruning enabled (reth --full equivalent)");
+        Some(PrunerBuilder::new(prune_config).build_with_provider_factory(factory.clone()))
+    } else {
+        info!("Pruning disabled — archive mode");
+        None
     };
 
-    // Run orchestrator
+    {
+        let hub = Arc::clone(&hub);
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            let r = driver::run(
+                DriverConfig {
+                    factory,
+                    rpc: driver_rpc,
+                    host_executor,
+                    hub,
+                    prove_tx,
+                    chain_spec,
+                    pruner,
+                },
+                shutdown,
+            )
+            .await;
+            ("driver", r)
+        });
+    }
+
     let config = OrchestratorConfig {
-        server_addr,
         proxy_url,
         db_path,
         http_client,
@@ -260,11 +339,56 @@ async fn main() {
         nitro_verifier_addr,
         l1_provider: l1_write_provider,
         api_key,
-        fallback_local_rpc,
-        fallback_remote_rpc,
-        max_concurrent_fallbacks,
         l2_provider,
     };
 
-    client::run(config, l1_rx, shutdown).await;
+    // Orchestrator runs in the foreground. Race it against `tasks.join_next()`
+    // so that ANY background task exiting first (driver failure, listener
+    // error, signal handler) immediately cancels the root token. Without
+    // this race, a driver failure closes prove_tx — the orchestrator's
+    // `Some(req) = prove_rx.recv()` arm would simply disable, and the loop
+    // would keep running forever on l1_events / sign_done / ticker.
+    let mut exit_code = 0;
+    let mut orchestrator_fut =
+        std::pin::pin!(orchestrator::run(config, hub, prove_rx, l1_rx, shutdown.clone()));
+
+    tokio::select! {
+        () = orchestrator_fut.as_mut() => {
+            shutdown.cancel();
+        }
+        Some(join) = tasks.join_next() => {
+            match join {
+                Ok((name, Ok(()))) => info!(task = name, "background task exited cleanly"),
+                Ok((name, Err(e))) => {
+                    tracing::error!(task = name, err = %e, "background task exited with error");
+                    exit_code = 1;
+                }
+                Err(e) => {
+                    tracing::error!(err = %e, "background task join failed");
+                    exit_code = 1;
+                }
+            }
+            shutdown.cancel();
+            orchestrator_fut.await;
+        }
+    }
+
+    // Drain any remaining background tasks.
+    while let Some(join) = tasks.join_next().await {
+        match join {
+            Ok((name, Ok(()))) => info!(task = name, "background task exited cleanly"),
+            Ok((name, Err(e))) => {
+                tracing::error!(task = name, err = %e, "background task exited with error");
+                exit_code = 1;
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "background task join failed");
+                exit_code = 1;
+            }
+        }
+    }
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
 }

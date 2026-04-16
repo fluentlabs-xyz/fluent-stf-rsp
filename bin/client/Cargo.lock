@@ -4129,6 +4129,7 @@ name = "nitro-types"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "base64 0.22.1",
  "revm-primitives",
  "rsp-client-executor",
  "serde",

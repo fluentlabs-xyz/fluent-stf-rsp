@@ -10,9 +10,7 @@ members = [
     "crates/storage/witness-db","crates/nitro-types",
     "crates/blob-builder",
     "crates/l1-rollup-client",
-    "crates/witness-orchestrator",
     "bin/witness-orchestrator",
-    "bin/forward-backfiller",
 ]
 exclude = []
 resolver = "2"
@@ -95,7 +93,6 @@ rsp-mpt = { path = "./crates/mpt" }
 fluent-stf-primitives = { path = "./crates/primitives", default-features = false }
 rsp-provider = { path = "./crates/provider" }
 nitro-types = { path = "./crates/nitro-types" }
-witness-orchestrator = { path = "./crates/witness-orchestrator" }
 
 # --- sp1 ---
 sp1-build = "6.0.2"
@@ -129,6 +126,10 @@ reth-tasks = { git = "https://github.com/fluentlabs-xyz/reth", default-features 
 reth-db-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-chain-state = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-trie-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-prune = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-prune-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-config = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+
 
 # --- revm ---
 revm = { version = "34.0.0", default-features = false }

@@ -16,7 +16,7 @@ use alloy_primitives::B256;
 use tracing::{error, info, warn};
 
 use crate::db::Db;
-use witness_orchestrator::types::{EthExecutionResponse, SubmitBatchResponse};
+use crate::types::{EthExecutionResponse, SubmitBatchResponse};
 
 #[derive(Debug)]
 pub(crate) struct PendingBatch {
@@ -128,6 +128,26 @@ impl BatchAccumulator {
 
     /// Register a new batch from `BatchHeadersSubmitted` event.
     pub(crate) async fn set_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
+        // Idempotent under listener re-emission: if the batch is already
+        // registered and the range matches, do nothing (re-emission must
+        // NOT clobber accumulated state, especially `blobs_accepted`).
+        // A range mismatch is a hard contract violation — log loudly but
+        // do not corrupt state.
+        if let Some(existing) = self.batches.get(&batch_index) {
+            if existing.from_block == from_block && existing.to_block == to_block {
+                return;
+            }
+            error!(
+                batch_index,
+                existing_from = existing.from_block,
+                existing_to = existing.to_block,
+                new_from = from_block,
+                new_to = to_block,
+                "set_batch: range mismatch on re-registration — ignoring"
+            );
+            return;
+        }
+
         // Consume any buffered BlobsAccepted for this batch
         let blobs_accepted = self.pending_blobs_accepted.remove(&batch_index);
         if blobs_accepted {
@@ -338,6 +358,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_batch_idempotent_preserves_blobs_accepted() {
+        let mut acc = BatchAccumulator::new();
+        acc.set_batch(1, 100, 199).await;
+        acc.mark_blobs_accepted(1).await;
+        assert!(acc.batches.get(&1).unwrap().blobs_accepted);
+
+        // Re-emission of the same BatchCommitted log must NOT clear the flag.
+        acc.set_batch(1, 100, 199).await;
+        assert!(acc.batches.get(&1).unwrap().blobs_accepted);
+    }
+
+    #[tokio::test]
     async fn not_ready_without_blobs_accepted() {
         let mut acc = BatchAccumulator::new();
         acc.set_batch(1, 10, 12).await;
@@ -433,7 +465,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path =
-            std::env::temp_dir().join(format!("courier_test_{id}_{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("orchestrator_test_{id}_{}.db", std::process::id()));
         let db = Db::open(&path).unwrap();
         Arc::new(Mutex::new(db))
     }
@@ -454,7 +486,7 @@ mod tests {
         assert_eq!(acc.first_ready_unsigned(), Some(1));
 
         // Sign batch 1
-        let sig_resp = witness_orchestrator::types::SubmitBatchResponse {
+        let sig_resp = crate::types::SubmitBatchResponse {
             batch_root: vec![0u8; 32],
             versioned_hashes: vec![],
             signature: vec![1, 2, 3],
@@ -487,7 +519,7 @@ mod tests {
         assert!(acc.first_sequential_signed().is_none());
 
         // Sign only batch 2 (not the first)
-        let sig_resp = witness_orchestrator::types::SubmitBatchResponse {
+        let sig_resp = crate::types::SubmitBatchResponse {
             batch_root: vec![0u8; 32],
             versioned_hashes: vec![],
             signature: vec![4, 5, 6],
@@ -498,7 +530,7 @@ mod tests {
         assert!(acc.first_sequential_signed().is_none());
 
         // Sign batch 1
-        let sig1 = witness_orchestrator::types::SubmitBatchResponse {
+        let sig1 = crate::types::SubmitBatchResponse {
             batch_root: vec![0u8; 32],
             versioned_hashes: vec![],
             signature: vec![7, 8, 9],

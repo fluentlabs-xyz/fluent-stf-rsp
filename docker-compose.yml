@@ -114,7 +114,13 @@ services:
       - witness_state:/var/lib/witness
     environment:
       RUST_LOG: ${RUST_LOG:-info}
-      FLUENT_WITNESS_ADDR: ${FLUENT_WITNESS_ADDR:-http://127.0.0.1:10000}
+      RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
+      FLUENT_DATADIR: ${FLUENT_DATADIR:-/var/lib/witness/forward-driver}
+      FLUENT_WITNESS_COLD_FILE: ${FLUENT_WITNESS_COLD_FILE:-/var/lib/witness/forward-driver/cold.redb}
+      FLUENT_MAX_COLD_BYTES: ${FLUENT_MAX_COLD_BYTES:-34359738368}
+      FLUENT_MDBX_MAX_SIZE: ${FLUENT_MDBX_MAX_SIZE:-549755813888}
+      FLUENT_PRUNE_FULL: ${FLUENT_PRUNE_FULL:-false}
+      FLUENT_DB_PATH: ${FLUENT_DB_PATH:-/var/lib/witness/witness_orchestrator.db}
       FLUENT_PROXY_URL: ${FLUENT_PROXY_URL:-http://127.0.0.1:8080}
       FLUENT_HTTP_TIMEOUT_SECS: ${FLUENT_HTTP_TIMEOUT_SECS:-120}
       FLUENT_API_KEY: ${API_KEY:?API_KEY is required in .env}
@@ -125,9 +131,6 @@ services:
       L1_START_BLOCK: ${L1_START_BLOCK:-0}
       FLUENT_START_BATCH_ID: ${FLUENT_START_BATCH_ID:-}
       FLUENT_L1_DEPLOY_BLOCK: ${FLUENT_L1_DEPLOY_BLOCK:-0}
-      FLUENT_FALLBACK_LOCAL_RPC: ${FLUENT_FALLBACK_LOCAL_RPC:-}
-      FLUENT_FALLBACK_REMOTE_RPC: ${FLUENT_FALLBACK_REMOTE_RPC:-}
-      FLUENT_MAX_CONCURRENT_FALLBACKS: ${FLUENT_MAX_CONCURRENT_FALLBACKS:-4}
     logging:
       driver: json-file
       options:
