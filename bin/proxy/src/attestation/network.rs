@@ -51,7 +51,7 @@ impl AttestationConfig {
             .map_err(|e| eyre!("Failed to setup nitro validator proving key: {e}"))?;
 
         info!(
-            vk_hash = %hex::encode(pk.verifying_key().hash_bytes()),
+            vk_hash = %pk.verifying_key().bytes32(),
             "Nitro validator SP1 prover initialised"
         );
 
@@ -219,7 +219,7 @@ pub(crate) async fn fetch_ha_whitelist(blacklist: &HashSet<Address>) -> Result<V
 
     let mut client = ProverNetworkClient::new(channel);
     let response = client
-        .get_provers_by_uptime(GetProversByUptimeRequest { high_availability_only: true })
+        .get_provers_by_uptime(GetProversByUptimeRequest { high_availability_only: false })
         .await
         .map_err(|e| eyre!("Failed to fetch HA provers: {e}"))?;
 

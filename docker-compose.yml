@@ -48,6 +48,7 @@ services:
     environment:
       API_KEY: ${API_KEY:?API_KEY is required in .env}
       LISTEN_ADDR: ${PROXY_LISTEN_ADDR}
+      PROXY_DB_PATH: ${PROXY_DB_PATH}
       RUST_LOG: ${RUST_LOG}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
       L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}

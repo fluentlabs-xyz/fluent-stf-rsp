@@ -91,7 +91,7 @@ pub fn rpc_url() -> String {
 #[derive(Clone)]
 struct AppState {
     api_key: String,
-    nitro: Option<NitroState>,
+    nitro: NitroConfig,
     sp1: Option<LazySp1>,
     /// Raw SP1 ELF bytes — used by mock endpoint for local CPU execution.
     sp1_elf_bytes: Option<Arc<Vec<u8>>>,
@@ -109,11 +109,6 @@ struct L1State {
     contract_addr: Address,
     /// L1 block where the rollup contract was deployed (lower bound for log scans).
     deploy_block: u64,
-}
-
-#[derive(Clone)]
-struct NitroState {
-    config: NitroConfig,
 }
 
 #[derive(Clone)]
@@ -200,13 +195,6 @@ async fn require_api_key(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn require_nitro(state: &AppState) -> Result<&NitroState, HandlerError> {
-    state
-        .nitro
-        .as_ref()
-        .ok_or_else(|| internal("Nitro enclave not configured (pass --eif_path at startup)"))
-}
 
 async fn require_sp1(state: &AppState) -> Result<&Sp1State, HandlerError> {
     match &state.sp1 {
@@ -326,11 +314,9 @@ async fn sign_block_execution(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Json<EthExecutionResponse>, HandlerError> {
-    let nitro = require_nitro(&state)?;
-
     let input = decode_bincode::<EthClientExecutorInput>(&body)?;
 
-    let response = enclave::execute_block(input, nitro.config)
+    let response = enclave::execute_block(input, state.nitro)
         .await
         .map_err(|e| internal(format!("Enclave execution failed: {e}")))?;
 
@@ -351,8 +337,6 @@ async fn sign_batch_root(
     State(state): State<AppState>,
     Json(req): Json<SignBatchRootRequest>,
 ) -> Result<impl IntoResponse, HandlerError> {
-    let nitro = require_nitro(&state)?;
-
     if req.from_block > req.to_block {
         return Err(bad_request(format!(
             "invalid range: from_block ({}) > to_block ({})",
@@ -366,7 +350,7 @@ async fn sign_batch_root(
 
     // Blobs are now provided by the courier — no L1/Beacon fetch needed
     let outcome =
-        enclave::submit_batch(req.from_block, req.to_block, req.responses, req.blobs, nitro.config)
+        enclave::submit_batch(req.from_block, req.to_block, req.responses, req.blobs, state.nitro)
             .await
             .map_err(|e| internal(format!("Batch submission failed: {e}")))?;
 
@@ -553,9 +537,6 @@ async fn main() -> eyre::Result<()> {
     let db_path = std::env::var("PROXY_DB_PATH").unwrap_or_else(|_| "./proxy.db".into());
     db::init(&db_path)?;
 
-    // ── Nitro enclave ────────────────────────────────────────────────────
-    let eif_path = std::env::args().skip_while(|a| a != "--eif_path").nth(1);
-
     // ── SP1 prover (lazy init) ────────────────────────────────────────────
     let mut sp1_elf_bytes: Option<Arc<Vec<u8>>> = None;
     let sp1: Option<LazySp1> = match std::env::var("SP1_ELF_PATH") {
@@ -618,22 +599,9 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
-    let nitro = match eif_path {
-        None => {
-            info!("--eif_path not provided — signing endpoints disabled");
-            None
-        }
-        Some(ref path) => {
-            let nitro_config = NitroConfig::default();
-            ensure_initialized(&nitro_config).await?;
-            info!("Nitro enclave initialised from {path}");
-            Some(NitroState { config: nitro_config })
-        }
-    };
-
-    if nitro.is_none() && sp1.is_none() {
-        eyre::bail!("No backends configured: provide --eif_path and/or SP1_ELF_PATH");
-    }
+    let nitro = NitroConfig::default();
+    ensure_initialized(&nitro).await?;
+    info!("Nitro enclave initialised");
 
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());

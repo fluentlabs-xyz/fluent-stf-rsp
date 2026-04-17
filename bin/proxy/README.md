@@ -75,7 +75,7 @@ Challenger ──► POST /challenge/nitro
 
 ## Running
 ```bash
-proxy --eif_path /path/to/enclave.eif
+proxy
 ```
 
 ### Required environment variables
@@ -120,7 +120,7 @@ x-api-key: <API_KEY>
 
 ### POST /sign-block-execution
 
-Executes a block inside the AWS Nitro Enclave and returns a signed result. Requires `--eif_path` at startup.
+Executes a block inside the AWS Nitro Enclave and returns a signed result.
 
 **Input format**: bincode-serialized `EthClientExecutorInput`, optionally compressed with zstd.
 
@@ -152,7 +152,7 @@ If `Content-Encoding: zstd` is present, the proxy decompresses first. Otherwise 
 
 ### POST /sign-batch-root
 
-Fetches blobs from L1 + Beacon API using `batch_index`, then sends them to the enclave for batch root signing. Requires `--eif_path` and L1 context (`L1_RPC_URL`, `L1_ROLLUP_ADDR`, `L1_BEACON_URL`).
+Fetches blobs from L1 + Beacon API using `batch_index`, then sends them to the enclave for batch root signing. Requires L1 context (`L1_RPC_URL`, `L1_ROLLUP_ADDR`, `L1_BEACON_URL`).
 
 **Request**
 ```json
@@ -176,7 +176,7 @@ Fetches blobs from L1 + Beacon API using `batch_index`, then sends them to the e
 
 ### POST /sign-batch-root-from-responses
 
-Signs a batch root from pre-signed block execution responses. Fetches blobs from L1 + Beacon API using `batch_index`. Requires `--eif_path` and L1 context (`L1_RPC_URL`, `L1_ROLLUP_ADDR`, `L1_BEACON_URL`).
+Signs a batch root from pre-signed block execution responses. Fetches blobs from L1 + Beacon API using `batch_index`. Requires L1 context (`L1_RPC_URL`, `L1_ROLLUP_ADDR`, `L1_BEACON_URL`).
 
 **Request**
 ```json
@@ -203,7 +203,7 @@ Signs a batch root from pre-signed block execution responses. Fetches blobs from
 
 Executes a block inside the AWS Nitro Enclave with blob verification. The proxy builds `ClientInput` from L2 RPC and fetches blobs from L1 + Beacon API using the provided `batch_index`.
 
-Requires `--eif_path` and L1 context.
+Requires L1 context.
 
 **Request**
 ```json
@@ -426,7 +426,7 @@ SP1_PRIVATE_KEY=0x… \
 L1_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/… \
 L1_ROLLUP_ADDR=0x… \
 L1_BEACON_URL=https://beacon.example.com \
-  proxy --eif_path enclave.eif
+  proxy
 ```
 
 ### Typical flow

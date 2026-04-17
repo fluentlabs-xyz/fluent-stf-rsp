@@ -88,16 +88,13 @@ COPY --from=proxy-builder /app/proxy /usr/local/bin/proxy
 
 ENV SP1_ELF_PATH=/opt/elfs/sp1-client.elf \
     NITRO_VALIDATOR_ELF_PATH=/opt/elfs/nitro-validator.elf \
-    ATTESTATION_STORAGE=/var/lib/proxy/attestation.bin \
-    PUBLIC_KEY_STORAGE=/var/lib/proxy/public_key.hex \
-    ATTESTATION_REQUEST_ID_STORAGE=/var/lib/proxy/attestation_request_id.hex \
+    PROXY_DB_PATH=/var/lib/proxy/proxy.db \
     HOME=/var/lib/proxy
 
 USER nonroot:nonroot
 WORKDIR /var/lib/proxy
 
 ENTRYPOINT ["/usr/local/bin/proxy"]
-CMD ["--eif_path", "/var/lib/proxy/placeholder.eif"]
 
 ###############################################################################
 #                                                                             #
