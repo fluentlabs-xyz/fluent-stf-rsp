@@ -387,12 +387,15 @@ impl WitnessHubClient {
 
 /// `POST /sign-block-execution`
 ///
-/// Body: bincode-serialized `EthClientExecutorInput`.
+/// Body: bincode-serialized `EthClientExecutorInput`, optionally zstd-compressed
+/// (indicated by `Content-Encoding: zstd`).
 /// Headers: `Content-Type: application/octet-stream`.
 async fn sign_block_execution(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<EthExecutionResponse>, HandlerError> {
+    let body = maybe_decompress(&headers, &body)?;
     let input = decode_bincode::<EthClientExecutorInput>(&body)?;
 
     let response = enclave::execute_block(input, state.nitro)
@@ -400,6 +403,29 @@ async fn sign_block_execution(
         .map_err(|e| internal(format!("Enclave execution failed: {e}")))?;
 
     Ok(Json(response))
+}
+
+/// If the request has `Content-Encoding: zstd`, decompress; otherwise return
+/// the body as-is (borrowed). Rejects unknown encodings to fail loudly instead
+/// of feeding compressed bytes to bincode.
+fn maybe_decompress<'a>(
+    headers: &HeaderMap,
+    body: &'a [u8],
+) -> Result<std::borrow::Cow<'a, [u8]>, HandlerError> {
+    let Some(encoding) = headers.get("content-encoding") else {
+        return Ok(std::borrow::Cow::Borrowed(body));
+    };
+    let encoding = encoding
+        .to_str()
+        .map_err(|e| bad_request(format!("Invalid content-encoding header: {e}")))?;
+    match encoding {
+        "zstd" => {
+            let decompressed = zstd::decode_all(body)
+                .map_err(|e| bad_request(format!("zstd decompression failed: {e}")))?;
+            Ok(std::borrow::Cow::Owned(decompressed))
+        }
+        other => Err(bad_request(format!("Unsupported content-encoding: {other}"))),
+    }
 }
 
 /// Decode a bincode payload.

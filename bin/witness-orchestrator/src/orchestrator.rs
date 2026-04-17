@@ -88,6 +88,11 @@ fn is_log_worthy(attempts: u64) -> bool {
     attempts > 0 && attempts.is_power_of_two()
 }
 
+/// zstd level for `/sign-block-execution` payload compression. Level 3 is the
+/// default and a good size/CPU trade-off for online use (~3–10× on bincode
+/// witness data; sub-100ms on multi-MB inputs).
+const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+
 /// Configuration for the orchestrator.
 #[derive(Clone)]
 pub(crate) struct OrchestratorConfig {
@@ -166,7 +171,27 @@ async fn execution_worker(
             else => break,
         };
 
-        let payload = Bytes::from(task.payload);
+        let uncompressed_len = task.payload.len();
+        let payload = match zstd::encode_all(task.payload.as_slice(), ZSTD_COMPRESSION_LEVEL) {
+            Ok(compressed) => {
+                tracing::debug!(
+                    block = task.block_number,
+                    uncompressed_len,
+                    compressed_len = compressed.len(),
+                    "Compressed block payload for /sign-block-execution"
+                );
+                Bytes::from(compressed)
+            }
+            Err(e) => {
+                error!(
+                    worker_id,
+                    block = task.block_number,
+                    err = %e,
+                    "zstd compression failed — dropping task"
+                );
+                continue;
+            }
+        };
         let mut backoff = Duration::from_millis(50);
         let mut attempts: u32 = 0;
         loop {
@@ -1141,6 +1166,7 @@ async fn send_block_request(
         .post(&url)
         .timeout(Duration::from_secs(30))
         .header("content-type", "application/octet-stream")
+        .header("content-encoding", "zstd")
         .header("x-block-number", block_number.to_string())
         .header("x-api-key", api_key)
         .body(payload)

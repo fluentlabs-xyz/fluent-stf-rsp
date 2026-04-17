@@ -158,6 +158,7 @@ pub(crate) async fn prove_and_submit(
                     matches!(
                         ne,
                         Sp1NetworkError::RequestUnfulfillable { .. }
+                            | Sp1NetworkError::RequestUnexecutable { .. }
                             | Sp1NetworkError::RequestTimedOut { .. }
                             | Sp1NetworkError::RequestAuctionTimedOut { .. }
                     )
@@ -175,13 +176,15 @@ pub(crate) async fn prove_and_submit(
                     tracing::warn!(
                         request_id = %hex::encode(id),
                         fulfiller = %fulfiller,
-                        "Prover returned unfulfillable — blacklisting"
+                        error = %e,
+                        "Proof request failed with retriable error — blacklisting fulfiller"
                     );
                     blacklist.insert(fulfiller);
                 } else {
                     tracing::warn!(
                         request_id = %hex::encode(id),
-                        "Proof request failed, could not identify fulfiller"
+                        error = %e,
+                        "Proof request failed with retriable error, could not identify fulfiller"
                     );
                 }
 
