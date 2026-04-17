@@ -21,7 +21,7 @@ use k256::SecretKey;
 use alloy_primitives::{Address, B256};
 use c_kzg::{Blob, KzgSettings, BYTES_PER_BLOB};
 
-use fluent_stf_primitives::{FLUENT_CHAIN_ID, NITRO_VERIFIER_ADDRESS};
+use fluent_stf_primitives::{L1_CHAIN_ID, NITRO_VERIFIER_ADDRESS};
 use nitro_types::{EnclaveIncoming, EnclaveResponse, EthExecutionResponse, SubmitBatchResponse};
 use rsp_client_executor::{executor::EthClientExecutor, io::EthClientExecutorInput};
 
@@ -262,6 +262,9 @@ fn verify_blobs(
 /// matching Solidity's `abi.encode(block.chainid, address(this), batchRoot, blobHashes)`
 /// in `NitroVerifier.verifyBatch` (domain separation against cross-chain /
 /// cross-deployment replay).
+///
+/// `block.chainid` in Solidity is the L1 chain where `NitroVerifier` is deployed,
+/// so we sign under `L1_CHAIN_ID`, not the Fluent L2 chain id.
 fn abi_encode_batch(batch_root: &[u8; 32], hashes: &[B256]) -> Vec<u8> {
     // Head: chainId(32) + verifier(32) + batchRoot(32) + offset(32) = 128 bytes
     // Tail: array length(32) + elements(32 * N)
@@ -269,7 +272,7 @@ fn abi_encode_batch(batch_root: &[u8; 32], hashes: &[B256]) -> Vec<u8> {
 
     // uint256 chainId — left-padded big-endian
     let mut chain_id_word = [0u8; 32];
-    chain_id_word[24..32].copy_from_slice(&FLUENT_CHAIN_ID.to_be_bytes());
+    chain_id_word[24..32].copy_from_slice(&L1_CHAIN_ID.to_be_bytes());
     buf.extend_from_slice(&chain_id_word);
 
     // address verifier — left-padded (12 zero bytes || 20-byte address)

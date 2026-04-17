@@ -117,12 +117,12 @@ sol! {
 /// `batch_id` is found, then derive the L2 starting block from its
 /// `lastBlockHash` field.
 ///
-/// `lastBlockHash` in `BatchCommitted` is the hash of the L2 block that
-/// directly precedes the batch (i.e., the parent of the batch's first block).
-/// So the first L2 block in batch N is `lastBlockHash`'s number + 1.
+/// `lastBlockHash` in `BatchCommitted` is the hash of the **last** L2 block
+/// *inside* this batch. The first L2 block is therefore
+/// `lastBlockHash.number - numberOfBlocks + 1`.
 ///
 /// Returns `(l2_from_block, l1_event_block, num_blocks)`:
-/// - `l2_from_block`: first L2 block in the batch (`prev_block.number + 1`)
+/// - `l2_from_block`: first L2 block in the batch (`last_block.number - num_blocks + 1`)
 /// - `l1_event_block`: L1 block containing the `BatchCommitted` event
 /// - `num_blocks`: number of L2 block headers in this batch
 ///
@@ -207,7 +207,7 @@ pub async fn resolve_l2_start_checkpoint(
         )
     })?;
 
-    let prev_block_number = l2_provider
+    let l2_to_block = l2_provider
         .get_block_by_hash(last_block_hash)
         .await
         .map_err(|e| eyre!("eth_getBlockByHash({last_block_hash}) on L2: {e}"))?
@@ -221,13 +221,18 @@ pub async fn resolve_l2_start_checkpoint(
         .header
         .number;
 
-    let l2_from_block = prev_block_number + 1;
+    let l2_from_block = l2_to_block.checked_sub(num_blocks - 1).ok_or_else(|| {
+        eyre!(
+            "batch {batch_id}: lastBlockHash.number={l2_to_block} < numberOfBlocks={num_blocks} - 1 \
+             — L2 chain appears shorter than the batch it committed."
+        )
+    })?;
 
     info!(
         batch_id,
         %last_block_hash,
-        prev_block_number,
         l2_from_block,
+        l2_to_block,
         num_blocks,
         l1_block,
         "Resolved L2 start checkpoint"

@@ -1,5 +1,5 @@
-//! Orchestrator orchestrator: receives witnesses from the embedded forward driver,
-//! dispatches them to the Nitro proxy, and drives L1 batch signing + submission.
+//! Orchestrator: pulls witnesses from the embedded forward driver, dispatches
+//! them to the Nitro proxy, and drives L1 batch signing + submission.
 //!
 //! # Architecture
 //!
@@ -7,17 +7,20 @@
 //! pair (`high_rx` / `normal_rx`) via `biased` select, ensuring re-execution
 //! after enclave key rotation takes precedence over fresh witnesses.
 //!
-//! Witnesses arrive in-process via [`mpsc::Receiver<ProveRequest>`]: the main
-//! select loop forwards each request into `normal_tx`, whose bounded capacity
-//! provides backpressure on the driver when workers are saturated.
+//! Witnesses are **pulled** by a single feeder task that calls
+//! [`Driver::try_take_new_block`] and forwards the result into `normal_tx`.
+//! Back-pressure is natural: when workers are saturated, the feeder blocks on
+//! `normal_tx.send().await`, which stops calling the driver, which idles.
+//! The main select loop is drain-only — no branch performs an awaited send,
+//! eliminating the bounded-channel deadlock the previous push-model suffered from.
 //!
 //! On key rotation, blocks that need re-execution are fetched from the cold
 //! witness store ([`WitnessHub::get_witness`]) and pushed onto the high-priority
-//! queue.
+//! queue — independent of the feeder.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
@@ -30,9 +33,10 @@ use tracing::{error, info, warn};
 
 use crate::accumulator::BatchAccumulator;
 use crate::db::Db;
+use crate::driver::Driver;
 use crate::hub::WitnessHub;
 use crate::l1_listener::L1Event;
-use crate::types::{EthExecutionResponse, ProveRequest, SignBatchRootRequest, SubmitBatchResponse};
+use crate::types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse};
 use l1_rollup_client::{nitro_verifier::is_key_registered, submit_preconfirmation};
 
 use alloy_eips::BlockNumberOrTag;
@@ -42,6 +46,13 @@ use alloy_provider::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy_provider::{Identity, Provider, RootProvider};
+
+/// Shared set of block numbers whose execution response is already present in
+/// the accumulator. Read by the feeder (to skip blocks with a response),
+/// written on every response insert / purge / finalization. Kept as a narrow
+/// projection of `BatchAccumulator.responses` so the feeder does not need to
+/// lock the full accumulator.
+pub(crate) type KnownResponses = Arc<RwLock<HashSet<u64>>>;
 
 /// Concrete type of the L1 write provider built in `main`. Pinned to the
 /// current alloy filler stack; a future alloy upgrade that changes the filler
@@ -211,14 +222,15 @@ async fn execution_worker(
 // Main orchestrator loop
 // ============================================================================
 
-/// Run the orchestrator orchestrator loop until `shutdown` fires or `prove_rx` closes.
+/// Run the orchestrator loop until `shutdown` fires.
 ///
-/// Creates the persistent execution worker pool once and reads witnesses from
-/// the in-process `prove_rx` channel supplied by the embedded forward driver.
+/// Creates the persistent execution worker pool once and spawns a feeder task
+/// that pulls witnesses from the embedded forward driver via
+/// [`Driver::try_take_new_block`] and forwards them into `normal_tx`.
 pub(crate) async fn run(
     config: OrchestratorConfig,
     hub: Arc<WitnessHub>,
-    mut prove_rx: mpsc::Receiver<ProveRequest>,
+    driver: Arc<Driver>,
     mut l1_events: mpsc::Receiver<L1Event>,
     shutdown: CancellationToken,
 ) {
@@ -236,6 +248,11 @@ pub(crate) async fn run(
             db.lock().unwrap_or_else(|e| e.into_inner()).get_last_batch_end().map(|e| e + 1)
         });
 
+    let known_responses: KnownResponses = {
+        let initial: HashSet<u64> = accumulator.response_block_numbers().collect();
+        Arc::new(RwLock::new(initial))
+    };
+
     // Persists across finalization ticks: a batch still dispatched but with a
     // transiently missing receipt should not reset its observation window.
     let mut missing_receipt_first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
@@ -247,6 +264,7 @@ pub(crate) async fn run(
             &db,
             &mut accumulator,
             &mut missing_receipt_first_seen,
+            &known_responses,
         )
         .await;
     }
@@ -270,6 +288,62 @@ pub(crate) async fn run(
             config.api_key.clone(),
             shutdown.clone(),
         ));
+    }
+
+    // Feeder: the single producer for `normal_tx`. Pulls witnesses from the
+    // driver one at a time and forwards them. Critical invariant — this is
+    // the ONLY place that sends into normal_tx (key-rotation replay writes
+    // directly to high_tx). Back-pressure propagates naturally: when workers
+    // are saturated, `normal_tx.send().await` blocks the feeder, which stops
+    // calling `try_take_new_block`, which idles the driver.
+    {
+        let driver = Arc::clone(&driver);
+        let normal_tx = normal_tx.clone();
+        let shutdown = shutdown.clone();
+        let known_responses = Arc::clone(&known_responses);
+        tokio::spawn(async move {
+            const FEEDER_IDLE: Duration = Duration::from_millis(500);
+
+            loop {
+                if shutdown.is_cancelled() {
+                    info!("Feeder: shutdown — exiting");
+                    break;
+                }
+
+                match driver.try_take_new_block(&shutdown).await {
+                    Ok(Some(req)) => {
+                        let bn = req.block_number;
+                        // Dedup: if the main loop already has a response for this
+                        // block (e.g. after a startup checkpoint rollback that
+                        // caused the driver to re-feed covered blocks), skip the
+                        // proxy round-trip. The main loop's gap-check gate in
+                        // `on_block_result` still rejects duplicates if they slip
+                        // through, so this is an efficiency layer, not a
+                        // correctness gate.
+                        if known_responses.read().unwrap_or_else(|e| e.into_inner()).contains(&bn) {
+                            continue;
+                        }
+                        let task = ExecutionTask { block_number: bn, payload: req.payload };
+                        if normal_tx.send(task).await.is_err() {
+                            warn!("Feeder: normal_tx closed — exiting");
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = tokio::time::sleep(FEEDER_IDLE) => continue,
+                        }
+                    }
+                    Err(e) => {
+                        error!(err = %e, "Feeder: driver fatal — cancelling shutdown");
+                        shutdown.cancel();
+                        break;
+                    }
+                }
+            }
+            info!("Feeder exited");
+        });
     }
 
     let from_block = {
@@ -299,6 +373,7 @@ pub(crate) async fn run(
         global_next_dispatch_allowed: None,
         pending_key_check: None,
         key_check_attempts: 0,
+        known_responses: Arc::clone(&known_responses),
     };
 
     info!(from_block, "Orchestrator ready — awaiting witnesses");
@@ -309,25 +384,6 @@ pub(crate) async fn run(
             _ = shutdown.cancelled() => {
                 info!("Shutdown requested — exiting orchestrator loop");
                 break;
-            }
-            // ── Witness intake from the embedded driver ─────────────────
-            Some(req) = prove_rx.recv() => {
-                if req.block_number <= state.checkpoint {
-                    warn!(
-                        block_number = req.block_number,
-                        checkpoint = state.checkpoint,
-                        "Ignoring stale prove request"
-                    );
-                    continue;
-                }
-                if normal_tx
-                    .send(ExecutionTask { block_number: req.block_number, payload: req.payload })
-                    .await
-                    .is_err()
-                {
-                    warn!(block_number = req.block_number, "Normal execution channel closed");
-                    break;
-                }
             }
             // ── Block execution results ────────────────────────────────
             Some(result) = result_rx.recv() =>
@@ -420,6 +476,7 @@ struct OrchestratorState {
     /// `InvalidSignatures` rotation starts. Used by `spawn_key_check` to
     /// thin logs at 1, 2, 4, 8, ... attempts during long outages.
     key_check_attempts: u64,
+    known_responses: KnownResponses,
 }
 
 impl OrchestratorState {
@@ -427,17 +484,26 @@ impl OrchestratorState {
     async fn on_block_result(&mut self, result: BlockResult, accumulator: &mut BatchAccumulator) {
         let block_number = result.block_number;
 
-        if block_number <= self.checkpoint {
+        // Gap check: accept the result iff the block falls inside the range of
+        // some non-dispatched pending batch AND we do not already have a
+        // response for it. Results that fail this check are either late
+        // arrivals for a block whose batch has already been finalized, or
+        // duplicate re-execution results from an earlier run. Either way
+        // ignore — persisting them would undo finalize cleanup or clobber a
+        // fresh response.
+        if !accumulator.block_is_in_pending_gap(block_number) {
             warn!(
                 block_number,
                 checkpoint = self.checkpoint,
-                "Ignoring stale block result (orphaned task)"
+                "Ignoring block result: not inside any pending-batch gap"
             );
             return;
         }
 
         info!(block_number, "Block execution response received");
         accumulator.insert_response(result.response).await;
+
+        self.known_responses.write().unwrap_or_else(|e| e.into_inner()).insert(block_number);
 
         self.confirmed.insert(block_number);
         while self.confirmed.contains(&(self.checkpoint + 1)) {
@@ -610,6 +676,13 @@ impl OrchestratorState {
                 accumulator.purge_responses(&invalid_blocks).await;
                 accumulator.delete_batch_signature(batch_index).await;
 
+                {
+                    let mut w = self.known_responses.write().unwrap_or_else(|e| e.into_inner());
+                    for b in &invalid_blocks {
+                        w.remove(b);
+                    }
+                }
+
                 for &block_number in &invalid_blocks {
                     self.spawn_re_execution(block_number);
                 }
@@ -745,6 +818,7 @@ impl OrchestratorState {
             &self.db,
             accumulator,
             missing_receipt_first_seen,
+            &self.known_responses,
         )
         .await;
 
@@ -801,6 +875,7 @@ async fn check_finalized_batches(
     db: &Arc<Mutex<Db>>,
     accumulator: &mut BatchAccumulator,
     missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
+    known_responses: &KnownResponses,
 ) -> bool {
     if !accumulator.has_dispatched() {
         return false;
@@ -828,6 +903,12 @@ async fn check_finalized_batches(
                 let Some(dispatched) = accumulator.finalize_dispatched(batch_index).await else {
                     continue;
                 };
+                {
+                    let mut w = known_responses.write().unwrap_or_else(|e| e.into_inner());
+                    for b in dispatched.from_block..=dispatched.to_block {
+                        w.remove(&b);
+                    }
+                }
                 {
                     let db = Arc::clone(db);
                     let block = dispatched.to_block;
@@ -1137,13 +1218,19 @@ mod tests {
         let provider = StubFinality { finalized: Some(1000), receipts: HashMap::new() };
         let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
 
-        let changed = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
+        let changed =
+            check_finalized_batches(&provider, &db, &mut acc, &mut first_seen, &known_responses)
+                .await;
         assert!(!changed, "first missing receipt must not cause undispatch");
         assert!(acc.has_dispatched(), "batch must remain dispatched");
         assert!(first_seen.contains_key(&1));
 
         tokio::time::advance(RECEIPT_MISSING_WINDOW + Duration::from_secs(1)).await;
-        let changed = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
+        let changed =
+            check_finalized_batches(&provider, &db, &mut acc, &mut first_seen, &known_responses)
+                .await;
         assert!(changed, "elapsed window must trigger undispatch");
         assert!(!acc.has_dispatched(), "batch must be undispatched after window");
         assert!(!first_seen.contains_key(&1), "first_seen entry cleared on undispatch");
@@ -1169,7 +1256,10 @@ mod tests {
         let provider = StubFinality { finalized: Some(1000), receipts };
         let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
 
-        let changed = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
+        let changed =
+            check_finalized_batches(&provider, &db, &mut acc, &mut first_seen, &known_responses)
+                .await;
 
         assert!(changed, "batch 2 finalization must mark state as changed");
         assert!(first_seen.contains_key(&1), "batch 1 first_seen recorded");

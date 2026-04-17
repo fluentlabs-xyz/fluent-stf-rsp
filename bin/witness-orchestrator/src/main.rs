@@ -8,9 +8,9 @@
 //! ## Data flow
 //!
 //! ```text
-//! L2 RPC ──▶ forward driver ──mpsc──▶ orchestrator ──HTTP POST──▶ proxy ──▶ Nitro
-//!                   │
-//!                   └──▶ redb cold witness store (for key-rotation replay)
+//! L2 RPC ──▶ Driver (struct) ◀──pull── feeder ──▶ normal_tx ──▶ workers ──HTTP──▶ proxy
+//!                   │                                                         │
+//!                   └──▶ redb cold witness store             result_rx ◀──────┘
 //! ```
 //!
 //! # Configuration (environment variables)
@@ -50,7 +50,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::hub::WitnessHub;
-use crate::types::ProveRequest;
 use alloy_network::{Ethereum, EthereumWallet};
 use alloy_primitives::Address;
 use alloy_provider::{ProviderBuilder, RootProvider};
@@ -66,7 +65,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use driver::DriverConfig;
+use driver::{Driver, DriverConfig};
 use orchestrator::OrchestratorConfig;
 
 const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:8080";
@@ -191,6 +190,72 @@ async fn main() {
             }
         }
 
+        // ── Startup: recover from re-execution result gaps ──────────────────────
+        //
+        // If a previous run lost re-execution results (e.g. enclave key rotation
+        // followed by orchestrator restart), some pending batches may have gaps
+        // in their block_responses coverage. Roll the checkpoint back to
+        // `earliest_gap - 1` so the driver re-feeds the missing blocks on this
+        // run.
+        {
+            let pending = db_startup.load_batches();
+            let dispatched_ranges = db_startup.load_dispatched_block_ranges();
+            let response_blocks: std::collections::HashSet<u64> =
+                db_startup.get_all_response_block_numbers().into_iter().collect();
+
+            let dispatched_set: std::collections::HashSet<u64> =
+                dispatched_ranges.iter().flat_map(|&(f, t)| f..=t).collect();
+
+            let mut earliest_gap: Option<u64> = None;
+            let mut gapped_batches: Vec<u64> = Vec::new();
+
+            for batch in &pending {
+                let mut batch_has_gap = false;
+                for b in batch.from_block..=batch.to_block {
+                    if dispatched_set.contains(&b) {
+                        continue;
+                    }
+                    if response_blocks.contains(&b) {
+                        continue;
+                    }
+                    batch_has_gap = true;
+                    earliest_gap = Some(match earliest_gap {
+                        Some(current) => current.min(b),
+                        None => b,
+                    });
+                }
+                if batch_has_gap {
+                    gapped_batches.push(batch.batch_index);
+                }
+            }
+
+            if let Some(gap) = earliest_gap {
+                let current_ckpt = db_startup.get_checkpoint();
+                let new_ckpt = gap.saturating_sub(1);
+                if new_ckpt < current_ckpt {
+                    info!(
+                        current_ckpt,
+                        earliest_gap = gap,
+                        new_ckpt,
+                        gapped_batches = ?gapped_batches,
+                        "Startup gap recovery: rolling back checkpoint"
+                    );
+                    db_startup.save_checkpoint(new_ckpt);
+                    for idx in &gapped_batches {
+                        db_startup.delete_batch_signature(*idx);
+                    }
+                } else {
+                    info!(
+                        current_ckpt,
+                        earliest_gap = gap,
+                        "Startup gap detected but checkpoint already at or below rollback target"
+                    );
+                }
+            } else {
+                info!("Startup gap scan: no gaps detected");
+            }
+        }
+
         let checkpoint = db_startup.get_checkpoint();
         let witness_from = if checkpoint > 0 { checkpoint + 1 } else { 0 };
 
@@ -274,9 +339,8 @@ async fn main() {
         });
     }
 
-    // Cold witness store + in-process witness channel.
+    // Cold witness store.
     let hub = Arc::new(WitnessHub::new(cold_file, max_cold_bytes, witness_retention_blocks));
-    let (prove_tx, prove_rx) = tokio::sync::mpsc::channel::<ProveRequest>(64);
 
     // Witness HTTP server — serves cold witnesses to the proxy (challenge/mock
     // endpoints). Opens a read path into the same `redb` file without the
@@ -332,28 +396,42 @@ async fn main() {
         None
     };
 
-    {
-        let hub = Arc::clone(&hub);
+    let driver = Arc::new(
+        Driver::new(DriverConfig {
+            factory,
+            rpc: driver_rpc,
+            host_executor,
+            hub: Arc::clone(&hub),
+            chain_spec,
+            pruner,
+            witness_from_block,
+            orchestrator_checkpoint,
+        })
+        .expect("Driver::new failed"),
+    );
+
+    // Catch-up runs as its own task so the orchestrator (L1 listener, signing,
+    // dispatch) stays responsive while MDBX fast-forwards to witness_from_block.
+    //
+    // NOT added to `tasks` on purpose: this is a one-shot catch-up — successful
+    // completion is expected (and happens instantly when MDBX is already past
+    // `witness_from_block`). The JoinSet race below cancels the root token on
+    // ANY task exit, so routing this through `tasks` would tear the whole
+    // process down as soon as catch-up finished. On failure, we cancel the
+    // root token here ourselves.
+    let catchup_handle = {
+        let driver = Arc::clone(&driver);
         let shutdown = shutdown.clone();
-        tasks.spawn(async move {
-            let r = driver::run(
-                DriverConfig {
-                    factory,
-                    rpc: driver_rpc,
-                    host_executor,
-                    hub,
-                    prove_tx,
-                    chain_spec,
-                    pruner,
-                    witness_from_block,
-                    orchestrator_checkpoint,
-                },
-                shutdown,
-            )
-            .await;
-            ("driver", r)
-        });
-    }
+        tokio::spawn(async move {
+            match driver.advance_to_witness_from_block(&shutdown).await {
+                Ok(()) => info!("driver_catchup: completed"),
+                Err(e) => {
+                    tracing::error!(err = %e, "driver_catchup: fatal — cancelling shutdown");
+                    shutdown.cancel();
+                }
+            }
+        })
+    };
 
     let config = OrchestratorConfig {
         proxy_url,
@@ -367,14 +445,13 @@ async fn main() {
     };
 
     // Orchestrator runs in the foreground. Race it against `tasks.join_next()`
-    // so that ANY background task exiting first (driver failure, listener
-    // error, signal handler) immediately cancels the root token. Without
-    // this race, a driver failure closes prove_tx — the orchestrator's
-    // `Some(req) = prove_rx.recv()` arm would simply disable, and the loop
-    // would keep running forever on l1_events / sign_done / ticker.
+    // so that ANY background task exiting first (signal handler, L1 listener,
+    // witness server) immediately cancels the root token. Catch-up is tracked
+    // separately via `catchup_handle` because its successful completion is
+    // expected and must not trigger shutdown.
     let mut exit_code = 0;
     let mut orchestrator_fut =
-        std::pin::pin!(orchestrator::run(config, hub, prove_rx, l1_rx, shutdown.clone()));
+        std::pin::pin!(orchestrator::run(config, hub, driver, l1_rx, shutdown.clone()));
 
     tokio::select! {
         () = orchestrator_fut.as_mut() => {
@@ -409,6 +486,15 @@ async fn main() {
                 tracing::error!(err = %e, "background task join failed");
                 exit_code = 1;
             }
+        }
+    }
+
+    // Wait for catch-up to observe shutdown and exit. Aborts only if it's still
+    // running — on normal exit it has already completed long ago.
+    if let Err(e) = catchup_handle.await {
+        if !e.is_cancelled() {
+            tracing::error!(err = %e, "driver_catchup join failed");
+            exit_code = 1;
         }
     }
 

@@ -217,6 +217,26 @@ impl BatchAccumulator {
             && (batch.from_block..=batch.to_block).all(|b| self.responses.contains_key(&b))
     }
 
+    /// True iff `block` falls inside the range of some pending (non-dispatched)
+    /// batch AND no response is currently stored for it.
+    ///
+    /// Used by `on_block_result` to decide whether to accept a block execution
+    /// result or discard it as stale/duplicate. A result is accepted only when
+    /// it fills an actual gap in a pending batch.
+    pub(crate) fn block_is_in_pending_gap(&self, block: u64) -> bool {
+        if self.responses.contains_key(&block) {
+            return false;
+        }
+        self.batches.values().any(|b| b.from_block <= block && block <= b.to_block)
+    }
+
+    /// Iterator over every block number with a stored response.
+    /// Used at orchestrator startup to seed the shared `known_responses`
+    /// dedup set.
+    pub(crate) fn response_block_numbers(&self) -> impl Iterator<Item = u64> + '_ {
+        self.responses.keys().copied()
+    }
+
     #[cfg(test)]
     pub(crate) fn first_ready(&self) -> Option<u64> {
         self.batches.values().find(|b| self.is_batch_ready(b)).map(|b| b.batch_index)

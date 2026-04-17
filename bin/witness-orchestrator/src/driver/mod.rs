@@ -1,9 +1,9 @@
 //! Embedded forward-sync driver: re-executes L2 blocks against a writable
-//! `ProviderFactory`, produces witnesses via `execute_exex_with_block`, and
-//! emits `ProveRequest`s into the orchestrator channel.
+//! `ProviderFactory` and produces witnesses on demand via
+//! `Driver::try_take_new_block`.
 
 mod forward;
 mod node_types;
 
-pub(crate) use forward::{open_writable_factory, run, DriverConfig};
+pub(crate) use forward::{open_writable_factory, Driver, DriverConfig};
 pub(crate) use node_types::FluentMdbxNode;
