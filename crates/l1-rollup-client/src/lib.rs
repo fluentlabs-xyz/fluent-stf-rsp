@@ -113,23 +113,39 @@ sol! {
 // Read helpers
 // =====================================================================
 
-/// Walk all `BatchCommitted` events from `l1_deploy_block` until the event
-/// for `batch_id` is found, summing `numberOfBlocks` for prior batches to
-/// derive the L2 starting block.
+/// Walk `BatchCommitted` events from `l1_deploy_block` until the event for
+/// `batch_id` is found, then derive the L2 starting block from its
+/// `lastBlockHash` field.
+///
+/// `lastBlockHash` in `BatchCommitted` is the hash of the L2 block that
+/// directly precedes the batch (i.e., the parent of the batch's first block).
+/// So the first L2 block in batch N is `lastBlockHash`'s number + 1.
 ///
 /// Returns `(l2_from_block, l1_event_block, num_blocks)`:
-/// - `l2_from_block`: first L2 block in the batch (`1 + sum(prior numberOfBlocks)`)
+/// - `l2_from_block`: first L2 block in the batch (`prev_block.number + 1`)
 /// - `l1_event_block`: L1 block containing the `BatchCommitted` event
 /// - `num_blocks`: number of L2 block headers in this batch
+///
+/// Rejects `batch_id == 0` — batch 0 is the synthetic genesis batch and
+/// cannot be reproved.
 ///
 /// Note: this is O(batch_id) on cold start. Callers should treat it as a
 /// rare manual operation (e.g., explicit `L1_START_BATCH_ID`).
 pub async fn resolve_l2_start_checkpoint(
     l1_provider: &RootProvider,
+    l2_provider: &RootProvider,
     contract_addr: Address,
     batch_id: u64,
     l1_deploy_block: u64,
 ) -> Result<(u64, u64, u64)> {
+    if batch_id == 0 {
+        return Err(eyre!(
+            "L1_START_BATCH_ID must be >= 1. Batch 0 is the synthetic genesis \
+             batch and cannot be reproved; use batch_id=1 to start at the \
+             first user-facing batch."
+        ));
+    }
+
     let latest = l1_provider
         .get_block_number()
         .await
@@ -138,8 +154,7 @@ pub async fn resolve_l2_start_checkpoint(
     const PAGE: u64 = 50_000;
     const SCAN_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
-    let mut sum_blocks: u64 = 0;
-    let mut target: Option<(u64, u64)> = None; // (l1_event_block, num_blocks)
+    let mut target: Option<(u64, u64, B256)> = None; // (l1_event_block, num_blocks, last_block_hash)
     let mut current = l1_deploy_block;
 
     'outer: while current <= latest {
@@ -161,18 +176,16 @@ pub async fn resolve_l2_start_checkpoint(
                 .batchIndex
                 .try_into()
                 .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-            let num_blocks: u64 = event
-                .numberOfBlocks
-                .try_into()
-                .map_err(|_| eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks))?;
 
-            if idx < batch_id {
-                sum_blocks += num_blocks;
-            } else if idx == batch_id {
+            if idx == batch_id {
+                let num_blocks: u64 = event
+                    .numberOfBlocks
+                    .try_into()
+                    .map_err(|_| eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks))?;
                 let l1_block = log
                     .block_number
                     .ok_or_else(|| eyre!("BatchCommitted log missing block_number"))?;
-                target = Some((l1_block, num_blocks));
+                target = Some((l1_block, num_blocks, event.lastBlockHash));
                 break 'outer;
             }
         }
@@ -183,41 +196,64 @@ pub async fn resolve_l2_start_checkpoint(
         }
     }
 
-    let (l1_block, num_blocks) = target.ok_or_else(|| {
+    let (l1_block, num_blocks, last_block_hash) = target.ok_or_else(|| {
         eyre!(
             "BatchCommitted for batch {batch_id} not found in L1 blocks \
              [{l1_deploy_block}..{latest}]. \
-             Ensure L1_ROLLUP_DEPLOY_BLOCK is ≤ the block where batch 0 was committed. \
+             Ensure L1_ROLLUP_DEPLOY_BLOCK is ≤ the block where batch {batch_id} was committed. \
              If the block range is correct, the deployed Rollup contract's ABI \
              may have drifted from this binding — verify the BatchCommitted \
              topic hash against the release the contract was deployed from."
         )
     })?;
 
-    let l2_from_block = 1 + sum_blocks;
+    let prev_block_number = l2_provider
+        .get_block_by_hash(last_block_hash)
+        .await
+        .map_err(|e| eyre!("eth_getBlockByHash({last_block_hash}) on L2: {e}"))?
+        .ok_or_else(|| {
+            eyre!(
+                "L2 block with hash {last_block_hash} (from \
+                 BatchCommitted.lastBlockHash for batch {batch_id}) not found — \
+                 L2 RPC may be pointing at the wrong chain or be missing history."
+            )
+        })?
+        .header
+        .number;
+
+    let l2_from_block = prev_block_number + 1;
 
     info!(
         batch_id,
+        %last_block_hash,
+        prev_block_number,
         l2_from_block,
         num_blocks,
         l1_block,
-        "Resolved L2 start checkpoint by walking BatchCommitted events"
+        "Resolved L2 start checkpoint"
     );
 
     Ok((l2_from_block, l1_block, num_blocks))
 }
 
-/// Resolve `(from_block, to_block)` for a given `batch_id` using only L1
+/// Resolve `(from_block, to_block)` for a given `batch_id` using L1 + L2
 /// reads. Used by `bin/proxy` to map a challenge request's `batch_index` →
 /// L2 block range without requiring the caller to know it.
 pub async fn fetch_batch_range(
     l1_provider: &RootProvider,
+    l2_provider: &RootProvider,
     contract_addr: Address,
     batch_id: u64,
     l1_deploy_block: u64,
 ) -> Result<(u64, u64)> {
-    let (l2_from_block, _l1_event_block, num_blocks) =
-        resolve_l2_start_checkpoint(l1_provider, contract_addr, batch_id, l1_deploy_block).await?;
+    let (l2_from_block, _l1_event_block, num_blocks) = resolve_l2_start_checkpoint(
+        l1_provider,
+        l2_provider,
+        contract_addr,
+        batch_id,
+        l1_deploy_block,
+    )
+    .await?;
     let to_block = l2_from_block + num_blocks - 1;
     Ok((l2_from_block, to_block))
 }

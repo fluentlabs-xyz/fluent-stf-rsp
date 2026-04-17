@@ -22,6 +22,7 @@ use reth_provider::providers::{
 };
 use reth_provider::{BlockNumReader, DatabaseProviderFactory, HeaderProvider, SaveBlocksMode};
 use reth_prune::Pruner;
+use reth_prune_types::MINIMUM_UNWIND_SAFE_DISTANCE;
 use reth_revm::database::StateProviderDatabase;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
 use rsp_client_executor::evm::FluentEvmConfig;
@@ -123,6 +124,9 @@ pub(crate) struct DriverConfig {
     /// are commit-only (MDBX sync without witness/cold-store/ProveRequest).
     /// Set to 0 to witness every block (default when L1_START_BATCH_ID is unset).
     pub witness_from_block: u64,
+    /// Pipeline-confirmed watermark from the orchestrator's SQLite store.
+    /// The driver's resume cursor is `max(orchestrator_checkpoint + 1, witness_from_block)`.
+    pub orchestrator_checkpoint: u64,
 }
 
 /// A block fetched from RPC together with the time it took to pull.
@@ -173,10 +177,42 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
             ));
         }
     }
-    let start_tip = mdbx_tip;
-    let mut next = start_tip + 1;
     let witness_from_block = cfg.witness_from_block;
-    info!(mdbx_tip, cold_last = ?cold_last, next, witness_from_block, "Forward driver ready");
+    let start_tip = mdbx_tip;
+
+    // Startup safety: if PRUNE_FULL is on and the tip is far past
+    // witness_from_block, the history needed to re-witness blocks
+    // [witness_from_block..start_tip] may already have been pruned.
+    if pruner.is_some()
+        && witness_from_block <= start_tip
+        && start_tip - witness_from_block > MINIMUM_UNWIND_SAFE_DISTANCE
+    {
+        return Err(eyre!(
+            "PRUNE_FULL=true but mdbx_tip ({start_tip}) is {} blocks past \
+             witness_from_block ({witness_from_block}) — account_history/storage_history \
+             needed to re-witness blocks [{witness_from_block}..{start_tip}] may already \
+             have been pruned (MINIMUM_UNWIND_SAFE_DISTANCE = {}). Either disable \
+             PRUNE_FULL, or restore from a snapshot whose mdbx_tip is within {} blocks \
+             of witness_from_block.",
+            start_tip - witness_from_block,
+            MINIMUM_UNWIND_SAFE_DISTANCE,
+            MINIMUM_UNWIND_SAFE_DISTANCE,
+        ));
+    }
+
+    // Resume cursor: max of pipeline-confirmed checkpoint and first
+    // witness-required block. This handles snapshots where MDBX is ahead of
+    // the orchestrator's confirmed watermark — the driver re-witnesses the
+    // gap [next..=start_tip] in the re-witness branch below.
+    let mut next = (cfg.orchestrator_checkpoint + 1).max(witness_from_block);
+    info!(
+        mdbx_tip = start_tip,
+        cold_last = ?cold_last,
+        orchestrator_checkpoint = cfg.orchestrator_checkpoint,
+        witness_from_block,
+        next,
+        "Forward driver ready"
+    );
 
     loop {
         if shutdown.is_cancelled() {
@@ -195,14 +231,18 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
             }
         };
 
-        if remote_tip < next {
+        // Re-witness range [next..=start_tip] is locally bounded; if remote
+        // is somehow behind start_tip we still want to drain it. Idle-wait
+        // only fires when both are exhausted.
+        let upper_inclusive = remote_tip.max(start_tip);
+        if next > upper_inclusive {
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(IDLE_POLL_INTERVAL) => continue,
             }
         }
 
-        while next <= remote_tip {
+        while next <= upper_inclusive {
             if shutdown.is_cancelled() {
                 info!("Shutdown requested mid-range — driver exiting");
                 return Ok(());
@@ -210,7 +250,59 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
 
             let block_number = next;
 
-            // ── Commit-only fast path (catch-up before first batch) ────
+            // ── Already-committed re-witness paths (block_number <= start_tip) ──
+            if block_number <= start_tip {
+                if block_number < witness_from_block {
+                    // Below witness threshold: already committed, no witness needed.
+                    next = block_number + 1;
+                    continue;
+                }
+
+                let permit = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        info!("Shutdown requested while waiting for capacity — driver exiting");
+                        return Ok(());
+                    }
+                    result = cfg.prove_tx.reserve() => match result {
+                        Ok(p) => p,
+                        Err(_) => {
+                            info!("Orchestrator channel closed — driver exiting");
+                            return Ok(());
+                        }
+                    },
+                };
+
+                let fetched = match fetch_block(&cfg.rpc, block_number).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(block_number, err = %e, "fetch_block failed during re-witness — retrying");
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(RPC_ERROR_BACKOFF) => {}
+                        }
+                        break;
+                    }
+                };
+
+                let payload =
+                    rewitness_phase(fetched, cfg.factory.clone(), Arc::clone(&cfg.host_executor))
+                        .await?;
+
+                cfg.hub.push(block_number, &payload).await?;
+                permit.send(ProveRequest { block_number, payload });
+
+                // Pruner is skipped here — nothing was committed, so there
+                // is nothing new to prune. Re-running pruner on old tips
+                // would just churn without purpose.
+
+                next = block_number + 1;
+                continue;
+            }
+
+            // ── block_number > start_tip — fresh tip-following paths ──
+
+            // Commit-only fast path (catch-up before first batch).
             if block_number < witness_from_block {
                 let fetched = match fetch_block(&cfg.rpc, block_number).await {
                     Ok(f) => f,
@@ -232,7 +324,7 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
                 .await
                 .map_err(|e| eyre!("commit_phase join: {e}"))??;
 
-                if block_number % 1000 == 0 {
+                if block_number.is_multiple_of(1000) {
                     info!(
                         block_number,
                         witness_from_block, "Catch-up: committed block (no witness)"
@@ -522,6 +614,68 @@ async fn witness_phase(
         serialize_ms,
         payload_bytes,
         "Block witness built"
+    );
+
+    Ok(payload)
+}
+
+/// Re-witness phase: regenerate the witness for a block already in MDBX.
+/// Reads parent state root from MDBX, runs `execute_exex_with_block` against
+/// the existing state, and serializes. Does NOT commit — the block is already
+/// present.
+async fn rewitness_phase(
+    fetched: FetchedBlock,
+    factory: ProviderFactory<DriverNode>,
+    host_executor: Arc<EthHostExecutor>,
+) -> eyre::Result<Vec<u8>> {
+    let FetchedBlock { block_number, alloy_block, fetch_ms } = fetched;
+    let t_total_start = Instant::now();
+
+    let prim_block =
+        <reth_ethereum_primitives::EthPrimitives as IntoPrimitives<Ethereum>>::into_primitive_block(
+            alloy_block,
+        );
+
+    let parent_state_root = factory
+        .header_by_number(block_number - 1)
+        .map_err(|e| eyre!("header_by_number({}): {e}", block_number - 1))?
+        .ok_or_else(|| eyre!("missing header N-1 during re-witness of block {block_number}"))?
+        .state_root;
+
+    let t_witness = Instant::now();
+    let input = tokio::task::spawn_blocking(move || -> eyre::Result<_> {
+        let read_view =
+            BlockchainProvider::new(factory).map_err(|e| eyre!("BlockchainProvider::new: {e}"))?;
+        host_executor
+            .execute_exex_with_block(prim_block, parent_state_root, read_view, None)
+            .map_err(|e| eyre!("execute_exex_with_block (rewitness): {e}"))
+    })
+    .await
+    .map_err(|e| eyre!("rewitness_phase join: {e}"))??;
+    let witness_ms = t_witness.elapsed().as_millis() as u64;
+
+    let t_ser = Instant::now();
+    let payload = match tokio::task::spawn_blocking(move || bincode::serialize(&input)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            error!(block_number, err = %e, "bincode serialize failed (rewitness)");
+            return Err(eyre!("bincode: {e}"));
+        }
+        Err(e) => {
+            error!(block_number, err = %e, "serialize task panicked (rewitness)");
+            return Err(eyre!("serialize task: {e}"));
+        }
+    };
+    let serialize_ms = t_ser.elapsed().as_millis() as u64;
+
+    info!(
+        block_number,
+        total_ms = t_total_start.elapsed().as_millis() as u64,
+        fetch_ms,
+        witness_ms,
+        serialize_ms,
+        payload_bytes = payload.len() as u64,
+        "Block re-witness built"
     );
 
     Ok(payload)

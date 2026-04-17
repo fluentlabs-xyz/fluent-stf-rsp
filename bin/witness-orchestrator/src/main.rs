@@ -131,8 +131,13 @@ async fn main() {
     let l1_rpc_url_parsed: url::Url = l1_rpc_url.parse().expect("Invalid L1_RPC_URL");
     let l1_read_provider: RootProvider = rsp_provider::create_provider(l1_rpc_url_parsed.clone());
 
+    // L2 provider — used by the startup resolver (for `lastBlockHash` lookup)
+    // AND later by the embedded driver + blob builder.
+    let l2_rpc_parsed: url::Url = rpc_url.parse().expect("Invalid RPC_URL");
+    let l2_provider: RootProvider = rsp_provider::create_provider(l2_rpc_parsed);
+
     // ── Startup: resolve L2 checkpoint from START_BATCH_ID ───────────────────────
-    let (listener_from_block, witness_from_block): (u64, u64) = {
+    let (listener_from_block, witness_from_block, orchestrator_checkpoint): (u64, u64, u64) = {
         let db_startup = crate::db::Db::open(&db_path).expect("Failed to open DB for startup");
 
         if let Some(batch_id) = start_batch_id {
@@ -141,6 +146,7 @@ async fn main() {
                 let (l2_from_block, l1_event_block, _num_blocks) =
                     l1_rollup_client::resolve_l2_start_checkpoint(
                         &l1_read_provider,
+                        &l2_provider,
                         l1_rollup_addr,
                         batch_id,
                         l1_deploy_block,
@@ -182,7 +188,7 @@ async fn main() {
         };
 
         drop(db_startup);
-        (lfb, witness_from)
+        (lfb, witness_from, checkpoint)
     };
 
     info!(
@@ -253,19 +259,13 @@ async fn main() {
         });
     }
 
-    // L2 provider for blob construction (and — once the embedded driver
-    // lands in Step B — for forward sync as well).
-    let l2_rpc_parsed: url::Url = rpc_url.parse().expect("Invalid RPC_URL");
-    let l2_provider: RootProvider = rsp_provider::create_provider(l2_rpc_parsed);
-
     // Cold witness store + in-process witness channel.
     let hub = Arc::new(WitnessHub::new(cold_file, max_cold_bytes));
     let (prove_tx, prove_rx) = tokio::sync::mpsc::channel::<ProveRequest>(64);
 
     // ── Embedded forward-sync driver ─────────────────────────────────────────────
     let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
-    let driver_rpc: RootProvider<Ethereum> =
-        rsp_provider::create_provider(rpc_url.parse().expect("Invalid RPC_URL"));
+    let driver_rpc: RootProvider<Ethereum> = l2_provider.clone();
     let runtime = Runtime::with_existing_handle(Handle::current())
         .expect("failed to build reth_tasks::Runtime from current handle");
     let factory = driver::open_writable_factory::<driver::FluentMdbxNode>(
@@ -318,6 +318,7 @@ async fn main() {
                     chain_spec,
                     pruner,
                     witness_from_block,
+                    orchestrator_checkpoint,
                 },
                 shutdown,
             )
