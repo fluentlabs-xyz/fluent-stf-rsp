@@ -1,9 +1,9 @@
 //! L1 event listener for batch lifecycle events.
 //!
 //! Polls the rollup contract on L1 for:
-//! - `BatchCommitted(batchIndex, batchRoot, numberOfBlocks, expectedBlobsCount)` — new batch declared
+//! - `BatchCommitted(batchIndex, batchRoot, lastBlockHash, numberOfBlocks, expectedBlobs)` — new batch declared
 //! - `BatchSubmitted(batchIndex)` — all blobs submitted for the batch
-//! - `BatchPreconfirmed(batchIndex, nitroVerifier, verifier)` — preconfirmation accepted
+//! - `BatchPreconfirmed(batchIndex, verifierContract, verifier)` — preconfirmation accepted
 //!
 //! Events are sent to the orchestrator via an mpsc channel.
 //!
@@ -25,7 +25,7 @@ use tracing::{info, warn};
 
 /// Events the L1 listener sends to the orchestrator.
 ///
-/// Variant names mirror the v0.1.0 contract event names 1:1.
+/// Variant names mirror the v1.0.0 contract event names 1:1.
 #[derive(Debug)]
 pub(crate) enum L1Event {
     /// `BatchCommitted` — a new batch has been declared on L1.
@@ -37,7 +37,7 @@ pub(crate) enum L1Event {
     /// `BatchSubmitted` — all blobs for the batch have been submitted.
     BatchSubmitted { batch_index: u64 },
     /// `BatchPreconfirmed` — carries the real tx_hash and l1_block.
-    Preconfirmed { batch_index: u64, tx_hash: B256, l1_block: u64 },
+    BatchPreconfirmed { batch_index: u64, tx_hash: B256, l1_block: u64 },
     /// All events up to this L1 block have been sent.
     /// Orchestrator persists this as the L1 checkpoint.
     Checkpoint(u64),
@@ -283,7 +283,8 @@ async fn process_page(
                 .block_number
                 .ok_or_else(|| eyre!("BatchPreconfirmed log missing block_number"))?;
             info!(batch_index, %tx_hash, l1_block, "BatchPreconfirmed event");
-            if tx.send(L1Event::Preconfirmed { batch_index, tx_hash, l1_block }).await.is_err() {
+            if tx.send(L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block }).await.is_err()
+            {
                 return Err(eyre!("L1 event channel closed"));
             }
         }

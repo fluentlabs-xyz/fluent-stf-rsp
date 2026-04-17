@@ -3,10 +3,10 @@
 //!
 //! A batch is "ready" when:
 //! 1. All blocks in `[from_block, to_block]` have execution responses
-//! 2. Blobs have been accepted on L1 (`BatchAccepted` event received)
+//! 2. The batch has moved to Submitted on L1 (`BatchSubmitted` event received)
 //!
 //! Responses are stored in a flat pool keyed by block number — blocks are
-//! produced in realtime and responses typically arrive before `acceptNextBatch`
+//! produced in realtime and responses typically arrive before `commitBatch`
 //! is called on L1, so there is no "matching batch" yet at insertion time.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -39,8 +39,8 @@ pub(crate) struct DispatchedBatch {
 pub(crate) struct BatchAccumulator {
     batches: BTreeMap<u64, PendingBatch>,
     responses: HashMap<u64, EthExecutionResponse>,
-    /// BlobsAccepted events that arrived before BatchHeadersSubmitted.
-    /// Applied when the batch is later registered via set_batch.
+    /// BatchSubmitted events that arrived before the batch was registered via set_batch.
+    /// Applied when the batch is later registered.
     pending_blobs_accepted: HashSet<u64>,
     db: Option<Arc<Mutex<Db>>>,
     /// In-memory cache of batch signatures: batch_index → SubmitBatchResponse.
@@ -126,7 +126,7 @@ impl BatchAccumulator {
         Self { batches, responses, pending_blobs_accepted, db: Some(db), signatures, dispatched }
     }
 
-    /// Register a new batch from `BatchHeadersSubmitted` event.
+    /// Register a new batch from a `BatchCommitted` event.
     pub(crate) async fn set_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
         // Idempotent under listener re-emission: if the batch is already
         // registered and the range matches, do nothing (re-emission must
@@ -148,7 +148,7 @@ impl BatchAccumulator {
             return;
         }
 
-        // Consume any buffered BlobsAccepted for this batch
+        // Consume any buffered BatchSubmitted for this batch
         let blobs_accepted = self.pending_blobs_accepted.remove(&batch_index);
         if blobs_accepted {
             self.persist(move |db| db.delete_pending_blobs_accepted(batch_index)).await;
@@ -180,15 +180,16 @@ impl BatchAccumulator {
         self.responses.insert(block, resp);
     }
 
-    pub(crate) async fn mark_blobs_accepted(&mut self, batch_index: u64) {
+    pub(crate) async fn mark_batch_submitted(&mut self, batch_index: u64) {
         if let Some(batch) = self.batches.get_mut(&batch_index) {
             batch.blobs_accepted = true;
+            // DB column keeps its original name — internal persistence schema.
             self.persist(move |db| db.update_blobs_accepted(batch_index)).await;
-            info!(batch_index, "Blobs accepted on L1");
+            info!(batch_index, "Batch marked Submitted on L1");
         } else {
             self.pending_blobs_accepted.insert(batch_index);
             self.persist(move |db| db.save_pending_blobs_accepted(batch_index)).await;
-            warn!(batch_index, "BlobsAccepted arrived before BatchHeaders — buffered");
+            warn!(batch_index, "BatchSubmitted arrived before BatchCommitted — buffered");
         }
     }
 
@@ -361,7 +362,7 @@ mod tests {
     async fn set_batch_idempotent_preserves_blobs_accepted() {
         let mut acc = BatchAccumulator::new();
         acc.set_batch(1, 100, 199).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
         assert!(acc.batches.get(&1).unwrap().blobs_accepted);
 
         // Re-emission of the same BatchCommitted log must NOT clear the flag.
@@ -378,7 +379,7 @@ mod tests {
         acc.insert_response(mock_response(12)).await;
 
         assert!(acc.first_ready().is_none());
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
         assert_eq!(acc.first_ready(), Some(1));
     }
 
@@ -386,7 +387,7 @@ mod tests {
     async fn not_ready_without_all_responses() {
         let mut acc = BatchAccumulator::new();
         acc.set_batch(1, 10, 12).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
 
         acc.insert_response(mock_response(10)).await;
         acc.insert_response(mock_response(11)).await;
@@ -404,12 +405,12 @@ mod tests {
 
         acc.insert_response(mock_response(10)).await;
         acc.insert_response(mock_response(11)).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
         assert_eq!(acc.first_ready(), Some(1));
 
         acc.insert_response(mock_response(12)).await;
         acc.insert_response(mock_response(13)).await;
-        acc.mark_blobs_accepted(2).await;
+        acc.mark_batch_submitted(2).await;
 
         acc.mark_dispatched(1, B256::ZERO, 1).await;
         acc.finalize_dispatched(1).await;
@@ -426,7 +427,7 @@ mod tests {
         acc.insert_response(mock_response(12)).await;
 
         acc.set_batch(1, 10, 12).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
         assert_eq!(acc.first_ready(), Some(1));
     }
 
@@ -437,7 +438,7 @@ mod tests {
         acc.insert_response(mock_response(10)).await;
         acc.insert_response(mock_response(11)).await;
         acc.insert_response(mock_response(12)).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
 
         // Batch should be ready
         assert_eq!(acc.first_ready(), Some(1));
@@ -479,8 +480,8 @@ mod tests {
         acc.set_batch(2, 11, 11).await;
         acc.insert_response(mock_response(10)).await;
         acc.insert_response(mock_response(11)).await;
-        acc.mark_blobs_accepted(1).await;
-        acc.mark_blobs_accepted(2).await;
+        acc.mark_batch_submitted(1).await;
+        acc.mark_batch_submitted(2).await;
 
         // Both ready, neither signed
         assert_eq!(acc.first_ready_unsigned(), Some(1));
@@ -512,8 +513,8 @@ mod tests {
         acc.set_batch(2, 11, 11).await;
         acc.insert_response(mock_response(10)).await;
         acc.insert_response(mock_response(11)).await;
-        acc.mark_blobs_accepted(1).await;
-        acc.mark_blobs_accepted(2).await;
+        acc.mark_batch_submitted(1).await;
+        acc.mark_batch_submitted(2).await;
 
         // No signatures yet — returns None
         assert!(acc.first_sequential_signed().is_none());
@@ -552,7 +553,7 @@ mod tests {
         acc.insert_response(mock_response(10)).await;
         acc.insert_response(mock_response(11)).await;
         acc.insert_response(mock_response(12)).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
 
         let tx_hash = B256::from([0xAA; 32]);
         acc.mark_dispatched(1, tx_hash, 100).await;
@@ -572,7 +573,7 @@ mod tests {
         acc.set_batch(1, 10, 11).await;
         acc.insert_response(mock_response(10)).await;
         acc.insert_response(mock_response(11)).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
 
         // Also insert a response for a different batch to verify it's not removed
         acc.insert_response(mock_response(12)).await;
@@ -594,7 +595,7 @@ mod tests {
         acc.set_batch(1, 10, 11).await;
         acc.insert_response(mock_response(10)).await;
         acc.insert_response(mock_response(11)).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
 
         acc.mark_dispatched(1, B256::from([0xCC; 32]), 60).await;
         assert!(acc.get(1).is_none());
@@ -613,7 +614,7 @@ mod tests {
         let mut acc = BatchAccumulator::new();
         acc.set_batch(1, 10, 20).await;
         acc.insert_response(mock_response(10)).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
 
         assert_eq!(acc.max_to_block(), Some(20));
 
@@ -633,7 +634,7 @@ mod tests {
         acc.insert_response(mock_response(10)).await;
         acc.insert_response(mock_response(11)).await;
         acc.insert_response(mock_response(12)).await;
-        acc.mark_blobs_accepted(1).await;
+        acc.mark_batch_submitted(1).await;
 
         let tx_hash = B256::from([0xEE; 32]);
         acc.mark_dispatched(1, tx_hash, 80).await;

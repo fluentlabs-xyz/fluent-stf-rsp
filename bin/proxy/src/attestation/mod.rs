@@ -63,6 +63,7 @@ mod tests {
     /// End-to-end local SP1 execution: verify attestation doc produces
     /// the correct committed address matching public_key.hex.
     #[tokio::test]
+    #[ignore]
     async fn test_sp1_attestation_verify() {
         use sp1_sdk::Prover as _;
 

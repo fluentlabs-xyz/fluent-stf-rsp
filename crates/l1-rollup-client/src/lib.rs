@@ -2,12 +2,12 @@
 //! Fluent rollup contract on L1. Used by `bin/witness-orchestrator` (read +
 //! write) and `bin/proxy` (read only, for batch metadata lookup).
 //!
-//! Targets the `release/v0.1.0` deployment of `Rollup.sol`.
+//! Targets the `release/v1.0.0` deployment of `Rollup.sol`.
 //!
 //! What lives here:
-//! - sol! ABI: events (`BatchCommitted`, `BatchSubmitted`, `BatchPreconfirmed`)
-//!   and functions (`preconfirmBatch`).
-//! - Read helpers: `find_batch_log`, `resolve_l2_start_checkpoint`, `fetch_batch_range`.
+//! - sol! ABI: all on-chain events (lifecycle, challenge, rewards) and the
+//!   `preconfirmBatch` function.
+//! - Read helpers: `resolve_l2_start_checkpoint`, `fetch_batch_range`.
 //! - Write helpers: `submit_preconfirmation`.
 //!
 //! What does NOT live here (intentionally):
@@ -21,33 +21,85 @@ pub use nitro_verifier::is_key_registered;
 
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types::{Filter, Log, TransactionRequest};
+use alloy_rpc_types::{Filter, TransactionRequest};
 use alloy_sol_types::{sol, SolCall, SolEvent};
 use eyre::{eyre, Result};
-use tracing::{info, warn};
+use tracing::info;
 
 // =====================================================================
-// Contract ABI (Rollup.sol @ release/v0.1.0)
+// Contract ABI (Rollup.sol @ release/v1.0.0)
 // =====================================================================
 
 sol! {
-    /// Emitted by `commitBatch` — declares a new batch with its block count.
+    // ============ Batch lifecycle ============
+
+    /// Emitted by `commitBatch` — declares a new batch with its batch root,
+    /// last block hash, block count, and expected blob count.
     event BatchCommitted(
         uint256 indexed batchIndex,
         bytes32 batchRoot,
+        bytes32 lastBlockHash,
         uint24 numberOfBlocks,
-        uint8 expectedBlobsCount
+        uint256 expectedBlobs
     );
 
-    /// Emitted when all blobs for the batch have been submitted.
+    /// Emitted each time the sequencer submits blob hashes for a batch.
+    event BatchBlobsSubmitted(
+        uint256 indexed batchIndex,
+        uint256 numBlobs,
+        uint256 totalBlobs
+    );
+
+    /// Emitted when all expected blobs are in DA and the batch moves to Submitted.
     event BatchSubmitted(uint256 indexed batchIndex);
 
-    /// Emitted when `preconfirmBatch` succeeds.
+    /// Emitted when Nitro preconfirmation is committed for a batch.
     event BatchPreconfirmed(
         uint256 indexed batchIndex,
-        address nitroVerifier,
-        address verifier
+        address indexed verifierContract,
+        address indexed verifier
     );
+
+    /// Emitted when a batch is permanently finalized after the challenge period.
+    event BatchFinalized(uint256 indexed batchIndex);
+
+    /// Emitted when admin force-reverts batches from a given index onward.
+    event BatchReverted(uint256 indexed fromBatchIndex);
+
+    // ============ Challenge lifecycle ============
+
+    /// Emitted when a challenger disputes a block in a preconfirmed batch.
+    event BlockChallenged(
+        uint256 indexed batchIndex,
+        bytes32 indexed commitment,
+        address indexed challenger
+    );
+
+    /// Emitted when a challenger opens a batch-root validity dispute.
+    event BatchRootChallenged(uint256 indexed batchIndex);
+
+    /// Emitted when a prover resolves a challenge with Nitro + SP1 proof.
+    event ChallengeResolved(
+        uint256 indexed batchIndex,
+        bytes32 indexed commitment,
+        address indexed prover
+    );
+
+    /// Emitted when a batch root challenge is resolved.
+    event BatchRootChallengeResolved(
+        uint256 indexed batchIndex,
+        address indexed prover
+    );
+
+    // ============ Rewards ============
+
+    /// Emitted when a challenger claims their reward (deposit + incentive fee).
+    event ChallengerRewardClaimed(address indexed challenger, uint256 amount);
+
+    /// Emitted when a prover claims their proof reward.
+    event ProofRewardClaimed(address indexed prover, uint256 amount);
+
+    // ============ Functions ============
 
     /// Submit enclave signature to L1, proving batch validity.
     function preconfirmBatch(
@@ -60,54 +112,6 @@ sol! {
 // =====================================================================
 // Read helpers
 // =====================================================================
-
-/// Find the `BatchCommitted` log for a specific batch index.
-///
-/// Tries a single full-range query first. If the RPC rejects it (rate limit
-/// or block range cap), falls back to a paginated scan with 50k-block pages.
-pub async fn find_batch_log(
-    provider: &RootProvider,
-    contract_addr: Address,
-    batch_topic: B256,
-    from: u64,
-    to: u64,
-) -> Result<Option<Log>> {
-    let make_filter = |f: u64, t: u64| {
-        Filter::new()
-            .address(contract_addr)
-            .event_signature(BatchCommitted::SIGNATURE_HASH)
-            .topic1(batch_topic)
-            .from_block(f)
-            .to_block(t)
-    };
-
-    // Fast path: single query.
-    match provider.get_logs(&make_filter(from, to)).await {
-        Ok(logs) => return Ok(logs.into_iter().next()),
-        Err(e) => warn!(err = %e, "Full-range eth_getLogs failed — falling back to paginated scan"),
-    }
-
-    // Slow path: paginated with throttle to avoid rate limiting.
-    const PAGE: u64 = 50_000;
-    const SCAN_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
-    let mut current = from;
-    while current <= to {
-        let page_end = (current + PAGE - 1).min(to);
-        let logs = provider
-            .get_logs(&make_filter(current, page_end))
-            .await
-            .map_err(|e| eyre!("eth_getLogs [{current}..{page_end}] failed: {e}"))?;
-        if let Some(log) = logs.into_iter().next() {
-            return Ok(Some(log));
-        }
-        current = page_end + 1;
-        if current <= to {
-            tokio::time::sleep(SCAN_DELAY).await;
-        }
-    }
-
-    Ok(None)
-}
 
 /// Walk all `BatchCommitted` events from `l1_deploy_block` until the event
 /// for `batch_id` is found, summing `numberOfBlocks` for prior batches to
@@ -183,7 +187,10 @@ pub async fn resolve_l2_start_checkpoint(
         eyre!(
             "BatchCommitted for batch {batch_id} not found in L1 blocks \
              [{l1_deploy_block}..{latest}]. \
-             Ensure L1_ROLLUP_DEPLOY_BLOCK is ≤ the block where batch 0 was committed."
+             Ensure L1_ROLLUP_DEPLOY_BLOCK is ≤ the block where batch 0 was committed. \
+             If the block range is correct, the deployed Rollup contract's ABI \
+             may have drifted from this binding — verify the BatchCommitted \
+             topic hash against the release the contract was deployed from."
         )
     })?;
 

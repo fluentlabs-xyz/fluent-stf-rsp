@@ -26,7 +26,7 @@
 //! | `DB_PATH` | `./witness_orchestrator.db` | SQLite DB for crash recovery |
 //! | `HTTP_TIMEOUT_SECS` | `120` | HTTP POST timeout (seconds) |
 //! | `L1_RPC_URL` | — | L1 Ethereum RPC URL |
-//! | `l1_rollup_addr` | — | Rollup contract address on L1 |
+//! | `L1_ROLLUP_ADDR` | — | Rollup contract address on L1 |
 //! | `L1_SUBMITTER_KEY` | — | Private key for signing `preconfirmBatch` txs |
 //! | — | — | `NITRO_VERIFIER_ADDR` removed: now compile-time constant from `fluent_stf_primitives` |
 //! | `L1_START_BATCH_ID` | — | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
@@ -109,10 +109,10 @@ async fn main() {
 
     // L1 configuration
     let l1_rpc_url = std::env::var("L1_RPC_URL").expect("L1_RPC_URL is required");
-    let l1_rollup_addr: Address = std::env::var("l1_rollup_addr")
-        .expect("l1_rollup_addr is required")
+    let l1_rollup_addr: Address = std::env::var("L1_ROLLUP_ADDR")
+        .expect("L1_ROLLUP_ADDR is required")
         .parse()
-        .expect("Invalid l1_rollup_addr");
+        .expect("Invalid L1_ROLLUP_ADDR");
     let l1_submitter_key = std::env::var("L1_SUBMITTER_KEY").expect("L1_SUBMITTER_KEY is required");
     let nitro_verifier_addr: Address = fluent_stf_primitives::NITRO_VERIFIER_ADDR;
     let start_batch_id: Option<u64> =

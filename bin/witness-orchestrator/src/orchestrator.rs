@@ -477,11 +477,11 @@ impl OrchestratorState {
                 *next_batch_from_block = Some(to + 1);
             }
             L1Event::BatchSubmitted { batch_index } => {
-                accumulator.mark_blobs_accepted(batch_index).await;
+                accumulator.mark_batch_submitted(batch_index).await;
                 self.try_sign_next_batch(accumulator);
                 self.try_dispatch_next_batch(accumulator);
             }
-            L1Event::Preconfirmed { batch_index, tx_hash, l1_block } => {
+            L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block } => {
                 accumulator.mark_dispatched(batch_index, tx_hash, l1_block).await;
                 self.global_dispatch_attempts = 0;
                 self.global_next_dispatch_allowed = None;
