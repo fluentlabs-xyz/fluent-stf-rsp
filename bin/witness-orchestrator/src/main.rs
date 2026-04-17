@@ -21,6 +21,8 @@
 //! | `DATADIR` | `./forward-driver` | Driver datadir (MDBX + static_files + RocksDB) |
 //! | `WITNESS_COLD_FILE` | `<datadir>/cold.redb` | redb file for cold witness store |
 //! | `MAX_COLD_BYTES` | `34359738368` (32 GiB) | Size cap for cold witness store |
+//! | `WITNESS_RETENTION_BLOCKS` | `172800` | Cold store retention window in L2 blocks — blocks older than `tip - retention` are pruned on push. `0` disables retention (archive mode). |
+//! | `WITNESS_HUB_LISTEN_ADDR` | `127.0.0.1:8090` | HTTP listen address of the witness-server that serves cold witnesses to external consumers (proxy). |
 //! | `MDBX_MAX_SIZE` | `549755813888` (512 GiB) | MDBX max size |
 //! | `PROXY_URL` | `http://127.0.0.1:8080` | Remote proxy base URL |
 //! | `DB_PATH` | `./witness_orchestrator.db` | SQLite DB for crash recovery |
@@ -41,6 +43,7 @@ mod hub;
 mod l1_listener;
 mod orchestrator;
 mod types;
+mod witness_server;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,6 +77,10 @@ const DEFAULT_DATADIR: &str = "./forward-driver";
 const DEFAULT_MAX_COLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// 512 GiB default MDBX geometry max size.
 const DEFAULT_MDBX_MAX_SIZE: u64 = 512 * 1024 * 1024 * 1024;
+/// Default cold-store retention window: 172 800 L2 blocks (~2 days at 1 s/block).
+const DEFAULT_WITNESS_RETENTION_BLOCKS: u64 = 172_800;
+/// Default listen address for the witness HTTP server.
+const DEFAULT_WITNESS_HUB_LISTEN_ADDR: &str = "127.0.0.1:8090";
 
 #[tokio::main]
 async fn main() {
@@ -94,6 +101,12 @@ async fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_MAX_COLD_BYTES);
+    let witness_retention_blocks: u64 = std::env::var("WITNESS_RETENTION_BLOCKS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WITNESS_RETENTION_BLOCKS);
+    let witness_hub_listen_addr = std::env::var("WITNESS_HUB_LISTEN_ADDR")
+        .unwrap_or_else(|_| DEFAULT_WITNESS_HUB_LISTEN_ADDR.into());
     let mdbx_max_size: u64 = std::env::var("MDBX_MAX_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -196,6 +209,8 @@ async fn main() {
         ?datadir,
         ?cold_file,
         max_cold_bytes,
+        witness_retention_blocks,
+        %witness_hub_listen_addr,
         %proxy_url,
         ?db_path,
         http_timeout_secs,
@@ -260,8 +275,21 @@ async fn main() {
     }
 
     // Cold witness store + in-process witness channel.
-    let hub = Arc::new(WitnessHub::new(cold_file, max_cold_bytes));
+    let hub = Arc::new(WitnessHub::new(cold_file, max_cold_bytes, witness_retention_blocks));
     let (prove_tx, prove_rx) = tokio::sync::mpsc::channel::<ProveRequest>(64);
+
+    // Witness HTTP server — serves cold witnesses to the proxy (challenge/mock
+    // endpoints). Opens a read path into the same `redb` file without the
+    // cross-process lock conflict a shared-file read would cause.
+    {
+        let hub = Arc::clone(&hub);
+        let shutdown = shutdown.clone();
+        let addr = witness_hub_listen_addr.clone();
+        tasks.spawn(async move {
+            let r = witness_server::run(addr, hub, shutdown).await;
+            ("witness_server", r)
+        });
+    }
 
     // ── Embedded forward-sync driver ─────────────────────────────────────────────
     let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());

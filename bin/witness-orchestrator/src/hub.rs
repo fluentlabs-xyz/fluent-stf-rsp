@@ -2,7 +2,7 @@
 //!
 //! Used by the embedded forward-driver to durably store witnesses for
 //! re-execution lookups (enclave key rotation) and to survive orchestrator
-//! restarts. Zstd-compressed, byte-capped, explicit range acknowledgement.
+//! restarts. Zstd-compressed, byte-capped, block-window retention.
 
 #![allow(clippy::result_large_err)]
 
@@ -17,16 +17,11 @@ use crate::types::ProveRequest;
 const COLD_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("cold_witnesses");
 const META_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("cold_meta");
 const TOTAL_BYTES_KEY: &str = "total_bytes";
-/// Highest `block_number` ever durably committed to the cold store. Written
-/// on every successful commit in `commit_one_blocking` and **never** cleared
-/// or decremented by `acknowledge_range` / eviction. This is the driver's
-/// resume-point source of truth: `max(COLD_TABLE key)` is unsafe because
-/// `acknowledge_range` deletes acknowledged rows in steady state.
-const LAST_COMMITTED_KEY: &str = "last_committed_block";
 
-pub(crate) struct WitnessHub {
+pub struct WitnessHub {
     db: Arc<Database>,
     max_cold_bytes: u64,
+    retention_blocks: u64,
 }
 
 impl std::fmt::Debug for WitnessHub {
@@ -37,7 +32,12 @@ impl std::fmt::Debug for WitnessHub {
 
 impl WitnessHub {
     /// Open or create a cold witness database at `cold_file`.
-    pub(crate) fn new(cold_file: PathBuf, max_cold_bytes: u64) -> Self {
+    ///
+    /// `retention_blocks` defines the window of retained blocks. On every
+    /// successful `push(N)`, entries with `block_number < N - retention_blocks`
+    /// are removed in the same write transaction. `retention_blocks == 0`
+    /// disables retention (archive mode).
+    pub fn new(cold_file: PathBuf, max_cold_bytes: u64, retention_blocks: u64) -> Self {
         if let Some(parent) = cold_file.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -55,22 +55,23 @@ impl WitnessHub {
             write_txn.commit().expect("commit fresh cold schema");
         }
 
-        Self { db: Arc::new(db), max_cold_bytes }
+        Self { db: Arc::new(db), max_cold_bytes, retention_blocks }
     }
 
     /// Persist a witness payload for `block_number`. Returns only after the
     /// `redb` commit (fsync) — await is the backpressure signal. Any failure
-    /// is now a hard error so the driver can refuse to advance past an
+    /// is a hard error so the driver can refuse to advance past an
     /// unpersisted block (A2 atomicity invariant).
-    pub(crate) async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
+    pub async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
         let db = Arc::clone(&self.db);
         let max_cold_bytes = self.max_cold_bytes;
+        let retention_blocks = self.retention_blocks;
         let payload = payload.to_vec();
 
         let join = tokio::task::spawn_blocking(move || -> eyre::Result<()> {
             let compressed = zstd::encode_all(payload.as_slice(), 3)
                 .map_err(|e| eyre::eyre!("zstd encode: {e}"))?;
-            commit_one_blocking(&db, block_number, compressed, max_cold_bytes)
+            commit_one_blocking(&db, block_number, compressed, max_cold_bytes, retention_blocks)
                 .map_err(|e| eyre::eyre!("commit_one: {e}"))
         })
         .await;
@@ -88,19 +89,18 @@ impl WitnessHub {
         }
     }
 
-    /// Highest `block_number` ever durably committed to the cold store.
-    /// Unlike `max(COLD_TABLE key)`, this is **monotonic**: it is written
-    /// on every commit and never decremented by `acknowledge_range` or
-    /// eviction. It is the driver's resume-point source of truth.
-    pub(crate) fn last_committed_block(&self) -> eyre::Result<Option<u64>> {
+    /// Highest block number currently in the cold store. Under window retention
+    /// the newest row is never evicted, so `table.last()` is the resume point.
+    pub fn last_committed_block(&self) -> eyre::Result<Option<u64>> {
         let read_txn = self.db.begin_read()?;
-        let meta = read_txn.open_table(META_TABLE)?;
-        Ok(meta.get(LAST_COMMITTED_KEY)?.map(|v| v.value()))
+        let table = read_txn.open_table(COLD_TABLE)?;
+        let last = table.last()?.map(|(k, _)| k.value());
+        Ok(last)
     }
 
     /// Look up a single witness by block number. Returns `None` if missing
     /// or on decode failure.
-    pub(crate) async fn get_witness(&self, block_number: u64) -> Option<ProveRequest> {
+    pub async fn get_witness(&self, block_number: u64) -> Option<ProveRequest> {
         let db = Arc::clone(&self.db);
 
         tokio::task::spawn_blocking(move || -> Option<ProveRequest> {
@@ -113,58 +113,17 @@ impl WitnessHub {
         .await
         .ok()?
     }
-
-    /// Delete all cold-tier entries in `[from_block, to_block]`.
-    pub(crate) async fn acknowledge_range(&self, from_block: u64, to_block: u64) {
-        let db = Arc::clone(&self.db);
-        let from = from_block;
-        let to = to_block.saturating_add(1);
-
-        let join = tokio::task::spawn_blocking(move || -> Result<u64, redb::Error> {
-            let write_txn = db.begin_write()?;
-            let freed = {
-                let mut cold_table = write_txn.open_table(COLD_TABLE)?;
-                let mut meta = write_txn.open_table(META_TABLE)?;
-
-                let keys: Vec<(u64, u64)> = cold_table
-                    .range(from..to)?
-                    .filter_map(|r| r.ok().map(|(k, v)| (k.value(), v.value().len() as u64)))
-                    .collect();
-                let mut freed: u64 = 0;
-                for (k, size) in &keys {
-                    cold_table.remove(*k)?;
-                    freed = freed.saturating_add(*size);
-                }
-                let new_total = read_total_bytes(&meta)?.saturating_sub(freed);
-                meta.insert(TOTAL_BYTES_KEY, new_total)?;
-                freed
-            };
-            write_txn.commit()?;
-            Ok(freed)
-        })
-        .await;
-
-        match join {
-            Ok(Ok(_)) => info!(from_block, to_block, "Cold witnesses acknowledged"),
-            Ok(Err(e)) => warn!(err = %e, "Cold: acknowledge commit failed"),
-            Err(e) => warn!(err = %e, "Cold: acknowledge spawn_blocking failed"),
-        }
-    }
 }
 
 /// Commit a single `(block_number, compressed)` entry in one write txn:
-/// insert, update `total_bytes`, log a warning if the size cap is exceeded.
-///
-/// Eviction is **not** performed here — un-acknowledged witnesses may still
-/// be needed for re-execution after enclave key rotation. Only
-/// [`WitnessHub::acknowledge_range`] (called after successful batch signing)
-/// removes cold-store entries. If `total_bytes` exceeds the cap, the operator
-/// should investigate why signing is falling behind or increase the limit.
+/// insert, prune stale entries below the retention window, update
+/// `total_bytes`, log a warning if the size cap is exceeded.
 fn commit_one_blocking(
     db: &Database,
     block_number: u64,
     compressed: Vec<u8>,
     max_cold_bytes: u64,
+    retention_blocks: u64,
 ) -> Result<(), redb::Error> {
     let write_txn = db.begin_write()?;
     {
@@ -176,21 +135,38 @@ fn commit_one_blocking(
         // not by addition — otherwise retries / replays inflate the counter.
         let prior_len: u64 = cold.get(block_number)?.map(|v| v.value().len() as u64).unwrap_or(0);
         cold.insert(block_number, compressed.as_slice())?;
-        let new_total =
+
+        let mut total_bytes =
             read_total_bytes(&meta)?.saturating_sub(prior_len).saturating_add(compressed_len);
-        meta.insert(TOTAL_BYTES_KEY, new_total)?;
-        // Monotonic resume point — never cleared or decremented.
-        let prev_committed: u64 = meta.get(LAST_COMMITTED_KEY)?.map(|v| v.value()).unwrap_or(0);
-        if block_number > prev_committed {
-            meta.insert(LAST_COMMITTED_KEY, block_number)?;
+
+        // Retention: drop every entry with key < block_number - retention_blocks
+        // in the same write txn. `retention_blocks == 0` → archive mode, no-op.
+        if retention_blocks > 0 {
+            let cutoff = block_number.saturating_sub(retention_blocks);
+            if cutoff > 0 {
+                let stale: Vec<(u64, u64)> = cold
+                    .range(..cutoff)?
+                    .filter_map(|r| r.ok().map(|(k, v)| (k.value(), v.value().len() as u64)))
+                    .collect();
+                for (k, size) in &stale {
+                    cold.remove(*k)?;
+                    total_bytes = total_bytes.saturating_sub(*size);
+                }
+                if !stale.is_empty() {
+                    info!(block_number, cutoff, pruned = stale.len(), "Cold: retention prune");
+                }
+            }
         }
 
-        if new_total > max_cold_bytes {
+        meta.insert(TOTAL_BYTES_KEY, total_bytes)?;
+
+        if total_bytes > max_cold_bytes {
             warn!(
                 block_number,
-                total_bytes = new_total,
+                total_bytes,
                 max_cold_bytes,
-                "Cold store exceeds size cap — signing pipeline may be falling behind"
+                retention_blocks,
+                "Cold store exceeds size cap — lower WITNESS_RETENTION_BLOCKS or raise MAX_COLD_BYTES"
             );
         }
     }
@@ -220,7 +196,7 @@ mod tests {
     #[tokio::test]
     async fn push_get_roundtrip() {
         let file = unique_cold_file("roundtrip");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
 
         hub.push(42, &vec![7u8; 1024]).await.unwrap();
 
@@ -234,38 +210,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acknowledge_range_deletes_and_updates_meta() {
-        let file = unique_cold_file("ack_range");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024);
-
-        for i in 1..=10u64 {
-            hub.push(i, &vec![i as u8; 300 * 1024]).await.unwrap();
-        }
-        hub.acknowledge_range(1, 3).await;
-
-        let read_txn = hub.db.begin_read().unwrap();
-        let table = read_txn.open_table(COLD_TABLE).unwrap();
-        let meta = read_txn.open_table(META_TABLE).unwrap();
-
-        let sum: u64 =
-            table.iter().unwrap().filter_map(|r| r.ok().map(|(_, v)| v.value().len() as u64)).sum();
-        let total = meta.get(TOTAL_BYTES_KEY).unwrap().unwrap().value();
-        assert_eq!(sum, total, "meta[total_bytes] must equal sum of value lengths");
-
-        // Blocks 1..=3 are gone, 4..=10 remain.
-        assert!(table.get(1u64).unwrap().is_none());
-        assert!(table.get(3u64).unwrap().is_none());
-        assert!(table.get(4u64).unwrap().is_some());
-
-        drop(read_txn);
-        drop(hub);
-        let _ = std::fs::remove_file(&file);
-    }
-
-    #[tokio::test]
     async fn push_overwrite_preserves_total_bytes() {
         let file = unique_cold_file("overwrite");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
 
         hub.push(1, &vec![7u8; 100_000]).await.unwrap();
         let total1 = {
@@ -289,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn last_committed_block_tracks_highest_push() {
         let file = unique_cold_file("last_committed");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
 
         assert_eq!(hub.last_committed_block().unwrap(), None);
 
@@ -297,10 +244,6 @@ mod tests {
         assert_eq!(hub.last_committed_block().unwrap(), Some(10));
 
         hub.push(20, &vec![2u8; 1024]).await.unwrap();
-        assert_eq!(hub.last_committed_block().unwrap(), Some(20));
-
-        // acknowledge_range must NOT decrement LAST_COMMITTED_KEY
-        hub.acknowledge_range(10, 20).await;
         assert_eq!(hub.last_committed_block().unwrap(), Some(20));
 
         drop(hub);
@@ -311,17 +254,84 @@ mod tests {
     async fn survives_hub_drop_and_reopen() {
         let file = unique_cold_file("reopen");
         {
-            let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024);
+            let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
             for i in 1..=5u64 {
                 hub.push(i, &vec![i as u8; 300 * 1024]).await.unwrap();
             }
         }
 
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
         let got = hub.get_witness(3).await.expect("block 3 in cold");
         assert_eq!(got.payload.len(), 300 * 1024);
         assert_eq!(got.payload[0], 3u8);
 
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn push_prunes_blocks_below_retention_window() {
+        let file = unique_cold_file("retention");
+        // retention = 3: push(N) removes entries with key < N - 3.
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3);
+
+        for i in 1..=10u64 {
+            hub.push(i, &vec![i as u8; 1024]).await.unwrap();
+        }
+
+        let read_txn = hub.db.begin_read().unwrap();
+        let table = read_txn.open_table(COLD_TABLE).unwrap();
+        // After push(10), cutoff = 7 → blocks 1..=6 gone, 7..=10 stay.
+        for i in 1..=6u64 {
+            assert!(table.get(i).unwrap().is_none(), "block {i} must be pruned");
+        }
+        for i in 7..=10u64 {
+            assert!(table.get(i).unwrap().is_some(), "block {i} must remain");
+        }
+
+        drop(read_txn);
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn retention_zero_keeps_all() {
+        let file = unique_cold_file("archive");
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
+
+        for i in 1..=20u64 {
+            hub.push(i, &vec![i as u8; 256]).await.unwrap();
+        }
+
+        let read_txn = hub.db.begin_read().unwrap();
+        let table = read_txn.open_table(COLD_TABLE).unwrap();
+        for i in 1..=20u64 {
+            assert!(table.get(i).unwrap().is_some(), "archive mode must keep block {i}");
+        }
+
+        drop(read_txn);
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn push_prune_updates_total_bytes() {
+        let file = unique_cold_file("prune_meta");
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3);
+
+        for i in 1..=10u64 {
+            hub.push(i, &vec![i as u8; 300 * 1024]).await.unwrap();
+        }
+
+        let read_txn = hub.db.begin_read().unwrap();
+        let table = read_txn.open_table(COLD_TABLE).unwrap();
+        let meta = read_txn.open_table(META_TABLE).unwrap();
+        let sum: u64 =
+            table.iter().unwrap().filter_map(|r| r.ok().map(|(_, v)| v.value().len() as u64)).sum();
+        let total = meta.get(TOTAL_BYTES_KEY).unwrap().unwrap().value();
+        assert_eq!(sum, total, "meta[total_bytes] must equal sum of remaining value lengths");
+
+        drop(read_txn);
         drop(hub);
         let _ = std::fs::remove_file(&file);
     }

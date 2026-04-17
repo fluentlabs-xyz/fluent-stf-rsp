@@ -23,7 +23,11 @@ use reth_primitives_traits::Block as _;
 use reth_provider::providers::{
     BlockchainProvider, NodeTypesForProvider, ProviderFactory, RocksDBProvider, StaticFileProvider,
 };
-use reth_provider::{BlockNumReader, DatabaseProviderFactory, HeaderProvider, SaveBlocksMode};
+use reth_provider::static_file::StaticFileSegment;
+use reth_provider::{
+    BlockBodyIndicesProvider, BlockNumReader, DatabaseProviderFactory, HeaderProvider,
+    SaveBlocksMode, StaticFileProviderFactory, StaticFileWriter,
+};
 use reth_prune::Pruner;
 use reth_prune_types::MINIMUM_UNWIND_SAFE_DISTANCE;
 use reth_revm::database::StateProviderDatabase;
@@ -108,7 +112,115 @@ where
         db, chain_spec, sf, rocks, runtime,
     )
     .map_err(|e| eyre!("provider_factory: {e}"))?;
+
+    heal_static_files_if_needed(&factory)?;
+
     Ok(factory)
+}
+
+/// Self-heal static_files that got ahead of the MDBX tip.
+///
+/// reth's `save_blocks` is not atomic between static-file commits and
+/// the MDBX commit: if the process dies (SIGKILL, OOM, power loss, panic)
+/// between them, the static_files `.conf` tail pointer moves forward
+/// while MDBX stays at the previous tip. On next open, the static-file
+/// provider insists on the next append being `static_tip + 1`, but
+/// `save_blocks` would hand it `mdbx_tip + 1` → "expected block N but
+/// got N-1".
+///
+/// Fix: on startup, if any of Headers / Transactions / Receipts segments
+/// point to a block above the MDBX tip, queue a prune back to MDBX tip
+/// and commit. Next `save_blocks` then resumes cleanly.
+fn heal_static_files_if_needed<N>(
+    factory: &ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
+) -> eyre::Result<()>
+where
+    N: NodeTypesForProvider<
+        ChainSpec = ChainSpec,
+        Primitives = reth_ethereum_primitives::EthPrimitives,
+    >,
+{
+    let mdbx_tip = factory.best_block_number().map_err(|e| eyre!("best_block_number: {e}"))?;
+    if mdbx_tip == 0 {
+        // Pre-genesis: leave initialization to `init_genesis`.
+        return Ok(());
+    }
+
+    let sf = factory.static_file_provider();
+
+    let headers_tip = sf.get_highest_static_file_block(StaticFileSegment::Headers).unwrap_or(0);
+    let txs_tip = sf.get_highest_static_file_block(StaticFileSegment::Transactions).unwrap_or(0);
+    let receipts_tip = sf.get_highest_static_file_block(StaticFileSegment::Receipts).unwrap_or(0);
+
+    if headers_tip <= mdbx_tip && txs_tip <= mdbx_tip && receipts_tip <= mdbx_tip {
+        return Ok(());
+    }
+
+    warn!(
+        mdbx_tip,
+        headers_tip,
+        txs_tip,
+        receipts_tip,
+        "static_files ahead of MDBX tip — healing (previous run likely killed \
+         between save_blocks and MDBX commit)"
+    );
+
+    if headers_tip > mdbx_tip {
+        let to_delete = headers_tip - mdbx_tip;
+        let mut w = sf
+            .get_writer(mdbx_tip, StaticFileSegment::Headers)
+            .map_err(|e| eyre!("heal: headers writer: {e}"))?;
+        w.prune_headers(to_delete).map_err(|e| eyre!("heal: prune_headers: {e}"))?;
+        w.commit().map_err(|e| eyre!("heal: headers commit: {e}"))?;
+    }
+
+    if txs_tip > mdbx_tip || receipts_tip > mdbx_tip {
+        let last_tx_at_tip = {
+            let db_provider = factory
+                .database_provider_ro()
+                .map_err(|e| eyre!("heal: database_provider_ro: {e}"))?;
+            let body = db_provider
+                .block_body_indices(mdbx_tip)
+                .map_err(|e| eyre!("heal: block_body_indices({mdbx_tip}): {e}"))?
+                .ok_or_else(|| eyre!("heal: no block_body_indices for MDBX tip {mdbx_tip}"))?;
+            body.last_tx_num()
+        };
+
+        if txs_tip > mdbx_tip {
+            let highest_static_tx =
+                sf.get_highest_static_file_tx(StaticFileSegment::Transactions).unwrap_or(0);
+            let to_delete = highest_static_tx.saturating_sub(last_tx_at_tip);
+            if to_delete > 0 {
+                let mut w = sf
+                    .get_writer(mdbx_tip, StaticFileSegment::Transactions)
+                    .map_err(|e| eyre!("heal: txs writer: {e}"))?;
+                w.prune_transactions(to_delete, mdbx_tip)
+                    .map_err(|e| eyre!("heal: prune_transactions: {e}"))?;
+                w.commit().map_err(|e| eyre!("heal: txs commit: {e}"))?;
+            }
+        }
+
+        if receipts_tip > mdbx_tip {
+            let highest_static_rx =
+                sf.get_highest_static_file_tx(StaticFileSegment::Receipts).unwrap_or(0);
+            let to_delete = highest_static_rx.saturating_sub(last_tx_at_tip);
+            if to_delete > 0 {
+                let mut w = sf
+                    .get_writer(mdbx_tip, StaticFileSegment::Receipts)
+                    .map_err(|e| eyre!("heal: receipts writer: {e}"))?;
+                w.prune_receipts(to_delete, mdbx_tip)
+                    .map_err(|e| eyre!("heal: prune_receipts: {e}"))?;
+                w.commit().map_err(|e| eyre!("heal: receipts commit: {e}"))?;
+            }
+        }
+    }
+
+    // Refresh the in-memory segment index so subsequent readers see the
+    // truncated state.
+    sf.initialize_index().map_err(|e| eyre!("heal: initialize_index: {e}"))?;
+
+    info!(mdbx_tip, "heal: static_files truncated to MDBX tip");
+    Ok(())
 }
 
 /// Initialise genesis on an empty datadir; no-op if already populated.
@@ -222,8 +334,7 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
     // the clamp routes blocks [start_tip+1 .. witness_from_block-1] through
     // the commit-only fast path below instead of the full-witness path, which
     // would otherwise fail with StateAtBlockNotAvailable on the parent lookup.
-    let mut next =
-        (cfg.orchestrator_checkpoint + 1).max(witness_from_block).min(start_tip + 1);
+    let mut next = (cfg.orchestrator_checkpoint + 1).max(witness_from_block).min(start_tip + 1);
     info!(
         mdbx_tip = start_tip,
         cold_last = ?cold_last,
@@ -338,9 +449,7 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
                 {
                     let mut s = block_number;
                     while s <= catchup_upper {
-                        let e = s
-                            .saturating_add(CATCHUP_BATCH_SIZE - 1)
-                            .min(catchup_upper);
+                        let e = s.saturating_add(CATCHUP_BATCH_SIZE - 1).min(catchup_upper);
                         ranges.push((s, e));
                         s = e + 1;
                     }
@@ -355,7 +464,7 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
                     .buffered(CATCHUP_BATCH_PIPELINE);
 
                 let mut fetch_failed = false;
-                'batches: loop {
+                loop {
                     let (s, e, fetch_result) = tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => {
@@ -439,7 +548,6 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
                                             err = %e,
                                             "Pruner join failed — pruning disabled for this run, restart to restore"
                                         );
-                                        break 'batches;
                                     }
                                 }
                             } else {
@@ -589,10 +697,7 @@ async fn fetch_batch(
         waiters.push((bn, waiter));
     }
 
-    batch
-        .send()
-        .await
-        .map_err(|e| eyre!("rpc batch send [{start}..={end_inclusive}]: {e}"))?;
+    batch.send().await.map_err(|e| eyre!("rpc batch send [{start}..={end_inclusive}]: {e}"))?;
 
     let total_ms = t_fetch.elapsed().as_millis() as u64;
     let per_block_ms = total_ms / (end_inclusive - start + 1);

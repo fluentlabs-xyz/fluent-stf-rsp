@@ -21,6 +21,7 @@ eyre.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
+axum = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 url.workspace = true
 rusqlite.workspace = true
@@ -70,7 +71,7 @@ reth-prune-types = { workspace = true }
 reth-config = { workspace = true }
 
 [features]
-default = ["mainnet"]
+default = ["testnet"]
 mainnet = ["fluent-stf-primitives/mainnet", "rsp-host-executor/mainnet"]
 testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet"]
 devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet"]

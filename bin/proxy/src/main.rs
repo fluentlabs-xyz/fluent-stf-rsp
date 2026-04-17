@@ -7,7 +7,7 @@
 //! - `POST /sign-block-execution`           — execute block, return signed result (bincode)
 //! - `POST /sign-batch-root`                — sign batch Merkle root from in-memory store
 //!
-//! ## Challenge endpoints (proxy builds `ClientInput` from RPC)
+//! ## Challenge endpoints (proxy builds `ClientInput` from cold hub or RPC)
 //!
 //! - `POST /challenge/sp1/request`    — submit async SP1 zkVM proof request (blobs from beacon)
 //! - `POST /challenge/sp1/status`     — poll for SP1 proof result
@@ -15,6 +15,10 @@
 //! ## Mock endpoints (testing, local SP1 execution)
 //!
 //! - `POST /mock/sp1/request`         — execute SP1 locally (CPU), return success/failure
+//!
+//! When `WITNESS_HUB_URL` is configured, challenge and mock handlers first
+//! query the witness-orchestrator cold storage over HTTP and only fall back
+//! to host execution on miss / decode error.
 //!
 //! All endpoints are protected by `x-api-key` header.
 
@@ -99,6 +103,15 @@ struct AppState {
     chain: ChainContext,
     /// L1 context — used by `/sign-batch-root` for blob fetching.
     l1: Option<L1State>,
+    /// Witness-orchestrator cold-storage HTTP client. If set, challenge/mock
+    /// handlers query it before falling back to host execution.
+    witness_hub: Option<WitnessHubClient>,
+}
+
+#[derive(Clone)]
+struct WitnessHubClient {
+    url: String,
+    http: reqwest::Client,
 }
 
 #[derive(Clone)]
@@ -303,6 +316,71 @@ async fn build_client_input(
         .map_err(|e| internal(format!("Block execution failed: {e}")))
 }
 
+/// Try the witness-orchestrator cold storage first; fall back to host
+/// execution if the witness is not found, the hub is not configured, or only
+/// `block_hash` was provided (cold storage is keyed by block number).
+async fn build_client_input_cold_first(
+    block_number: Option<u64>,
+    block_hash: Option<B256>,
+    chain: &ChainContext,
+    witness_hub: Option<&WitnessHubClient>,
+) -> Result<EthClientExecutorInput, HandlerError> {
+    if let (Some(num), Some(hub)) = (block_number, witness_hub) {
+        match hub.fetch(num).await {
+            Some(bytes) => match bincode::deserialize::<EthClientExecutorInput>(&bytes) {
+                Ok(input) => {
+                    info!(block_number = num, "Loaded client input from cold witness hub");
+                    return Ok(input);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        block_number = num,
+                        err = %e,
+                        "Cold witness decode failed — falling back to host execution"
+                    );
+                }
+            },
+            None => {
+                info!(block_number = num, "Cold witness miss — falling back to host execution");
+            }
+        }
+    }
+
+    build_client_input(block_number, block_hash, chain).await
+}
+
+impl WitnessHubClient {
+    /// `GET /witness/{block_number}` — returns the raw bincode-serialized
+    /// `EthClientExecutorInput` bytes or `None` on 404 / network error.
+    async fn fetch(&self, block_number: u64) -> Option<Vec<u8>> {
+        let url = format!("{}/witness/{block_number}", self.url);
+        match self.http.get(&url).send().await {
+            Ok(resp) => match resp.status() {
+                reqwest::StatusCode::OK => match resp.bytes().await {
+                    Ok(body) => Some(body.to_vec()),
+                    Err(e) => {
+                        tracing::warn!(block_number, err = %e, "Witness hub body read failed");
+                        None
+                    }
+                },
+                reqwest::StatusCode::NOT_FOUND => None,
+                status => {
+                    tracing::warn!(
+                        block_number,
+                        %status,
+                        "Witness hub returned unexpected status"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(block_number, err = %e, "Witness hub request failed");
+                None
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Signing endpoints — caller provides EthClientExecutorInput
 // ===========================================================================
@@ -383,7 +461,13 @@ async fn challenge_sp1_request(
 
     let raw_blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
 
-    let client_input = build_client_input(req.block_number, req.block_hash, &state.chain).await?;
+    let client_input = build_client_input_cold_first(
+        req.block_number,
+        req.block_hash,
+        &state.chain,
+        state.witness_hub.as_ref(),
+    )
+    .await?;
     let block_number = client_input.current_block.header.number;
 
     let blob_input = prepare_blob_input(&raw_blobs)?;
@@ -487,7 +571,13 @@ async fn mock_sp1_request(
     );
 
     let raw_blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
-    let client_input = build_client_input(req.block_number, req.block_hash, &state.chain).await?;
+    let client_input = build_client_input_cold_first(
+        req.block_number,
+        req.block_hash,
+        &state.chain,
+        state.witness_hub.as_ref(),
+    )
+    .await?;
     let block_number = client_input.current_block.header.number;
     let blob_input = prepare_blob_input(&raw_blobs)?;
 
@@ -607,7 +697,24 @@ async fn main() -> eyre::Result<()> {
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
-    let state = AppState { api_key, nitro, sp1, sp1_elf_bytes, chain, l1 };
+    // Witness-orchestrator HTTP cold-storage client. Optional — without it,
+    // challenge/mock handlers always execute via host RPC (legacy behaviour).
+    let witness_hub = match env::var("WITNESS_HUB_URL") {
+        Ok(url) => {
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| eyre::eyre!("build reqwest client: {e}"))?;
+            info!(%url, "Witness hub cold-storage client attached");
+            Some(WitnessHubClient { url, http })
+        }
+        Err(_) => {
+            info!("WITNESS_HUB_URL not set — challenge/mock will always host-execute");
+            None
+        }
+    };
+
+    let state = AppState { api_key, nitro, sp1, sp1_elf_bytes, chain, l1, witness_hub };
 
     let app = Router::new()
         // ── Signing (TEE, input from caller) ─────────────

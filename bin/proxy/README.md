@@ -14,7 +14,6 @@ An HTTP proxy that sits between callers and execution backends, managing the Mul
 ### Challenge endpoints (proxy builds `ClientInput` from RPC, fetches blobs from Beacon)
 | Endpoint | Backend | Output |
 |---|---|---|
-| `POST /challenge/nitro` | AWS Nitro Enclave | TEE challenge execution with blob verification |
 | `POST /challenge/sp1/request` | SP1 zkVM (network) | `request_id` for async Groth16 proof |
 | `POST /challenge/sp1/status` | SP1 zkVM (network) | Proof result by `request_id` |
 

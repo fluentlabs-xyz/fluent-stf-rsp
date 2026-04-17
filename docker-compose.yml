@@ -57,6 +57,7 @@ services:
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
       SP1_PROVER: ${SP1_PROVER}
       NETWORK_PRIVATE_KEY: ${SP1_PRIVATE_KEY}
+      WITNESS_HUB_URL: ${WITNESS_HUB_URL}
     # TCP-only liveness probe. This verifies only that proxy has bound the
     # socket — it does NOT verify that the enclave handshake succeeded or that
     # the signing pipeline is ready. If proxy is stuck retrying vsock handshake
@@ -79,13 +80,6 @@ services:
     # parent and child processes. Docker's default is 64MB which is too
     # small — SIGBUS at 0x0 when the mapping is exhausted.
     shm_size: 4g
-    deploy:
-      resources:
-        limits:
-          cpus: '4'
-          memory: 8G
-        reservations:
-          memory: 2G
     ulimits:
       nofile:
         soft: 65536
@@ -123,9 +117,6 @@ services:
     init: true
     stop_grace_period: 30s
     network_mode: host
-    depends_on:
-      proxy:
-        condition: service_healthy
     volumes:
       - ./data/witness:/var/lib/witness
     environment:
@@ -134,6 +125,8 @@ services:
       DATADIR: ${DATADIR}
       WITNESS_COLD_FILE: ${WITNESS_COLD_FILE}
       MAX_COLD_BYTES: ${MAX_COLD_BYTES}
+      WITNESS_RETENTION_BLOCKS: ${WITNESS_RETENTION_BLOCKS}
+      WITNESS_HUB_LISTEN_ADDR: ${WITNESS_HUB_LISTEN_ADDR}
       MDBX_MAX_SIZE: ${MDBX_MAX_SIZE}
       PRUNE_FULL: ${PRUNE_FULL}
       DB_PATH: ${DB_PATH}
@@ -150,13 +143,6 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          memory: 512M
     ulimits:
       nofile:
         soft: 65536

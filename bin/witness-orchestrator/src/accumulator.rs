@@ -138,8 +138,7 @@ impl BatchAccumulator {
         // batch_index itself, and fall through to re-register with the
         // new range. Dispatched batches are not touched here — the
         // receipt-missing reorg path in `check_finalized_batches` handles them.
-        let existing_range =
-            self.batches.get(&batch_index).map(|b| (b.from_block, b.to_block));
+        let existing_range = self.batches.get(&batch_index).map(|b| (b.from_block, b.to_block));
         if let Some((existing_from, existing_to)) = existing_range {
             if existing_from == from_block && existing_to == to_block {
                 return;

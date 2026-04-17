@@ -596,18 +596,6 @@ impl OrchestratorState {
                 info!(batch_index, "Batch signed — available for dispatch");
                 accumulator.cache_signature(batch_index, response);
 
-                // Acknowledge cold storage immediately after signing — the
-                // signature is durable in DB, so raw witnesses are no longer
-                // needed.
-                if let Some(batch) = accumulator.get(batch_index) {
-                    let hub = Arc::clone(&self.hub);
-                    let fb = batch.from_block;
-                    let tb = batch.to_block;
-                    tokio::spawn(async move {
-                        hub.acknowledge_range(fb, tb).await;
-                    });
-                }
-
                 self.try_sign_next_batch(accumulator);
                 self.try_dispatch_next_batch(accumulator);
             }
@@ -752,21 +740,13 @@ impl OrchestratorState {
         accumulator: &mut BatchAccumulator,
         missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
     ) {
-        let (changed, finalized_ranges) = check_finalized_batches(
+        let changed = check_finalized_batches(
             &self.config.l1_provider,
             &self.db,
             accumulator,
             missing_receipt_first_seen,
         )
         .await;
-
-        // Safety net: acknowledge cold files for finalized batches
-        for (fb, tb) in finalized_ranges {
-            let hub = Arc::clone(&self.hub);
-            tokio::spawn(async move {
-                hub.acknowledge_range(fb, tb).await;
-            });
-        }
 
         if changed {
             self.try_sign_next_batch(accumulator);
@@ -821,22 +801,21 @@ async fn check_finalized_batches(
     db: &Arc<Mutex<Db>>,
     accumulator: &mut BatchAccumulator,
     missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
-) -> (bool, Vec<(u64, u64)>) {
+) -> bool {
     if !accumulator.has_dispatched() {
-        return (false, vec![]);
+        return false;
     }
 
     let Some(finalized_block) = provider.finalized_block_number().await else {
-        return (false, vec![]);
+        return false;
     };
 
     let candidates = accumulator.dispatched_finalization_candidates(finalized_block);
     if candidates.is_empty() {
-        return (false, vec![]);
+        return false;
     }
 
     let mut changed = false;
-    let mut finalized_ranges = Vec::new();
 
     for batch_index in candidates {
         let Some(tx_hash) = accumulator.dispatched_tx_hash(batch_index) else {
@@ -861,7 +840,6 @@ async fn check_finalized_batches(
                     }
                 }
                 info!(batch_index, %tx_hash, to_block = dispatched.to_block, "Batch finalized on L1 — cleaned up");
-                finalized_ranges.push((dispatched.from_block, dispatched.to_block));
                 changed = true;
             }
             Ok(false) => {
@@ -892,7 +870,7 @@ async fn check_finalized_batches(
         }
     }
 
-    (changed, finalized_ranges)
+    changed
 }
 
 // ============================================================================
@@ -1159,13 +1137,13 @@ mod tests {
         let provider = StubFinality { finalized: Some(1000), receipts: HashMap::new() };
         let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
 
-        let (changed, _) = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        let changed = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
         assert!(!changed, "first missing receipt must not cause undispatch");
         assert!(acc.has_dispatched(), "batch must remain dispatched");
         assert!(first_seen.contains_key(&1));
 
         tokio::time::advance(RECEIPT_MISSING_WINDOW + Duration::from_secs(1)).await;
-        let (changed, _) = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        let changed = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
         assert!(changed, "elapsed window must trigger undispatch");
         assert!(!acc.has_dispatched(), "batch must be undispatched after window");
         assert!(!first_seen.contains_key(&1), "first_seen entry cleared on undispatch");
@@ -1191,11 +1169,9 @@ mod tests {
         let provider = StubFinality { finalized: Some(1000), receipts };
         let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
 
-        let (changed, finalized) =
-            check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
+        let changed = check_finalized_batches(&provider, &db, &mut acc, &mut first_seen).await;
 
         assert!(changed, "batch 2 finalization must mark state as changed");
-        assert_eq!(finalized, vec![(111, 120)], "batch 2 range must be reported");
         assert!(first_seen.contains_key(&1), "batch 1 first_seen recorded");
         assert!(acc.has_dispatched(), "batch 1 remains dispatched (transient None)");
         assert!(
