@@ -228,6 +228,46 @@ impl Db {
         }
     }
 
+    /// Atomically purge stale state after a batch is re-emitted with a different
+    /// range (L1 reorg at `threshold`): drops all `pending_batches > threshold`,
+    /// all `batch_signatures >= threshold` (signature for `threshold` itself is
+    /// stale because its range changed), and all `pending_blobs_accepted > threshold`.
+    /// The `threshold` row in `pending_batches` is preserved for the caller's
+    /// subsequent `save_batch` (INSERT OR REPLACE) to overwrite.
+    pub(crate) fn purge_batches_after(&mut self, threshold: u64) {
+        let tx = match self.conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                error!(err = %e, threshold, "purge_batches_after: begin tx failed");
+                return;
+            }
+        };
+        let ok = tx
+            .execute("DELETE FROM pending_batches WHERE batch_index > ?1", params![threshold])
+            .and_then(|_| {
+                tx.execute(
+                    "DELETE FROM batch_signatures WHERE batch_index >= ?1",
+                    params![threshold],
+                )
+            })
+            .and_then(|_| {
+                tx.execute(
+                    "DELETE FROM pending_blobs_accepted WHERE batch_index > ?1",
+                    params![threshold],
+                )
+            });
+        match ok {
+            Ok(_) => {
+                if let Err(e) = tx.commit() {
+                    error!(err = %e, threshold, "purge_batches_after: commit failed");
+                }
+            }
+            Err(e) => {
+                error!(err = %e, threshold, "purge_batches_after: delete failed — rolling back");
+            }
+        }
+    }
+
     pub(crate) fn load_batches(&self) -> Vec<PendingBatch> {
         let mut stmt = match self.conn.prepare(
             "SELECT batch_index, from_block, to_block, blobs_accepted FROM pending_batches ORDER BY batch_index",

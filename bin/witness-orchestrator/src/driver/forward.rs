@@ -6,9 +6,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloy_eips::BlockNumberOrTag;
 use alloy_network::Ethereum;
 use alloy_provider::{Provider, RootProvider};
+use alloy_rpc_client::BatchRequest;
 use eyre::eyre;
+use futures::stream::StreamExt;
 use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_chainspec::ChainSpec;
 use reth_db::mdbx::DatabaseArguments;
@@ -54,6 +57,16 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Backoff after a transient RPC error before retrying tip lookup.
 const RPC_ERROR_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Number of blocks per JSON-RPC batch during the commit-only catch-up path.
+/// One HTTP POST carries `CATCHUP_BATCH_SIZE` `eth_getBlockByNumber` calls,
+/// cutting per-block HTTP overhead and reducing load on the remote node.
+const CATCHUP_BATCH_SIZE: u64 = 64;
+
+/// Number of batch fetches kept in flight. With `CATCHUP_BATCH_SIZE = 64`
+/// and `CATCHUP_BATCH_PIPELINE = 2` the driver prefetches up to 128 blocks
+/// ahead while `commit_phase` drains them sequentially.
+const CATCHUP_BATCH_PIPELINE: usize = 2;
 
 /// Open a writable `ProviderFactory<N>` against a fresh or existing
 /// reth datadir. Layout: `<datadir>/{db,static_files,rocksdb}`.
@@ -158,8 +171,11 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
     // Invariant: every block MDBX-committed by the driver WITH a witness must
     // also have been cold-store-committed. Commit-only blocks (below
     // witness_from_block) do not push to cold store — this is expected.
-    // If `cold_last < mdbx_tip`, a previous run crashed between MDBX commit
-    // and the post-commit cold push for a witness block.
+    // If `cold_last < mdbx_tip` AND `mdbx_tip >= witness_from_block`, a previous
+    // run crashed between MDBX commit and the post-commit cold push for a
+    // witness block. When MDBX is still catching up below witness_from_block,
+    // cold_last trailing mdbx_tip is the normal commit-only state.
+    let witness_from_block = cfg.witness_from_block;
     let mdbx_tip = cfg.factory.best_block_number().map_err(|e| eyre!("best_block_number: {e}"))?;
     let cold_last =
         cfg.hub.last_committed_block().map_err(|e| eyre!("hub.last_committed_block: {e}"))?;
@@ -168,7 +184,7 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
     // to the new cold-store system — the first N blocks simply won't be in
     // cold storage, which is acceptable since they've already been processed.
     if let Some(cl) = cold_last {
-        if cl < mdbx_tip {
+        if mdbx_tip >= witness_from_block && cl < mdbx_tip {
             return Err(eyre!(
                 "cold store last_committed_block {cl} is behind MDBX tip {mdbx_tip} — \
                  previous run committed to MDBX without persisting to the cold store. \
@@ -177,7 +193,6 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
             ));
         }
     }
-    let witness_from_block = cfg.witness_from_block;
     let start_tip = mdbx_tip;
 
     // Startup safety: if PRUNE_FULL is on and the tip is far past
@@ -201,10 +216,14 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
     }
 
     // Resume cursor: max of pipeline-confirmed checkpoint and first
-    // witness-required block. This handles snapshots where MDBX is ahead of
-    // the orchestrator's confirmed watermark — the driver re-witnesses the
-    // gap [next..=start_tip] in the re-witness branch below.
-    let mut next = (cfg.orchestrator_checkpoint + 1).max(witness_from_block);
+    // witness-required block, clamped to `start_tip + 1` so the driver never
+    // skips past its own MDBX tip. When MDBX is behind `witness_from_block`
+    // (e.g. first run with a high L1_START_BATCH_ID against a fresh datadir),
+    // the clamp routes blocks [start_tip+1 .. witness_from_block-1] through
+    // the commit-only fast path below instead of the full-witness path, which
+    // would otherwise fail with StateAtBlockNotAvailable on the parent lookup.
+    let mut next =
+        (cfg.orchestrator_checkpoint + 1).max(witness_from_block).min(start_tip + 1);
     info!(
         mdbx_tip = start_tip,
         cold_last = ?cold_last,
@@ -303,72 +322,138 @@ pub(crate) async fn run(cfg: DriverConfig, shutdown: CancellationToken) -> eyre:
             // ── block_number > start_tip — fresh tip-following paths ──
 
             // Commit-only fast path (catch-up before first batch).
+            //
+            // Commit phase must run sequentially — `state_root_with_updates`
+            // at block N reads state written by block N-1. Fetching, however,
+            // is network-bound and batchable: we pipeline N JSON-RPC batches
+            // (each `CATCHUP_BATCH_SIZE` blocks) so network RTT and HTTP
+            // overhead are amortized across many blocks and hidden behind
+            // the CPU-bound commit work.
             if block_number < witness_from_block {
-                let fetched = match fetch_block(&cfg.rpc, block_number).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!(block_number, err = %e, "fetch_block failed — retrying range");
-                        tokio::select! {
-                            _ = shutdown.cancelled() => return Ok(()),
-                            _ = tokio::time::sleep(RPC_ERROR_BACKOFF) => {}
-                        }
-                        break;
+                let catchup_upper = upper_inclusive.min(witness_from_block - 1);
+
+                // Chunk [block_number ..= catchup_upper] into batches of up
+                // to CATCHUP_BATCH_SIZE blocks.
+                let mut ranges: Vec<(u64, u64)> = Vec::new();
+                {
+                    let mut s = block_number;
+                    while s <= catchup_upper {
+                        let e = s
+                            .saturating_add(CATCHUP_BATCH_SIZE - 1)
+                            .min(catchup_upper);
+                        ranges.push((s, e));
+                        s = e + 1;
                     }
-                };
-
-                let factory_clone = cfg.factory.clone();
-                let chain_spec_clone = Arc::clone(&cfg.chain_spec);
-                tokio::task::spawn_blocking(move || {
-                    commit_phase(&factory_clone, &chain_spec_clone, fetched)
-                })
-                .await
-                .map_err(|e| eyre!("commit_phase join: {e}"))??;
-
-                if block_number.is_multiple_of(1000) {
-                    info!(
-                        block_number,
-                        witness_from_block, "Catch-up: committed block (no witness)"
-                    );
-                }
-                if block_number + 1 == witness_from_block {
-                    info!(
-                        block_number,
-                        witness_from_block, "Catch-up complete — switching to full witness mode"
-                    );
                 }
 
-                // Pruner still runs during catch-up.
-                if let Some(p) = pruner.take() {
-                    if p.is_pruning_needed(block_number) {
-                        let res = tokio::task::spawn_blocking(move || {
-                            let mut p = p;
-                            let out = p.run(block_number);
-                            (p, out)
+                let rpc = cfg.rpc.clone();
+                let mut batch_stream = futures::stream::iter(ranges)
+                    .map(move |(s, e)| {
+                        let rpc = rpc.clone();
+                        async move { (s, e, fetch_batch(&rpc, s, e).await) }
+                    })
+                    .buffered(CATCHUP_BATCH_PIPELINE);
+
+                let mut fetch_failed = false;
+                'batches: loop {
+                    let (s, e, fetch_result) = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => {
+                            info!("Shutdown requested mid-catch-up — driver exiting");
+                            return Ok(());
+                        }
+                        item = batch_stream.next() => match item {
+                            Some(x) => x,
+                            None => break,
+                        }
+                    };
+
+                    let fetched_batch = match fetch_result {
+                        Ok(v) => v,
+                        Err(err) => {
+                            warn!(
+                                range_start = s,
+                                range_end = e,
+                                err = %err,
+                                "fetch_batch failed — retrying range"
+                            );
+                            tokio::select! {
+                                _ = shutdown.cancelled() => return Ok(()),
+                                _ = tokio::time::sleep(RPC_ERROR_BACKOFF) => {}
+                            }
+                            fetch_failed = true;
+                            break;
+                        }
+                    };
+
+                    for fetched in fetched_batch {
+                        if shutdown.is_cancelled() {
+                            info!("Shutdown requested mid-catch-up — driver exiting");
+                            return Ok(());
+                        }
+                        let bn = fetched.block_number;
+
+                        let factory_clone = cfg.factory.clone();
+                        let chain_spec_clone = Arc::clone(&cfg.chain_spec);
+                        tokio::task::spawn_blocking(move || {
+                            commit_phase(&factory_clone, &chain_spec_clone, fetched)
                         })
-                        .await;
-                        match res {
-                            Ok((returned, Ok(out))) => {
-                                info!(block_number, ?out, "Pruner run");
-                                pruner = Some(returned);
-                            }
-                            Ok((returned, Err(e))) => {
-                                warn!(block_number, err = %e, "Pruner run failed");
-                                pruner = Some(returned);
-                            }
-                            Err(e) => {
-                                error!(
-                                    block_number,
-                                    err = %e,
-                                    "Pruner join failed — pruning disabled for this run, restart to restore"
-                                );
+                        .await
+                        .map_err(|e| eyre!("commit_phase join: {e}"))??;
+
+                        if bn.is_multiple_of(1000) {
+                            info!(
+                                block_number = bn,
+                                witness_from_block, "Catch-up: committed block (no witness)"
+                            );
+                        }
+                        if bn + 1 == witness_from_block {
+                            info!(
+                                block_number = bn,
+                                witness_from_block,
+                                "Catch-up complete — switching to full witness mode"
+                            );
+                        }
+
+                        // Pruner still runs during catch-up.
+                        if let Some(p) = pruner.take() {
+                            if p.is_pruning_needed(bn) {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    let mut p = p;
+                                    let out = p.run(bn);
+                                    (p, out)
+                                })
+                                .await;
+                                match res {
+                                    Ok((returned, Ok(out))) => {
+                                        info!(block_number = bn, ?out, "Pruner run");
+                                        pruner = Some(returned);
+                                    }
+                                    Ok((returned, Err(e))) => {
+                                        warn!(block_number = bn, err = %e, "Pruner run failed");
+                                        pruner = Some(returned);
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            block_number = bn,
+                                            err = %e,
+                                            "Pruner join failed — pruning disabled for this run, restart to restore"
+                                        );
+                                        break 'batches;
+                                    }
+                                }
+                            } else {
+                                pruner = Some(p);
                             }
                         }
-                    } else {
-                        pruner = Some(p);
+
+                        next = bn + 1;
                     }
                 }
 
-                next = block_number + 1;
+                if fetch_failed {
+                    break;
+                }
                 continue;
             }
 
@@ -475,6 +560,53 @@ async fn fetch_block(
         .map_err(|e| eyre!("rpc get_block({block_number}): {e}"))?
         .ok_or_else(|| eyre!("rpc returned no block for {block_number}"))?;
     Ok(FetchedBlock { block_number, alloy_block, fetch_ms: t_fetch.elapsed().as_millis() as u64 })
+}
+
+/// Fetch `[start ..= end_inclusive]` as a single JSON-RPC batch request —
+/// one HTTP POST carrying N `eth_getBlockByNumber` calls, whose responses
+/// are multiplexed back through per-call waiters.
+///
+/// All-or-nothing: if the batch send fails or any waiter returns an error
+/// or `null`, the whole call errors out. Callers retry the entire range
+/// after a backoff, matching the previous `fetch_block` semantics.
+async fn fetch_batch(
+    rpc: &RootProvider<Ethereum>,
+    start: u64,
+    end_inclusive: u64,
+) -> eyre::Result<Vec<FetchedBlock>> {
+    debug_assert!(start <= end_inclusive);
+    let t_fetch = Instant::now();
+    let mut batch = BatchRequest::new(rpc.client());
+
+    let mut waiters = Vec::with_capacity((end_inclusive - start + 1) as usize);
+    for bn in start..=end_inclusive {
+        let waiter = batch
+            .add_call::<_, Option<alloy_rpc_types::Block>>(
+                "eth_getBlockByNumber",
+                &(BlockNumberOrTag::Number(bn), true),
+            )
+            .map_err(|e| eyre!("rpc batch add_call block {bn}: {e}"))?;
+        waiters.push((bn, waiter));
+    }
+
+    batch
+        .send()
+        .await
+        .map_err(|e| eyre!("rpc batch send [{start}..={end_inclusive}]: {e}"))?;
+
+    let total_ms = t_fetch.elapsed().as_millis() as u64;
+    let per_block_ms = total_ms / (end_inclusive - start + 1);
+
+    let mut results = Vec::with_capacity(waiters.len());
+    for (bn, waiter) in waiters {
+        let block = waiter
+            .await
+            .map_err(|e| eyre!("rpc batch get_block({bn}): {e}"))?
+            .ok_or_else(|| eyre!("rpc returned no block for {bn}"))?;
+        results.push(FetchedBlock { block_number: bn, alloy_block: block, fetch_ms: per_block_ms });
+    }
+
+    Ok(results)
 }
 
 /// Commit phase: alloy → primitive → execute → trie → save_blocks(Full) → commit.

@@ -470,7 +470,17 @@ impl OrchestratorState {
     ) {
         match event {
             L1Event::BatchCommitted { batch_index, num_blocks } => {
-                let from = next_batch_from_block.unwrap_or(from_block);
+                // On L1 reorg this event may re-fire for an already-registered
+                // batch. The `next_batch_from_block` tracker is stale in that
+                // case (points past the old — now purged — higher batches),
+                // so anchor `from` to the existing entry's `from_block` to
+                // preserve L2 block alignment. The new `to` shifts with the
+                // re-emitted `num_blocks`. Accumulator's set_batch then purges
+                // stale state for batches > batch_index.
+                let from = accumulator
+                    .get(batch_index)
+                    .map(|b| b.from_block)
+                    .unwrap_or_else(|| next_batch_from_block.unwrap_or(from_block));
                 let to = from + num_blocks.saturating_sub(1);
                 info!(batch_index, from, to, num_blocks, "Setting batch from L1 event");
                 accumulator.set_batch(batch_index, from, to).await;

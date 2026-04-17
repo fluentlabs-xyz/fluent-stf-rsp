@@ -37,6 +37,7 @@ alloy-signer.workspace = true
 alloy-signer-local.workspace = true
 alloy-eips.workspace = true
 alloy-consensus.workspace = true
+alloy-rpc-client.workspace = true
 
 # workspace crates
 rsp-blob-builder.workspace = true
@@ -75,7 +76,6 @@ testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet"]
 devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet"]
 
 [dev-dependencies]
-alloy-rpc-client.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints]

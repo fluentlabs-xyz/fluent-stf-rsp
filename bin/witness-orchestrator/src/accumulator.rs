@@ -131,21 +131,41 @@ impl BatchAccumulator {
         // Idempotent under listener re-emission: if the batch is already
         // registered and the range matches, do nothing (re-emission must
         // NOT clobber accumulated state, especially `blobs_accepted`).
-        // A range mismatch is a hard contract violation — log loudly but
-        // do not corrupt state.
-        if let Some(existing) = self.batches.get(&batch_index) {
-            if existing.from_block == from_block && existing.to_block == to_block {
+        // A range mismatch means an L1 reorg re-committed this batch with
+        // different contents; every higher-indexed batch is now stale and
+        // will be re-emitted on the new canonical chain. Purge pending
+        // state for indices > batch_index, plus the stale signature for
+        // batch_index itself, and fall through to re-register with the
+        // new range. Dispatched batches are not touched here — the
+        // receipt-missing reorg path in `check_finalized_batches` handles them.
+        let existing_range =
+            self.batches.get(&batch_index).map(|b| (b.from_block, b.to_block));
+        if let Some((existing_from, existing_to)) = existing_range {
+            if existing_from == from_block && existing_to == to_block {
                 return;
             }
-            error!(
+            warn!(
                 batch_index,
-                existing_from = existing.from_block,
-                existing_to = existing.to_block,
+                existing_from,
+                existing_to,
                 new_from = from_block,
                 new_to = to_block,
-                "set_batch: range mismatch on re-registration — ignoring"
+                "set_batch: range mismatch on re-registration — purging stale batches >= batch_index"
             );
-            return;
+
+            let stale: Vec<u64> =
+                self.batches.range((batch_index + 1)..).map(|(&k, _)| k).collect();
+            for idx in &stale {
+                self.batches.remove(idx);
+                self.signatures.remove(idx);
+            }
+            // Buffered BatchSubmitted events for any index > batch_index are
+            // also stale — they may not be in `batches` yet, so purge by range.
+            self.pending_blobs_accepted.retain(|&idx| idx <= batch_index);
+            // Signature for `batch_index` itself is tied to the old range — drop it.
+            self.signatures.remove(&batch_index);
+
+            self.persist(move |db| db.purge_batches_after(batch_index)).await;
         }
 
         // Consume any buffered BatchSubmitted for this batch
@@ -368,6 +388,56 @@ mod tests {
         // Re-emission of the same BatchCommitted log must NOT clear the flag.
         acc.set_batch(1, 100, 199).await;
         assert!(acc.batches.get(&1).unwrap().blobs_accepted);
+    }
+
+    #[tokio::test]
+    async fn set_batch_range_mismatch_purges_higher_batches() {
+        let db = temp_db();
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+
+        acc.set_batch(1, 10, 19).await;
+        acc.set_batch(2, 20, 29).await;
+        acc.set_batch(3, 30, 39).await;
+        acc.mark_batch_submitted(1).await;
+        acc.mark_batch_submitted(2).await;
+        acc.mark_batch_submitted(3).await;
+
+        let sig = crate::types::SubmitBatchResponse {
+            batch_root: vec![0u8; 32],
+            versioned_hashes: vec![],
+            signature: vec![0xAA],
+        };
+        acc.cache_signature(1, sig.clone());
+        acc.cache_signature(2, sig.clone());
+        acc.cache_signature(3, sig);
+        // Buffered BatchSubmitted for a not-yet-committed higher batch.
+        acc.mark_batch_submitted(5).await;
+        assert!(acc.pending_blobs_accepted.contains(&5));
+
+        // Re-emission of batch 1 with a different range — L1 reorg.
+        acc.set_batch(1, 10, 24).await;
+
+        // Batch 1 re-registered with new range, blobs_accepted reset, signature dropped.
+        let b1 = acc.batches.get(&1).unwrap();
+        assert_eq!(b1.from_block, 10);
+        assert_eq!(b1.to_block, 24);
+        assert!(!b1.blobs_accepted);
+        assert!(!acc.signatures.contains_key(&1));
+
+        // Batches 2, 3 purged from memory and DB.
+        assert!(!acc.batches.contains_key(&2));
+        assert!(!acc.batches.contains_key(&3));
+        assert!(!acc.signatures.contains_key(&2));
+        assert!(!acc.signatures.contains_key(&3));
+        // Buffered BatchSubmitted for index 5 purged.
+        assert!(!acc.pending_blobs_accepted.contains(&5));
+
+        // Cross-check DB state survives a reload.
+        let reloaded = BatchAccumulator::with_db(Arc::clone(&db));
+        assert!(reloaded.batches.contains_key(&1));
+        assert!(!reloaded.batches.contains_key(&2));
+        assert!(!reloaded.batches.contains_key(&3));
+        assert!(!reloaded.signatures.contains_key(&1));
     }
 
     #[tokio::test]
