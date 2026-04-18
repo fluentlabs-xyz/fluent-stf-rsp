@@ -139,14 +139,34 @@
             # resolves to $HOME/.cache/fluent on Linux.
             preBuild = ''
               export HOME="$TMPDIR/home"
+              # Canonicalize the build tree location so rustc/LLVM see the
+              # same absolute paths regardless of how nix invoked us.
+              # Sandboxed host nix uses $NIX_BUILD_TOP=/build; unsandboxed
+              # nix-in-docker uses /nix/var/nix/builds/nix-N-<pid>. Even with
+              # --remap-path-prefix, rustc's SVH/metadata hash and LLVM's
+              # monomorphization ordering depend on input paths, so differing
+              # $NIX_BUILD_TOP leads to different binary layout → different
+              # PCR0. Copy the source tree to a fixed path under /tmp and
+              # continue the build from there.
+              CANONICAL_BUILD=/tmp/rsp-canonical-build
+              if [ "$PWD" != "$CANONICAL_BUILD/source/bin/client" ]; then
+                rm -rf "$CANONICAL_BUILD"
+                mkdir -p "$CANONICAL_BUILD"
+                # Preserve mode (nix store entries are r-x/r--); just add user
+                # write so cargo can create target/ and write build artifacts.
+                # --no-preserve=ownership only, to avoid chown failures when
+                # the builder uid differs from the file owner in the sandbox.
+                cp -rL --no-preserve=ownership "$NIX_BUILD_TOP/." "$CANONICAL_BUILD/"
+                chmod -R u+w "$CANONICAL_BUILD"
+                cd "$CANONICAL_BUILD/source/bin/client"
+              fi
+              # Also remap build paths for defense in depth (covers file!(),
+              # panic strings, env!("CARGO_MANIFEST_DIR"), etc).
+              export RUSTFLAGS="--remap-path-prefix=$CANONICAL_BUILD=src"
               mkdir -p "$HOME/.cache/fluent/genesis"
               install -m 0644 ${genesisMainnet} "$HOME/.cache/fluent/genesis/genesis-mainnet-v1.0.0.json.gz"
               install -m 0644 ${genesisTestnet} "$HOME/.cache/fluent/genesis/genesis-v0.3.4-dev.json.gz"
               install -m 0644 ${genesisDevnet}  "$HOME/.cache/fluent/genesis/genesis-v0.5.7.json.gz"
-              # crates/primitives/build.rs writes generated code under
-              # crates/primitives/src/fluent_genesis_bin/, so the source must
-              # be writable. Crane unpacks with mode 555 (read-only).
-              chmod -R u+w ../../crates
             '';
 
             doCheck = false;

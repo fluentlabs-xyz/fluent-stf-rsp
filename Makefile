@@ -39,6 +39,7 @@ RUST_LOG 	 ?= info
 build-client:
 	cd $(CLIENT_DIR) && cargo prove build \
 		--elf-name $(ELF) \
+		--locked \
 		--output-directory ../../ \
 		--no-default-features \
 		--features "sp1 $(NETWORK)"
@@ -47,6 +48,7 @@ build-client:
 build-client-docker:
 	cd $(CLIENT_DIR) && cargo prove build \
 		--elf-name $(ELF) \
+		--locked \
 		--output-directory ../../ \
 		--workspace-directory ../../ \
 		--docker \
@@ -59,6 +61,7 @@ build-client-docker:
 build-nitro-validator:
 	cd $(NITRO_VALIDATOR_DIR) && cargo prove build \
 		--elf-name $(NITRO_VALIDATOR_ELF) \
+		--locked \
 		--output-directory ../../ \
 		--no-default-features \
 		--features $(NETWORK)
@@ -67,6 +70,7 @@ build-nitro-validator:
 build-nitro-validator-docker:
 	cd $(NITRO_VALIDATOR_DIR) && cargo prove build \
 		--elf-name $(NITRO_VALIDATOR_ELF) \
+		--locked \
 		--output-directory ../../ \
 		--workspace-directory ../../ \
 		--docker \

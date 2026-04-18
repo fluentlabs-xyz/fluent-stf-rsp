@@ -84,6 +84,11 @@ sha3 = { version = "0.10.8", optional = true }
 
 [profile.release]
 strip = true
+# Single codegen unit for deterministic symbol layout — required for
+# bit-identical PCR0 across build hosts. Default codegen-units=16 can emit
+# symbols in different order depending on available CPU count and
+# scheduling, breaking reproducibility.
+codegen-units = 1
 
 [patch.crates-io]
 # sp1 precompile patches
