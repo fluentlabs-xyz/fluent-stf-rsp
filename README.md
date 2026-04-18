@@ -27,13 +27,15 @@ the host's `/dev/vsock` device.
 
 ### Prerequisites
 
-- AWS EC2 instance with Nitro Enclave support, `nitro-cli` installed, and the
-  allocator service running.
+- AWS EC2 instance with Nitro Enclave support, `nitro-cli` installed (any
+  version, only needed to *run* the enclave), and the allocator service
+  running.
 - Host-side Fluent node exposing its gRPC witness server on `127.0.0.1:10000`.
 - L2 RPC available (set via `RPC_URL`).
-- Build-time: `cargo-prove` (SP1 toolchain) + Docker for the reproducible ELF
-  build. See [Makefile](Makefile) `build-client-docker` and
-  `build-nitro-validator-docker`.
+- Build-time: `cargo-prove` (SP1 toolchain) + Docker daemon (any version).
+  The enclave itself is built inside a digest-pinned builder container
+  ([docker/nitro-builder.Dockerfile](docker/nitro-builder.Dockerfile)), so
+  host `nitro-cli` / `buildx` versions do not affect PCR0.
 
 ### One-shot build and run
 
@@ -72,7 +74,10 @@ make compose-logs
 - **Reproducibility matters**: always use `make compose-build` (chains
   `build-client-docker` + `build-nitro-validator-docker`), never
   `build-client` directly — non-reproducible ELFs change PCR0 and break
-  enclave attestation.
+  enclave attestation. The enclave PCR0 itself is pinned by the
+  [nitro-builder](docker/nitro-builder.Dockerfile) image digest plus the
+  [rust:alpine base image digest](Dockerfile.enclave) — any machine with a
+  working docker daemon produces the same PCR0.
 - **Updating**: edit `.env` → `make compose-up` (compose recreates changed
   services). For image updates, `make compose-build && make compose-up`.
 - **Gotchas**:

@@ -75,24 +75,12 @@ build-nitro-validator-docker:
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────
 
-## Build .eif for AWS Nitro (reproducible). Rewrites EXPECTED_PCR0 in
-## nitro-validator main.rs with the freshly-built enclave's PCR0.
+## Build .eif for AWS Nitro using a pinned builder container. All PCR0-relevant
+## tool versions (nitro-cli, kernel/init/nsm blobs, docker CLI, buildx) live
+## inside the builder image — host only needs any docker daemon. Rewrites
+## EXPECTED_PCR0 in nitro-validator lib.rs with the freshly-built PCR0.
 build-enclave:
-	SOURCE_DATE_EPOCH=1776512613 \
-	docker buildx build \
-		--no-cache \
-		-f Dockerfile.enclave \
-		--build-arg NETWORK=$(NETWORK) \
-		--output type=docker,rewrite-timestamp=true \
-		-t $(BINARY):$(NETWORK) .
-	nitro-cli build-enclave \
-		--docker-uri $(BINARY):$(NETWORK) \
-		--output-file $(EIF) \
-		> $(EIF).pcrs.json
-	python3 scripts/update_expected_pcr0.py \
-		$(EIF).pcrs.json \
-		$(NITRO_VALIDATOR_DIR)/src/lib.rs \
-		$(NETWORK)
+	NETWORK=$(NETWORK) bash scripts/build_enclave_in_container.sh
 
 ## Run enclave locally (debug)
 run-enclave:
@@ -140,7 +128,7 @@ help:
 	@echo "  build-client-docker           Build SP1 ELF reproducible via Docker (prod)"
 	@echo "  build-nitro-validator         Build nitro-validator ELF for attestation proving (dev)"
 	@echo "  build-nitro-validator-docker  Build nitro-validator ELF reproducible via Docker (prod)"
-	@echo "  build-enclave                 Build AWS Nitro .eif"
+	@echo "  build-enclave                 Build AWS Nitro .eif in pinned builder container"
 	@echo "  build-proxy                   Build proxy binary"
 	@echo "  run                           Build and run with Nitro + SP1"
 	@echo "  run-sp1-only                  Build and run with SP1 only (no Nitro)"
