@@ -86,11 +86,29 @@
             # bin/client is a standalone crate but path-depends on ../../crates/*,
             # so the source must include both. sourceRoot cd's into bin/client
             # for cargo; the sibling crates/ stays reachable via relative paths.
+            #
+            # The filter is scoped to bin/client + crates/ only — unrelated
+            # subtrees (bin/aws-nitro-validator, bin/proxy, bin/witness-*)
+            # must NOT influence the source hash, otherwise mutating their
+            # files (e.g. scripts/update_expected_pcr0.py rewriting
+            # EXPECTED_PCR0 in aws-nitro-validator/src/lib.rs after each
+            # build) would cascade into a different PCR0 on every rebuild.
             src = pkgs.lib.cleanSourceWith {
               src = ./.;
               filter = path: type:
-                (craneLib.filterCargoSources path type)
-                || (builtins.match ".*/bin/client/trusted_setup\\.txt$" path != null);
+                let
+                  root = toString ./.;
+                  rel = pkgs.lib.removePrefix (root + "/") (toString path);
+                  inWanted =
+                    rel == "bin/client" || pkgs.lib.hasPrefix "bin/client/" rel
+                    || rel == "crates"   || pkgs.lib.hasPrefix "crates/" rel
+                    || rel == "Cargo.toml" || rel == "Cargo.lock";
+                  isAncestor = rel == "" || rel == "bin";
+                in
+                  (inWanted || isAncestor)
+                  && (type == "directory"
+                      || craneLib.filterCargoSources path type
+                      || builtins.match ".*/bin/client/trusted_setup\\.txt$" path != null);
             };
             sourceRoot = "source/bin/client";
 

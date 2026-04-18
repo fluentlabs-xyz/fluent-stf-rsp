@@ -1,5 +1,5 @@
 .PHONY: build-client build-client-docker build-nitro-validator build-nitro-validator-docker \
-        build-enclave build-proxy run run-sp1-only run-enclave clean help \
+        build-enclave build-enclave-docker build-proxy run run-sp1-only run-enclave clean help \
         compose-build compose-up compose-down compose-logs download-genesis-cache
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
@@ -94,6 +94,31 @@ build-enclave:
 		bin/aws-nitro-validator/src/lib.rs \
 		$(NETWORK)
 
+## Build .eif inside a docker container running nixos/nix, so the host
+## machine doesn't need Nix installed. PCR0 is identical to host-built
+## because every input is pinned by the flake. A named docker volume
+## (`rsp-nix-store`) persists /nix across runs so subsequent builds are
+## incremental. Output is chowned back to the invoking user.
+build-enclave-docker:
+	@command -v docker >/dev/null 2>&1 || { echo "error: docker not installed"; exit 1; }
+	docker volume create rsp-nix-store >/dev/null
+	docker run --rm \
+		-v rsp-nix-store:/nix \
+		-v $(PWD):/work \
+		-w /work \
+		nixos/nix:latest \
+		sh -c "git config --global --add safe.directory /work \
+			&& nix --extra-experimental-features 'nix-command flakes' build .#enclave-$(NETWORK) --impure --out-link /tmp/result \
+			&& install -m 0644 \$$(readlink -f /tmp/result)/image.eif /work/$(EIF) \
+			&& install -m 0644 \$$(readlink -f /tmp/result)/pcr.json  /work/$(EIF).pcrs.json \
+			&& chown $(shell id -u):$(shell id -g) /work/$(EIF) /work/$(EIF).pcrs.json"
+	@echo "EIF: $(EIF)"
+	@echo "PCR0: $$(jq -r .PCR0 $(EIF).pcrs.json)"
+	python3 scripts/update_expected_pcr0.py \
+		$(EIF).pcrs.json \
+		bin/aws-nitro-validator/src/lib.rs \
+		$(NETWORK)
+
 ## Run enclave locally (debug)
 run-enclave:
 	nitro-cli run-enclave \
@@ -140,7 +165,8 @@ help:
 	@echo "  build-client-docker           Build SP1 ELF reproducible via Docker (prod)"
 	@echo "  build-nitro-validator         Build nitro-validator ELF for attestation proving (dev)"
 	@echo "  build-nitro-validator-docker  Build nitro-validator ELF reproducible via Docker (prod)"
-	@echo "  build-enclave                 Build AWS Nitro .eif in pinned builder container"
+	@echo "  build-enclave                 Build AWS Nitro .eif via host Nix"
+	@echo "  build-enclave-docker          Build AWS Nitro .eif via nixos/nix docker image (no host Nix needed)"
 	@echo "  build-proxy                   Build proxy binary"
 	@echo "  run                           Build and run with Nitro + SP1"
 	@echo "  run-sp1-only                  Build and run with SP1 only (no Nitro)"

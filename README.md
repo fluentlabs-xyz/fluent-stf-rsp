@@ -15,7 +15,8 @@ using [Reth](https://github.com/paradigmxyz/reth). Supports both Ethereum and OP
 - `cargo fmt --all` — format (use `--check` to verify)
 - `make build-client` — build SP1 client ELF (dev, requires `sp1up`)
 - `make build-client-docker` — reproducible SP1 ELF build via Docker (prod)
-- `make build-enclave` — build AWS Nitro `.eif` image
+- `make build-enclave` — build AWS Nitro `.eif` image (requires Nix on host)
+- `make build-enclave-docker` — build AWS Nitro `.eif` via `nixos/nix` docker image (no host Nix)
 - `make build-proxy` — build the proxy binary
 
 ## Production Docker Compose
