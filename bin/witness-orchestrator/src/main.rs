@@ -339,21 +339,10 @@ async fn main() {
         });
     }
 
-    // Cold witness store.
+    // Cold witness store. Owned by `Driver`; external consumers reach it
+    // indirectly through `Driver::get_or_build_witness`, which also provides
+    // the MDBX rebuild fallback on cold miss.
     let hub = Arc::new(WitnessHub::new(cold_file, max_cold_bytes, witness_retention_blocks));
-
-    // Witness HTTP server — serves cold witnesses to the proxy (challenge/mock
-    // endpoints). Opens a read path into the same `redb` file without the
-    // cross-process lock conflict a shared-file read would cause.
-    {
-        let hub = Arc::clone(&hub);
-        let shutdown = shutdown.clone();
-        let addr = witness_hub_listen_addr.clone();
-        tasks.spawn(async move {
-            let r = witness_server::run(addr, hub, shutdown).await;
-            ("witness_server", r)
-        });
-    }
 
     // ── Embedded forward-sync driver ─────────────────────────────────────────────
     let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
@@ -401,7 +390,7 @@ async fn main() {
             factory,
             rpc: driver_rpc,
             host_executor,
-            hub: Arc::clone(&hub),
+            hub,
             chain_spec,
             pruner,
             witness_from_block,
@@ -409,6 +398,21 @@ async fn main() {
         })
         .expect("Driver::new failed"),
     );
+
+    // Witness HTTP server — serves witnesses to the proxy (challenge/mock
+    // endpoints). Cold-store hit is verbatim; cold miss falls through to an
+    // MDBX-backed rebuild inside `Driver::get_or_build_witness`. Opens its
+    // own read path into the cold `redb` file via the Arc it shares with the
+    // driver — no cross-process lock conflict.
+    {
+        let driver = Arc::clone(&driver);
+        let shutdown = shutdown.clone();
+        let addr = witness_hub_listen_addr.clone();
+        tasks.spawn(async move {
+            let r = witness_server::run(addr, driver, shutdown).await;
+            ("witness_server", r)
+        });
+    }
 
     // Catch-up runs as its own task so the orchestrator (L1 listener, signing,
     // dispatch) stays responsive while MDBX fast-forwards to witness_from_block.
@@ -451,7 +455,7 @@ async fn main() {
     // expected and must not trigger shutdown.
     let mut exit_code = 0;
     let mut orchestrator_fut =
-        std::pin::pin!(orchestrator::run(config, hub, driver, l1_rx, shutdown.clone()));
+        std::pin::pin!(orchestrator::run(config, driver, l1_rx, shutdown.clone()));
 
     tokio::select! {
         () = orchestrator_fut.as_mut() => {

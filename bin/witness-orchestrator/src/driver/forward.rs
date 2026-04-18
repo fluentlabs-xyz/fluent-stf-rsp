@@ -536,6 +536,50 @@ impl Driver {
         }
     }
 
+    /// Resolve the witness payload for an already-known block.
+    ///
+    /// Fast path: cold-store hit — returns the cached bincode payload verbatim.
+    ///
+    /// Slow path (cold miss): fetches the block body from the L2 RPC and
+    /// rebuilds the witness against the MDBX state at `block_number - 1`. This
+    /// is the same machinery `try_take_new_block` uses when re-feeding blocks
+    /// evicted from the retention window, lifted into a standalone entry point
+    /// so external consumers (HTTP witness server, post-key-rotation re-exec
+    /// in the orchestrator) can depend on cold storage without treating a miss
+    /// as fatal.
+    ///
+    /// Returns `Ok(None)` when the block cannot be served: either beyond the
+    /// current MDBX tip (not yet committed) or block zero (no parent state).
+    /// Returns `Err(_)` only on a fatal rebuild failure (RPC error, executor
+    /// failure, serialization failure).
+    pub(crate) async fn get_or_build_witness(
+        &self,
+        block_number: u64,
+    ) -> eyre::Result<Option<Vec<u8>>> {
+        if let Some(cached) = self.hub.get_witness(block_number).await {
+            return Ok(Some(cached.payload));
+        }
+
+        if block_number == 0 {
+            return Ok(None);
+        }
+        let mdbx_tip =
+            self.factory.best_block_number().map_err(|e| eyre!("best_block_number: {e}"))?;
+        if block_number > mdbx_tip {
+            return Ok(None);
+        }
+
+        let fetched = fetch_block(&self.rpc, block_number).await?;
+        let payload = rewitness_phase(
+            fetched,
+            self.factory.clone(),
+            Arc::clone(&self.host_executor),
+            Arc::clone(&self.hub),
+        )
+        .await?;
+        Ok(Some(payload))
+    }
+
     /// Pull one witness. Returns:
     /// - `Ok(Some(req))` — a witness is ready to dispatch; `state.next` is advanced.
     /// - `Ok(None)` — driver not yet ready (catch-up still running), tip is

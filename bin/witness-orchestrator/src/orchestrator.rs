@@ -14,9 +14,10 @@
 //! The main select loop is drain-only — no branch performs an awaited send,
 //! eliminating the bounded-channel deadlock the previous push-model suffered from.
 //!
-//! On key rotation, blocks that need re-execution are fetched from the cold
-//! witness store ([`WitnessHub::get_witness`]) and pushed onto the high-priority
-//! queue — independent of the feeder.
+//! On key rotation, blocks that need re-execution are fetched via
+//! [`Driver::get_or_build_witness`] — cold-store hit is verbatim, cold miss
+//! falls through to an MDBX-backed rebuild — and pushed onto the high-priority
+//! queue independent of the feeder.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -34,7 +35,6 @@ use tracing::{error, info, warn};
 use crate::accumulator::BatchAccumulator;
 use crate::db::Db;
 use crate::driver::Driver;
-use crate::hub::WitnessHub;
 use crate::l1_listener::L1Event;
 use crate::types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse};
 use l1_rollup_client::{nitro_verifier::is_key_registered, submit_preconfirmation};
@@ -254,7 +254,6 @@ async fn execution_worker(
 /// [`Driver::try_take_new_block`] and forwards them into `normal_tx`.
 pub(crate) async fn run(
     config: OrchestratorConfig,
-    hub: Arc<WitnessHub>,
     driver: Arc<Driver>,
     mut l1_events: mpsc::Receiver<L1Event>,
     shutdown: CancellationToken,
@@ -385,7 +384,7 @@ pub(crate) async fn run(
     let mut state = OrchestratorState {
         config: config.clone(),
         db: Arc::clone(&db),
-        hub: Arc::clone(&hub),
+        driver: Arc::clone(&driver),
         high_tx: high_tx.clone(),
         sign_done_tx,
         dispatch_done_tx,
@@ -484,7 +483,7 @@ pub(crate) async fn run(
 struct OrchestratorState {
     config: OrchestratorConfig,
     db: Arc<Mutex<Db>>,
-    hub: Arc<WitnessHub>,
+    driver: Arc<Driver>,
     high_tx: AsyncSender<ExecutionTask>,
     sign_done_tx: mpsc::Sender<(u64, SignOutcome)>,
     dispatch_done_tx: mpsc::Sender<(u64, DispatchOutcome)>,
@@ -609,26 +608,36 @@ impl OrchestratorState {
 
     /// Queue a block for re-execution after key rotation.
     ///
-    /// Fetches the witness from the cold store and pushes an eager task
-    /// onto the high-priority execution queue.
+    /// Resolves the witness via [`Driver::get_or_build_witness`] — cold-store
+    /// hit is verbatim, cold miss rebuilds from MDBX — and pushes an eager
+    /// task onto the high-priority execution queue.
     fn spawn_re_execution(&self, block_number: u64) {
         let h_tx = self.high_tx.clone();
-        let hub = Arc::clone(&self.hub);
+        let driver = Arc::clone(&self.driver);
         tokio::spawn(async move {
-            match hub.get_witness(block_number).await {
-                Some(req) => {
+            match driver.get_or_build_witness(block_number).await {
+                Ok(Some(payload)) => {
                     if h_tx
-                        .send(ExecutionTask { block_number, payload: req.payload })
+                        .send(ExecutionTask { block_number, payload })
                         .await
                         .is_err()
                     {
                         warn!(block_number, "High-priority channel closed during re-execution");
                     }
                 }
-                None => {
+                Ok(None) => {
                     error!(
                         block_number,
-                        "Re-execution: witness not in cold store — block permanently stuck"
+                        "Re-execution: block not yet in MDBX and not cached — block stuck \
+                         until driver commits it"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        block_number,
+                        err = %e,
+                        "Re-execution: witness rebuild failed — block will not be retried until \
+                         another rotation trigger"
                     );
                 }
             }
