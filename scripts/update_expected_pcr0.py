@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Rewrite the `EXPECTED_PCR0` constant (for a given network) in
-nitro-validator `lib.rs` from the JSON produced by `nitro-cli build-enclave`.
+nitro-validator `lib.rs` from PCR JSON produced by either `nitro-cli
+build-enclave` (nested `Measurements.PCR0`) or monzo/aws-nitro-util's
+buildEif (flat `PCR0`).
 
 Usage:
-    update_expected_pcr0.py <nitro-cli-output.json> <lib.rs> <network>
+    update_expected_pcr0.py <pcr.json> <lib.rs> <network>
 
 `network` must be one of: mainnet, testnet, devnet.
 Only the `#[cfg(feature = "<network>")] pub const EXPECTED_PCR0 …` block is rewritten.
@@ -30,7 +32,12 @@ def main() -> None:
         sys.exit(f"network must be one of {NETWORKS}, got {network!r}")
 
     data = json.loads(pcr_json.read_text())
-    pcr0_hex = data["Measurements"]["PCR0"]
+    if "Measurements" in data:
+        pcr0_hex = data["Measurements"]["PCR0"]
+    elif "PCR0" in data:
+        pcr0_hex = data["PCR0"]
+    else:
+        sys.exit(f"no PCR0 key found in {pcr_json} (expected 'Measurements.PCR0' or 'PCR0')")
     if len(pcr0_hex) != 96:
         sys.exit(f"expected 96 hex chars (48 bytes), got {len(pcr0_hex)}: {pcr0_hex!r}")
 

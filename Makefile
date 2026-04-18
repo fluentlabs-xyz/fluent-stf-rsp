@@ -75,12 +75,24 @@ build-nitro-validator-docker:
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────
 
-## Build .eif for AWS Nitro using a pinned builder container. All PCR0-relevant
-## tool versions (nitro-cli, kernel/init/nsm blobs, docker CLI, buildx) live
-## inside the builder image — host only needs any docker daemon. Rewrites
-## EXPECTED_PCR0 in nitro-validator lib.rs with the freshly-built PCR0.
+## Build .eif for AWS Nitro reproducibly via Nix + monzo/aws-nitro-util.
+## PCR0 is determined entirely by the flake (pinned nixpkgs + nitro-util blobs
+## + pinned rust toolchain + git-hashed source tree) — any machine with Nix
+## produces the same PCR0. `--impure` is needed on first build to let
+## builtins.fetchGit pull git dependencies from the Cargo.lock; subsequent
+## builds hit the store. Writes EIF + pcr.json into the repo root and rewrites
+## EXPECTED_PCR0 in nitro-validator lib.rs.
 build-enclave:
-	NETWORK=$(NETWORK) bash scripts/build_enclave_in_container.sh
+	@command -v nix >/dev/null 2>&1 || { echo "error: nix not installed (see https://determinate.systems/nix)"; exit 1; }
+	nix --extra-experimental-features 'nix-command flakes' build .#enclave-$(NETWORK) --impure
+	install -m 0644 result/image.eif $(EIF)
+	install -m 0644 result/pcr.json  $(EIF).pcrs.json
+	@echo "EIF: $(EIF)"
+	@echo "PCR0: $$(jq -r .PCR0 $(EIF).pcrs.json)"
+	python3 scripts/update_expected_pcr0.py \
+		$(EIF).pcrs.json \
+		bin/aws-nitro-validator/src/lib.rs \
+		$(NETWORK)
 
 ## Run enclave locally (debug)
 run-enclave:

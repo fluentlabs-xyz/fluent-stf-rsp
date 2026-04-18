@@ -32,10 +32,11 @@ the host's `/dev/vsock` device.
   running.
 - Host-side Fluent node exposing its gRPC witness server on `127.0.0.1:10000`.
 - L2 RPC available (set via `RPC_URL`).
-- Build-time: `cargo-prove` (SP1 toolchain) + Docker daemon (any version).
-  The enclave itself is built inside a digest-pinned builder container
-  ([docker/nitro-builder.Dockerfile](docker/nitro-builder.Dockerfile)), so
-  host `nitro-cli` / `buildx` versions do not affect PCR0.
+- Build-time: `cargo-prove` (SP1 toolchain) for the SP1 ELF, and
+  [Nix](https://determinate.systems/nix/) for the enclave (the flake
+  pins every PCR0-relevant input: nixpkgs, rust toolchain, kernel/init/nsm
+  blobs via monzo/aws-nitro-util, source tree). Install Nix with:
+  `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`.
 
 ### One-shot build and run
 
@@ -74,10 +75,10 @@ make compose-logs
 - **Reproducibility matters**: always use `make compose-build` (chains
   `build-client-docker` + `build-nitro-validator-docker`), never
   `build-client` directly — non-reproducible ELFs change PCR0 and break
-  enclave attestation. The enclave PCR0 itself is pinned by the
-  [nitro-builder](docker/nitro-builder.Dockerfile) image digest plus the
-  [rust:alpine base image digest](Dockerfile.enclave) — any machine with a
-  working docker daemon produces the same PCR0.
+  enclave attestation. The enclave PCR0 is pinned entirely by
+  [flake.nix](flake.nix) (nixpkgs rev, rust toolchain, kernel/init blobs
+  from monzo/aws-nitro-util, source tree) — any machine with Nix produces
+  the same PCR0.
 - **Updating**: edit `.env` → `make compose-up` (compose recreates changed
   services). For image updates, `make compose-build && make compose-up`.
 - **Gotchas**:

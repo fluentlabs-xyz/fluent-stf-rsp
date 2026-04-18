@@ -57,3 +57,7 @@ attestation.bin
 
 # Pre-downloaded assets for Docker builds
 .docker-cache/
+
+# Nix build output symlink
+result
+result-*
