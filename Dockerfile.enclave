@@ -9,7 +9,11 @@
 #     --output type=docker,rewrite-timestamp=true \
 #     -t rsp-client:latest .
 
-FROM rust:1.94.1-alpine3.21 AS builder
+# Base image pinned by digest — tag alone is not reproducible (Docker Hub
+# re-tags `:1.94.1-alpine3.21` on security rebuilds). Index digest covers
+# all architectures; docker resolves to the right platform at build time.
+# To refresh: `docker buildx imagetools inspect rust:1.94.1-alpine3.21`
+FROM rust:1.94.1-alpine3.21@sha256:f800c06daae24db26d34e43cc3a5c72e5aa863b0ef7f95569a0d13b1ad8891af AS builder
 
 # Network feature: mainnet | testnet | devnet (must match fluent-stf-primitives features)
 ARG NETWORK=mainnet

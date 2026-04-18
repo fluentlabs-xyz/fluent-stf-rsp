@@ -78,8 +78,9 @@ build-nitro-validator-docker:
 ## Build .eif for AWS Nitro (reproducible). Rewrites EXPECTED_PCR0 in
 ## nitro-validator main.rs with the freshly-built enclave's PCR0.
 build-enclave:
-	SOURCE_DATE_EPOCH=$$(git log -1 --pretty=%ct) \
+	SOURCE_DATE_EPOCH=1776512613 \
 	docker buildx build \
+		--no-cache \
 		-f Dockerfile.enclave \
 		--build-arg NETWORK=$(NETWORK) \
 		--output type=docker,rewrite-timestamp=true \
