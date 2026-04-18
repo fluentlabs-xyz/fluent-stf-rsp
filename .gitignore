@@ -54,3 +54,6 @@ attestation.bin
 
 # Claude Code
 .claude/
+
+# Pre-downloaded assets for Docker builds
+.docker-cache/

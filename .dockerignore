@@ -11,5 +11,9 @@
 !rsp-client-*.elf
 !nitro-validator-*.elf
 
+# Pre-downloaded genesis cache (populated by `make download-genesis-cache`)
+!.docker-cache/
+!.docker-cache/**
+
 # Exclude build artifacts from context
 **/target

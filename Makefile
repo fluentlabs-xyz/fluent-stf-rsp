@@ -1,6 +1,6 @@
 .PHONY: build-client build-client-docker build-nitro-validator build-nitro-validator-docker \
         build-enclave build-proxy run run-sp1-only run-enclave clean help \
-        compose-build compose-up compose-down compose-logs
+        compose-build compose-up compose-down compose-logs download-genesis-cache
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 CLIENT_DIR   := bin/client
@@ -163,14 +163,46 @@ help:
 	@echo "  make build-client NETWORK=testnet      # testnet"
 	@echo "  make build-enclave NETWORK=devnet      # devnet"
 
+# ─── Genesis pre-download (for reproducible docker builds) ───────────────────
+
+GENESIS_CACHE_DIR := .docker-cache/genesis
+
+## Pre-download genesis.json.gz for all networks into build context.
+## crates/primitives/build.rs iterates all three networks regardless of active
+## feature, so we must pre-download all three — otherwise cargo build inside
+## docker would pull from GitHub at compile time.
+download-genesis-cache:
+	@mkdir -p $(GENESIS_CACHE_DIR)
+	@set -e; \
+	for spec in \
+		"v1.0.0:genesis-mainnet-v1.0.0.json.gz" \
+		"v0.3.4-dev:genesis-v0.3.4-dev.json.gz" \
+		"v0.5.7:genesis-v0.5.7.json.gz"; do \
+		tag=$$(echo $$spec | cut -d: -f1); \
+		name=$$(echo $$spec | cut -d: -f2); \
+		path="$(GENESIS_CACHE_DIR)/$$name"; \
+		if [ ! -f "$$path" ]; then \
+			echo "Downloading $$name..."; \
+			curl -fsSL -o "$$path.tmp" \
+				"https://github.com/fluentlabs-xyz/fluentbase/releases/download/$$tag/$$name" \
+				&& mv "$$path.tmp" "$$path"; \
+		else \
+			echo "Cached: $$name"; \
+		fi; \
+	done
+
 # ─── Docker Compose ───────────────────────────────────────────────────────────
 
 ## Build ELFs (reproducibly, via docker) and docker images for the compose
 ## stack (one-shot). Uses the *-docker targets so ELFs are identical across
 ## developer machines — critical because the enclave hardcodes EXPECTED_PCR0
 ## and a non-reproducible build will cause attestation verification to fail.
-compose-build: build-client-docker build-nitro-validator-docker
-	NETWORK=$(NETWORK) $(DOCKER_COMPOSE) build
+##
+## Exports DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 so `docker-compose` v1
+## routes through BuildKit (needed for --mount=type=cache in Dockerfile).
+compose-build: download-genesis-cache build-client-docker build-nitro-validator-docker
+	DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
+		NETWORK=$(NETWORK) $(DOCKER_COMPOSE) build
 
 ## Start the compose stack in the background.
 compose-up:

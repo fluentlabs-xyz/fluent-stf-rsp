@@ -96,8 +96,6 @@ nitro-types = { path = "./crates/nitro-types" }
 witness-orchestrator = { path = "./bin/witness-orchestrator", package = "witness-orchestrator-bin" }
 
 # --- sp1 ---
-sp1-build = "6.0.2"
-sp1-helper = "6.0.2"
 sp1-core-executor = { version = "6.0.2", features = ["bigint-rug"] }
 sp1-prover = "6.0.2"
 sp1-sdk = "6.0.2"
