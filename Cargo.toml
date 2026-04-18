@@ -96,9 +96,9 @@ nitro-types = { path = "./crates/nitro-types" }
 witness-orchestrator = { path = "./bin/witness-orchestrator", package = "witness-orchestrator-bin" }
 
 # --- sp1 ---
-sp1-core-executor = { version = "6.0.2", features = ["bigint-rug"] }
-sp1-prover = "6.0.2"
-sp1-sdk = "6.0.2"
+sp1-core-executor = { version = "6.1.0", features = ["bigint-rug"] }
+sp1-prover = "6.1.0"
+sp1-sdk = "6.1.0"
 
 # --- reth ---
 reth-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["alloy-compat", "std"], branch = "v1.11-patched" }
