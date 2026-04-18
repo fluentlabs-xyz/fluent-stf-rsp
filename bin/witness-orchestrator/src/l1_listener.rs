@@ -1,7 +1,8 @@
 //! L1 event listener for batch lifecycle events.
 //!
 //! Polls the rollup contract on L1 for:
-//! - `BatchCommitted(batchIndex, batchRoot, lastBlockHash, numberOfBlocks, expectedBlobs)` — new batch declared
+//! - `BatchCommitted(batchIndex, batchRoot, fromBlockHash, toBlockHash, numberOfBlocks, expectedBlobs)` — new batch declared
+//!   (pre-upgrade variant `v0::BatchCommitted` with a single `lastBlockHash` is also matched for historical logs)
 //! - `BatchSubmitted(batchIndex)` — all blobs submitted for the batch
 //! - `BatchPreconfirmed(batchIndex, verifierContract, verifier)` — preconfirmation accepted
 //!
@@ -14,7 +15,7 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::Filter;
 use alloy_sol_types::SolEvent;
 use eyre::{eyre, Result};
-use l1_rollup_client::{BatchCommitted, BatchPreconfirmed, BatchSubmitted};
+use l1_rollup_client::{v0, BatchCommitted, BatchPreconfirmed, BatchSubmitted};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -220,6 +221,7 @@ async fn process_page(
         .address(contract_addr)
         .event_signature(vec![
             BatchCommitted::SIGNATURE_HASH,
+            v0::BatchCommitted::SIGNATURE_HASH,
             BatchSubmitted::SIGNATURE_HASH,
             BatchPreconfirmed::SIGNATURE_HASH,
         ])
@@ -234,18 +236,48 @@ async fn process_page(
     for log in &logs {
         let topic0 = log.topic0().copied().unwrap_or_default();
 
-        if topic0 == BatchCommitted::SIGNATURE_HASH {
-            let event = BatchCommitted::decode_log_data(&log.inner.data).map_err(|e| {
-                eyre!("Failed to decode BatchCommitted at L1 block {:?}: {e}", log.block_number)
-            })?;
-            let batch_index: u64 = event
-                .batchIndex
-                .try_into()
-                .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-            let num_blocks: u64 = event
-                .numberOfBlocks
-                .try_into()
-                .map_err(|_| eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks))?;
+        if topic0 == BatchCommitted::SIGNATURE_HASH
+            || topic0 == v0::BatchCommitted::SIGNATURE_HASH
+        {
+            // Both ABI variants carry the same (batch_index, numberOfBlocks)
+            // pair — everything downstream needs. Decode per topic0 and drop
+            // the version-specific extras.
+            let (batch_index, num_blocks): (u64, u64) =
+                if topic0 == BatchCommitted::SIGNATURE_HASH {
+                    let event = BatchCommitted::decode_log_data(&log.inner.data).map_err(|e| {
+                        eyre!(
+                            "Failed to decode BatchCommitted v1 at L1 block {:?}: {e}",
+                            log.block_number
+                        )
+                    })?;
+                    (
+                        event
+                            .batchIndex
+                            .try_into()
+                            .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?,
+                        event.numberOfBlocks.try_into().map_err(|_| {
+                            eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks)
+                        })?,
+                    )
+                } else {
+                    let event = v0::BatchCommitted::decode_log_data(&log.inner.data).map_err(
+                        |e| {
+                            eyre!(
+                                "Failed to decode BatchCommitted v0 at L1 block {:?}: {e}",
+                                log.block_number
+                            )
+                        },
+                    )?;
+                    (
+                        event
+                            .batchIndex
+                            .try_into()
+                            .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?,
+                        event.numberOfBlocks.try_into().map_err(|_| {
+                            eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks)
+                        })?,
+                    )
+                };
             if num_blocks == 0 {
                 return Err(eyre!(
                     "BatchCommitted with num_blocks=0 (batch_index={batch_index}) — refusing to advance checkpoint"

@@ -1177,14 +1177,16 @@ async fn send_block_request(
     payload: Bytes,
 ) -> eyre::Result<EthExecutionResponse> {
     let url = format!("{proxy_url}/sign-block-execution");
-    let resp = http_client
+    let req = http_client
         .post(&url)
         .timeout(Duration::from_secs(30))
         .header("content-type", "application/octet-stream")
-        .header("content-encoding", "zstd")
         .header("x-block-number", block_number.to_string())
         .header("x-api-key", api_key)
-        .body(payload)
+        .body(payload);
+    #[cfg(feature = "zstd-block-payload")]
+    let req = req.header("content-encoding", "zstd");
+    let resp = req
         .send()
         .await
         .map_err(|e| eyre::eyre!("HTTP POST failed: {e}"))?;

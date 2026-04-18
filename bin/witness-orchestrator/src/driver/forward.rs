@@ -601,6 +601,20 @@ impl Driver {
         // ── Re-witness path (block already MDBX-committed) ────────────────
         // Range is bounded locally; no RPC tip check needed.
         if block_number <= self.start_tip {
+            // Cold-store hit short-circuit: skip RPC fetch, rebuild, and
+            // re-push (all three produce bit-identical bytes, so round-tripping
+            // through redb is pure waste — and on a large cold.redb the write
+            // txn + retention scan dominate catch-up throughput).
+            if let Some(cached) = self.hub.get_witness(block_number).await {
+                info!(
+                    block_number,
+                    payload_bytes = cached.payload.len() as u64,
+                    "Re-witness served from cold store (skipped rebuild + re-push)"
+                );
+                state.next = block_number + 1;
+                return Ok(Some(ProveRequest { block_number, payload: cached.payload }));
+            }
+
             let fetched = match fetch_block(&self.rpc, block_number).await {
                 Ok(f) => f,
                 Err(e) => {
