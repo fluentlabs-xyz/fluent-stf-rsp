@@ -48,7 +48,7 @@ mod network {
 
     pub const BRIDGE_ADDRESS: Address = address!("0x9CAcf613fC29015893728563f423fD26dCdB8Ddc");
     pub const BRIDGE_WITHDRAWAL_TOPIC: B256 =
-        b256!("0x7b397c6ce16a73396390bf270a2021417ca4d97f44e82cdce3f5eb750fd34134");
+        b256!("0xd6dd852a42072c8955866b4726f03b3970da8db758c7af9a7130fcb97bf05977");
     pub const BRIDGE_ROLLBACK_TOPIC: B256 =
         b256!("0xdf7aa00ff05158efbc91b05d801c14d80f3d08daf5b13c7f066030c864be3d65");
     pub const BRIDGE_DEPOSIT_TOPIC: B256 =
@@ -72,7 +72,7 @@ mod network {
     ];
     pub const BRIDGE_ADDRESS: Address = address!("0x9CAcf613fC29015893728563f423fD26dCdB8Ddc");
     pub const BRIDGE_WITHDRAWAL_TOPIC: B256 =
-        b256!("0x7b397c6ce16a73396390bf270a2021417ca4d97f44e82cdce3f5eb750fd34134");
+        b256!("0xd6dd852a42072c8955866b4726f03b3970da8db758c7af9a7130fcb97bf05977");
     pub const BRIDGE_ROLLBACK_TOPIC: B256 =
         b256!("0xdf7aa00ff05158efbc91b05d801c14d80f3d08daf5b13c7f066030c864be3d65");
     pub const BRIDGE_DEPOSIT_TOPIC: B256 =
