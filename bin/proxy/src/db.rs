@@ -32,9 +32,11 @@ impl Db {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(
             "
-            CREATE TABLE IF NOT EXISTS attestation_request (
-                id          INTEGER PRIMARY KEY CHECK (id = 1),
-                request_id  BLOB NOT NULL
+            CREATE TABLE IF NOT EXISTS pending_attestation (
+                public_key   BLOB PRIMARY KEY,
+                attestation  BLOB NOT NULL,
+                request_id   BLOB,
+                created_at   INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS challenges (
                 challenge_id     BLOB PRIMARY KEY,
@@ -47,35 +49,86 @@ impl Db {
                 error            TEXT,
                 created_at       INTEGER NOT NULL
             );
+            DROP TABLE IF EXISTS attestation_request;
             ",
         )?;
         Ok(Self { conn })
     }
 
-    // ── Attestation request_id ──────────────────────────────────────────
+    // ── Pending attestations (per enclave key) ──────────────────────────
 
-    pub(crate) fn save_attestation_request_id(&self, request_id: B256) {
+    pub(crate) fn insert_pending_attestation(&self, public_key: &[u8], attestation: &[u8]) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         if let Err(e) = self.conn.execute(
-            "INSERT OR REPLACE INTO attestation_request(id, request_id) VALUES(1, ?1)",
-            params![request_id.as_slice()],
+            "INSERT INTO pending_attestation(public_key, attestation, request_id, created_at)
+             VALUES(?1, ?2, NULL, ?3)
+             ON CONFLICT(public_key) DO NOTHING",
+            params![public_key, attestation, now],
         ) {
-            error!(err = %e, "Failed to save attestation request_id");
+            error!(err = %e, "Failed to insert pending_attestation");
         }
     }
 
-    pub(crate) fn load_attestation_request_id(&self) -> Option<B256> {
-        let bytes: Vec<u8> = self
-            .conn
-            .query_row("SELECT request_id FROM attestation_request WHERE id = 1", [], |row| {
-                row.get(0)
-            })
-            .ok()?;
-        B256::try_from(bytes.as_slice()).ok()
+    pub(crate) fn load_pending_attestations(&self) -> Vec<PendingAttestation> {
+        let mut stmt =
+            match self.conn.prepare("SELECT public_key, attestation FROM pending_attestation") {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(err = %e, "Failed to prepare load_pending_attestations");
+                    return Vec::new();
+                }
+            };
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingAttestation { public_key: row.get(0)?, attestation: row.get(1)? })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                error!(err = %e, "Failed to query pending_attestation");
+                Vec::new()
+            }
+        }
     }
 
-    pub(crate) fn delete_attestation_request_id(&self) {
-        if let Err(e) = self.conn.execute("DELETE FROM attestation_request WHERE id = 1", []) {
-            error!(err = %e, "Failed to delete attestation request_id");
+    pub(crate) fn get_request_id(&self, public_key: &[u8]) -> Option<B256> {
+        let bytes: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT request_id FROM pending_attestation WHERE public_key = ?1",
+                params![public_key],
+                |row| row.get(0),
+            )
+            .ok()?;
+        bytes.and_then(|b| B256::try_from(b.as_slice()).ok())
+    }
+
+    pub(crate) fn set_request_id(&self, public_key: &[u8], request_id: B256) {
+        if let Err(e) = self.conn.execute(
+            "UPDATE pending_attestation SET request_id = ?2 WHERE public_key = ?1",
+            params![public_key, request_id.as_slice()],
+        ) {
+            error!(err = %e, "Failed to update request_id");
+        }
+    }
+
+    pub(crate) fn clear_request_id(&self, public_key: &[u8]) {
+        if let Err(e) = self.conn.execute(
+            "UPDATE pending_attestation SET request_id = NULL WHERE public_key = ?1",
+            params![public_key],
+        ) {
+            error!(err = %e, "Failed to clear request_id");
+        }
+    }
+
+    pub(crate) fn delete_pending_attestation(&self, public_key: &[u8]) {
+        if let Err(e) = self
+            .conn
+            .execute("DELETE FROM pending_attestation WHERE public_key = ?1", params![public_key])
+        {
+            error!(err = %e, "Failed to delete pending_attestation");
         }
     }
 
@@ -160,4 +213,9 @@ pub(crate) struct ChallengeRow {
     pub public_values: Option<Vec<u8>>,
     pub vk_hash: Option<Vec<u8>>,
     pub error: Option<String>,
+}
+
+pub(crate) struct PendingAttestation {
+    pub public_key: Vec<u8>,
+    pub attestation: Vec<u8>,
 }

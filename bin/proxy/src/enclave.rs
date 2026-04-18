@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::ProvideCredentials;
@@ -11,6 +12,7 @@ use vsock::{VsockAddr, VsockStream};
 use nitro_types::{AwsCredentials, EnclaveIncoming, EnclaveResponse, EthExecutionResponse};
 use rsp_client_executor::io::EthClientExecutorInput;
 
+use crate::attestation::AttestationConfig;
 use crate::types::NitroConfig;
 
 // ---------------------------------------------------------------------------
@@ -20,79 +22,17 @@ use crate::types::NitroConfig;
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// Initialization (OnceCell for idempotency)
-// ---------------------------------------------------------------------------
-
-/// Tracks whether `ensure_initialized` has already run successfully.
-/// `execute_block_inner` / `submit_batch_inner` may call `ensure_initialized`
-/// again on `NotInitialized` — the `OnceCell` makes repeat calls a no-op.
-static INITIALIZED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-
-/// Ensures the enclave has a signing key and attestation is handled.
-///
-/// 1. Handshake with enclave (always).
-/// 2. New key → save artifacts, delete stale request_id, prove → L1.
-/// 3. Existing key + request_id file → resume pending proof → L1.
-/// 4. Existing key + no request_id → nothing to do.
-///
-/// Blocks until attestation proving completes (or is skipped).
-/// Idempotent — second call returns immediately.
-pub(crate) async fn ensure_initialized(config: &NitroConfig) -> eyre::Result<()> {
-    let cfg = *config;
-    INITIALIZED.get_or_try_init(|| do_initialize(cfg)).await.map(|_| ())
-}
-
-async fn do_initialize(config: NitroConfig) -> eyre::Result<()> {
-    let (public_key, attestation, is_new_key) = handshake_with_enclave(&config).await?;
-
-    if is_new_key {
-        if let Some(db) = crate::db::db() {
-            db.delete_attestation_request_id();
-        }
-
-        info!("New enclave key — starting attestation proving");
-        match crate::attestation::AttestationConfig::from_env().await {
-            Ok(att_config) => {
-                if let Err(e) =
-                    crate::attestation::prove_and_submit(&att_config, &public_key, &attestation)
-                        .await
-                {
-                    tracing::error!("Attestation proving failed: {e}");
-                }
-            }
-            Err(e) => tracing::error!("Attestation config unavailable: {e}"),
-        }
-    } else if crate::db::db().and_then(|db| db.load_attestation_request_id()).is_some() {
-        info!("Found pending attestation request — resuming");
-        match crate::attestation::AttestationConfig::from_env().await {
-            Ok(att_config) => {
-                if let Err(e) =
-                    crate::attestation::prove_and_submit(&att_config, &public_key, &attestation)
-                        .await
-                {
-                    tracing::error!("Failed to resume attestation: {e}");
-                }
-            }
-            Err(e) => tracing::error!("Attestation config unavailable: {e}"),
-        }
-    } else {
-        info!("Enclave already attested — nothing to do");
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Normal block execution — enclave signs with block_hash in the payload.
 pub(crate) async fn execute_block(
     input: EthClientExecutorInput,
-    config: NitroConfig,
+    enclave_cfg: NitroConfig,
+    att_cfg: Option<Arc<AttestationConfig>>,
 ) -> eyre::Result<EthExecutionResponse> {
     let msg = EnclaveIncoming::ExecuteBlock { input: Box::new(input) };
-    execute_block_inner(msg, &config).await
+    execute_block_inner(msg, &enclave_cfg, att_cfg.as_ref()).await
 }
 
 /// Batch signing.
@@ -101,10 +41,11 @@ pub(crate) async fn submit_batch(
     to: u64,
     responses: Vec<EthExecutionResponse>,
     blobs: Vec<Vec<u8>>,
-    config: NitroConfig,
+    enclave_cfg: NitroConfig,
+    att_cfg: Option<Arc<AttestationConfig>>,
 ) -> eyre::Result<EnclaveResponse> {
     let msg = EnclaveIncoming::SubmitBatch { from, to, responses, blobs };
-    submit_batch_inner(msg, &config).await
+    submit_batch_inner(msg, &enclave_cfg, att_cfg.as_ref()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -113,16 +54,18 @@ pub(crate) async fn submit_batch(
 
 async fn execute_block_inner(
     msg: EnclaveIncoming,
-    config: &NitroConfig,
+    enclave_cfg: &NitroConfig,
+    att_cfg: Option<&Arc<AttestationConfig>>,
 ) -> eyre::Result<EthExecutionResponse> {
-    let resp = send_to_enclave(config.enclave_cid, config.enclave_port, &msg).await?;
+    let resp = send_to_enclave(enclave_cfg.enclave_cid, enclave_cfg.enclave_port, &msg).await?;
 
     match resp {
         EnclaveResponse::ExecutionResult(r) => Ok(r),
         EnclaveResponse::NotInitialized => {
-            info!("Enclave not initialised — triggering key generation");
-            ensure_initialized(config).await?;
-            let retry = send_to_enclave(config.enclave_cid, config.enclave_port, &msg).await?;
+            info!("Enclave not initialised — running handshake");
+            crate::attestation::driver::ensure_handshake(enclave_cfg, att_cfg).await?;
+            let retry =
+                send_to_enclave(enclave_cfg.enclave_cid, enclave_cfg.enclave_port, &msg).await?;
             match retry {
                 EnclaveResponse::ExecutionResult(r) => Ok(r),
                 EnclaveResponse::Error(e) => Err(eyre::eyre!("Enclave error on retry: {e}")),
@@ -140,17 +83,19 @@ async fn execute_block_inner(
 
 async fn submit_batch_inner(
     msg: EnclaveIncoming,
-    config: &NitroConfig,
+    enclave_cfg: &NitroConfig,
+    att_cfg: Option<&Arc<AttestationConfig>>,
 ) -> eyre::Result<EnclaveResponse> {
-    let resp = send_to_enclave(config.enclave_cid, config.enclave_port, &msg).await?;
+    let resp = send_to_enclave(enclave_cfg.enclave_cid, enclave_cfg.enclave_port, &msg).await?;
 
     match resp {
         r @ EnclaveResponse::SubmitBatchResult(_) => Ok(r),
         r @ EnclaveResponse::InvalidSignatures { .. } => Ok(r),
         EnclaveResponse::NotInitialized => {
-            info!("Enclave not initialised — triggering key generation");
-            ensure_initialized(config).await?;
-            let retry = send_to_enclave(config.enclave_cid, config.enclave_port, &msg).await?;
+            info!("Enclave not initialised — running handshake");
+            crate::attestation::driver::ensure_handshake(enclave_cfg, att_cfg).await?;
+            let retry =
+                send_to_enclave(enclave_cfg.enclave_cid, enclave_cfg.enclave_port, &msg).await?;
             match retry {
                 r @ EnclaveResponse::SubmitBatchResult(_) => Ok(r),
                 r @ EnclaveResponse::InvalidSignatures { .. } => Ok(r),
@@ -168,7 +113,9 @@ async fn submit_batch_inner(
 // ---------------------------------------------------------------------------
 
 /// Returns `(public_key, attestation, is_new_key)`.
-async fn handshake_with_enclave(config: &NitroConfig) -> eyre::Result<(Vec<u8>, Vec<u8>, bool)> {
+pub(crate) async fn handshake_with_enclave(
+    config: &NitroConfig,
+) -> eyre::Result<(Vec<u8>, Vec<u8>, bool)> {
     let credentials = resolve_aws_credentials().await?;
     let msg = EnclaveIncoming::Handshake { credentials };
 

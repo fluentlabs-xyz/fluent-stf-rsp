@@ -21,7 +21,7 @@ use sp1_sdk::{
     Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey, SP1ProvingKey, SP1Stdin,
 };
 use tonic::transport::Endpoint;
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 use super::{prepare, ROOT_CERT_DER};
@@ -78,40 +78,38 @@ impl AttestationConfig {
 // Proving flow
 // ---------------------------------------------------------------------------
 
-/// Submit attestation proof to SP1 network with retry, wait for result, submit to L1.
+/// Submit attestation proof for a specific enclave key.
 ///
-/// Retry strategy:
-/// 1. If `attestation_request_id.hex` exists on disk — try to resume that request first.
-/// 2. On unfulfillable — identify the bad fulfiller, add to in-memory blacklist.
-/// 3. Fetch fresh HA prover list, filter out blacklisted, submit new request.
-/// 4. If all HA provers exhausted — reset blacklist and retry with full list.
-pub(crate) async fn prove_and_submit(
+/// - If a `request_id` is already saved for this key, try `wait_proof` on it first.
+/// - Otherwise submit a fresh SP1 request with HA whitelist + unfulfillable retry.
+/// - On success: submit Groth16 proof to L1 NitroVerifier, delete the DB row.
+/// - Errors propagate; the caller (driver's `run_prove_loop`) applies outer retry.
+pub(crate) async fn prove_and_submit_for_key(
     config: &AttestationConfig,
     public_key: &[u8],
     attestation: &[u8],
 ) -> Result<()> {
-    // Try to resume a saved request from a previous run.
-    if let Some(saved_id) = crate::db::db().and_then(|db| db.load_attestation_request_id()) {
-        info!(request_id = %hex::encode(saved_id), "Resuming pending attestation proof");
-        match config.prover.wait_proof(saved_id, None, None).await {
+    let saved_id = crate::db::db().and_then(|db| db.get_request_id(public_key));
+
+    if let Some(id) = saved_id {
+        info!(request_id = %hex::encode(id), "Resuming pending attestation proof");
+        match config.prover.wait_proof(id, None, None).await {
             Ok(proof) => {
-                info!("Resumed proof ready, submitting to L1");
                 submit_proof_to_l1(config, public_key, &proof).await?;
                 if let Some(db) = crate::db::db() {
-                    db.delete_attestation_request_id();
+                    db.delete_pending_attestation(public_key);
                 }
                 return Ok(());
             }
             Err(e) => {
-                tracing::warn!("Failed to resume saved proof: {e} — will submit fresh request");
+                warn!("Failed to resume saved proof: {e} — will submit fresh request");
                 if let Some(db) = crate::db::db() {
-                    db.delete_attestation_request_id();
+                    db.clear_request_id(public_key);
                 }
             }
         }
     }
 
-    // Prepare stdin once — reused across retries.
     let guest_input = prepare::prepare_guest_input(attestation, ROOT_CERT_DER)
         .map_err(|e| eyre!("Failed to prepare guest input: {e}"))?;
 
@@ -121,7 +119,6 @@ pub(crate) async fn prove_and_submit(
     let mut blacklist: HashSet<Address> = HashSet::new();
 
     loop {
-        // Fetch fresh HA prover list and filter out blacklisted.
         let whitelist = fetch_ha_whitelist(&blacklist).await?;
 
         info!(
@@ -140,16 +137,15 @@ pub(crate) async fn prove_and_submit(
             .map_err(|e| eyre!("SP1 attestation proof request failed: {e}"))?;
 
         if let Some(db) = crate::db::db() {
-            db.save_attestation_request_id(id);
+            db.set_request_id(public_key, id);
         }
         info!(request_id = %hex::encode(id), "Attestation proof submitted");
 
         match config.prover.wait_proof(id, None, None).await {
             Ok(proof) => {
-                info!("Attestation proof ready, submitting to L1");
                 submit_proof_to_l1(config, public_key, &proof).await?;
                 if let Some(db) = crate::db::db() {
-                    db.delete_attestation_request_id();
+                    db.delete_pending_attestation(public_key);
                 }
                 return Ok(());
             }
@@ -166,14 +162,13 @@ pub(crate) async fn prove_and_submit(
 
                 if !is_retriable {
                     if let Some(db) = crate::db::db() {
-                        db.delete_attestation_request_id();
+                        db.clear_request_id(public_key);
                     }
                     return Err(eyre!("SP1 attestation proof failed: {e}"));
                 }
 
-                // Identify the bad fulfiller and blacklist it.
                 if let Some(fulfiller) = identify_fulfiller(&config.prover, id).await {
-                    tracing::warn!(
+                    warn!(
                         request_id = %hex::encode(id),
                         fulfiller = %fulfiller,
                         error = %e,
@@ -181,7 +176,7 @@ pub(crate) async fn prove_and_submit(
                     );
                     blacklist.insert(fulfiller);
                 } else {
-                    tracing::warn!(
+                    warn!(
                         request_id = %hex::encode(id),
                         error = %e,
                         "Proof request failed with retriable error, could not identify fulfiller"
@@ -189,16 +184,12 @@ pub(crate) async fn prove_and_submit(
                 }
 
                 if let Some(db) = crate::db::db() {
-                    db.delete_attestation_request_id();
+                    db.clear_request_id(public_key);
                 }
 
-                // Check if blacklist has grown too large — reset to give provers another chance.
                 let ha_count = fetch_ha_prover_count().await.unwrap_or(0);
                 if ha_count > 0 && blacklist.len() >= ha_count {
-                    tracing::warn!(
-                        "All HA provers blacklisted ({}) — resetting blacklist",
-                        blacklist.len()
-                    );
+                    warn!("All HA provers blacklisted ({}) — resetting blacklist", blacklist.len());
                     blacklist.clear();
                 }
             }

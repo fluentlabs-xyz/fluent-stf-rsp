@@ -28,10 +28,7 @@ mod db;
 mod enclave;
 mod types;
 
-use crate::{
-    enclave::ensure_initialized,
-    types::{NitroConfig, Sp1ProofResponse},
-};
+use crate::types::{NitroConfig, Sp1ProofResponse};
 use nitro_types::{
     EnclaveResponse, EthExecutionResponse, InvalidSignaturesResponse, SignBatchRootRequest,
 };
@@ -96,6 +93,7 @@ pub fn rpc_url() -> String {
 struct AppState {
     api_key: String,
     nitro: NitroConfig,
+    att_cfg: Option<Arc<attestation::AttestationConfig>>,
     sp1: Option<LazySp1>,
     /// Raw SP1 ELF bytes — used by mock endpoint for local CPU execution.
     sp1_elf_bytes: Option<Arc<Vec<u8>>>,
@@ -398,7 +396,7 @@ async fn sign_block_execution(
     let body = maybe_decompress(&headers, &body)?;
     let input = decode_bincode::<EthClientExecutorInput>(&body)?;
 
-    let response = enclave::execute_block(input, state.nitro)
+    let response = enclave::execute_block(input, state.nitro, state.att_cfg.clone())
         .await
         .map_err(|e| internal(format!("Enclave execution failed: {e}")))?;
 
@@ -454,10 +452,16 @@ async fn sign_batch_root(
     }
 
     // Blobs are now provided by the courier — no L1/Beacon fetch needed
-    let outcome =
-        enclave::submit_batch(req.from_block, req.to_block, req.responses, req.blobs, state.nitro)
-            .await
-            .map_err(|e| internal(format!("Batch submission failed: {e}")))?;
+    let outcome = enclave::submit_batch(
+        req.from_block,
+        req.to_block,
+        req.responses,
+        req.blobs,
+        state.nitro,
+        state.att_cfg.clone(),
+    )
+    .await
+    .map_err(|e| internal(format!("Batch submission failed: {e}")))?;
 
     match outcome {
         EnclaveResponse::SubmitBatchResult(resp) => Ok(Json(resp).into_response()),
@@ -717,8 +721,25 @@ async fn main() -> eyre::Result<()> {
     };
 
     let nitro = NitroConfig::default();
-    ensure_initialized(&nitro).await?;
-    info!("Nitro enclave initialised");
+
+    let att_cfg: Option<Arc<attestation::AttestationConfig>> =
+        match attestation::AttestationConfig::from_env().await {
+            Ok(cfg) => {
+                info!("AttestationConfig initialised");
+                Some(Arc::new(cfg))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "AttestationConfig unavailable: {e} — running without attestation proving"
+                );
+                None
+            }
+        };
+
+    attestation::driver::resume_all_pending(att_cfg.as_ref()).await;
+
+    attestation::driver::ensure_handshake(&nitro, att_cfg.as_ref()).await?;
+    info!("Nitro enclave handshake complete");
 
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
@@ -740,7 +761,7 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
-    let state = AppState { api_key, nitro, sp1, sp1_elf_bytes, chain, l1, witness_hub };
+    let state = AppState { api_key, nitro, att_cfg, sp1, sp1_elf_bytes, chain, l1, witness_hub };
 
     let app = Router::new()
         // ── Signing (TEE, input from caller) ─────────────

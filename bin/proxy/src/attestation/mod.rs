@@ -1,5 +1,6 @@
 //! Attestation validation and proving.
 
+pub(crate) mod driver;
 pub(crate) mod prepare;
 
 pub(crate) const ROOT_CERT_DER: &[u8] = include_bytes!("root.der");
