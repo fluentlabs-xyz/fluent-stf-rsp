@@ -38,7 +38,7 @@ services:
     devices:
       - /dev/vsock:/dev/vsock
     volumes:
-      - ./data/proxy:/var/lib/proxy
+      - ${PROXY_DATA_DIR:-./data/proxy}:/var/lib/proxy
     # NOTE: secrets below are visible via `docker inspect fluent-proxy` to
     # anyone with access to the docker socket. This is acceptable on a
     # dedicated EC2 host where the only docker user is root, but must be
@@ -118,7 +118,7 @@ services:
     stop_grace_period: 30s
     network_mode: host
     volumes:
-      - ./data/witness:/var/lib/witness
+      - ${WITNESS_DATA_DIR:-./data/witness}:/var/lib/witness
     environment:
       RUST_LOG: ${RUST_LOG}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
