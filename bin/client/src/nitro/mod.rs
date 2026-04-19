@@ -83,7 +83,7 @@ fn compute_versioned_hashes(blobs: &[Vec<u8>]) -> anyhow::Result<Vec<B256>> {
 // BlockStore — keeps the last MAX_ENTRIES Merkle leaves + block_hashes
 // ---------------------------------------------------------------------------
 
-const MAX_ENTRIES: usize = 10_000;
+const MAX_ENTRIES: usize = 1 << 18;
 
 /// Per-block data stored after execution.
 #[derive(Clone, Copy)]
