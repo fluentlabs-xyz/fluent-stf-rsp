@@ -32,10 +32,10 @@ pub const KMS_TIMEOUT_SECS: u64 = 30;
 pub const KMS_MAX_RESPONSE_BYTES: u64 = 512 * 1024;
 
 /// The AWS Region where the KMS service is located.
-pub const REGION: &str = "us-east-1";
+pub const REGION: &str = "eu-central-2";
 
 /// The DNS hostname for the AWS KMS endpoint.
-pub const KMS_HOST: &str = "kms.us-east-1.amazonaws.com";
+pub const KMS_HOST: &str = "kms.eu-central-2.amazonaws.com";
 
 /// Required Content-Type header for AWS JSON RPC requests.
 pub const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
