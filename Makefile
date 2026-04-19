@@ -151,7 +151,7 @@ build-release:
 run-enclave:
 	nitro-cli run-enclave \
 		--eif-path $(EIF_PATH) \
-		--cpu-count 7 \
+		--cpu-count 6 \
 		--memory 4096 \
 		--enclave-cid 10
 
