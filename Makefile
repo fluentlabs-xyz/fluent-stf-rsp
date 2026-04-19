@@ -1,4 +1,4 @@
-.PHONY: build-client build-client-docker build-nitro-validator build-nitro-validator-docker \
+.PHONY: build-client-docker build-nitro-validator-docker \
         build-enclave build-enclave-docker build-proxy run run-sp1-only run-enclave clean help \
         compose-build compose-up compose-down compose-logs download-genesis-cache
 
@@ -35,47 +35,30 @@ RUST_LOG 	 ?= info
 
 # ─── SP1 ELF ──────────────────────────────────────────────────────────────────
 
-## Quick ELF build (dev)
-build-client:
-	cd $(CLIENT_DIR) && cargo prove build \
-		--elf-name $(ELF) \
-		--locked \
-		--output-directory ../../ \
-		--no-default-features \
-		--features "sp1 $(NETWORK)"
-
-## Reproducible ELF build via Docker (prod)
-build-client-docker:
-	cd $(CLIENT_DIR) && cargo prove build \
-		--elf-name $(ELF) \
-		--locked \
-		--output-directory ../../ \
-		--workspace-directory ../../ \
-		--docker \
-		--no-default-features \
-		--features "sp1 $(NETWORK)"
+## Build the rsp-client ELF via the pinned SP1 toolchain stage in Dockerfile.
+## BuildKit compiles the `sp1-client-elf-builder` stage inside ghcr.io/
+## succinctlabs/sp1 (no host cargo-prove needed) and the `sp1-client-elf-export`
+## scratch stage writes exactly one file (rsp-client-$(NETWORK).elf) to the
+## repo root via `--output type=local`. Genesis cache must be pre-populated
+## because the builder stage copies it from .docker-cache/genesis.
+build-client-docker: download-genesis-cache
+	DOCKER_BUILDKIT=1 docker build \
+		--target sp1-client-elf-export \
+		--build-arg NETWORK=$(NETWORK) \
+		--output type=local,dest=. \
+		-f Dockerfile .
 
 # ─── Nitro validator ELF (attestation proving) ───────────────────────────────
 
-## Build nitro-validator ELF (dev)
-build-nitro-validator:
-	cd $(NITRO_VALIDATOR_DIR) && cargo prove build \
-		--elf-name $(NITRO_VALIDATOR_ELF) \
-		--locked \
-		--output-directory ../../ \
-		--no-default-features \
-		--features $(NETWORK)
-
-## Reproducible nitro-validator ELF build via Docker (prod)
+## Build the nitro-validator ELF via the Dockerfile, same mechanism as
+## build-client-docker. No genesis cache dependency — the validator crate is
+## a standalone workspace with no fluent-stf-primitives build.rs to feed.
 build-nitro-validator-docker:
-	cd $(NITRO_VALIDATOR_DIR) && cargo prove build \
-		--elf-name $(NITRO_VALIDATOR_ELF) \
-		--locked \
-		--output-directory ../../ \
-		--workspace-directory ../../ \
-		--docker \
-		--no-default-features \
-		--features $(NETWORK)
+	DOCKER_BUILDKIT=1 docker build \
+		--target nitro-validator-elf-export \
+		--build-arg NETWORK=$(NETWORK) \
+		--output type=local,dest=. \
+		-f Dockerfile .
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────
 
@@ -140,7 +123,7 @@ build-proxy:
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
 ## Build and run with both backends (Nitro + SP1)
-run: build-client build-enclave build-proxy
+run: build-client-docker build-enclave build-proxy
 	SP1_ELF_PATH=$(ELF_PATH) \
 	SP1_PROVER=$(SP1_PROVER) \
 	API_KEY=$(API_KEY) \
@@ -149,7 +132,7 @@ run: build-client build-enclave build-proxy
 	./target/release/proxy --eif_path $(EIF_PATH)
 
 ## Build and run with SP1 only (no Nitro)
-run-sp1-only: build-client build-proxy
+run-sp1-only: build-client-docker build-proxy
 	SP1_ELF_PATH=$(ELF_PATH) \
 	SP1_PROVER=network \
 	API_KEY=$(API_KEY) \
@@ -165,10 +148,8 @@ clean:
 
 help:
 	@echo "Targets:"
-	@echo "  build-client                  Build SP1 ELF (dev)"
-	@echo "  build-client-docker           Build SP1 ELF reproducible via Docker (prod)"
-	@echo "  build-nitro-validator         Build nitro-validator ELF for attestation proving (dev)"
-	@echo "  build-nitro-validator-docker  Build nitro-validator ELF reproducible via Docker (prod)"
+	@echo "  build-client-docker           Build SP1 ELF via pinned SP1 image (no host cargo-prove)"
+	@echo "  build-nitro-validator-docker  Build nitro-validator ELF via pinned SP1 image"
 	@echo "  build-enclave                 Build AWS Nitro .eif via host Nix"
 	@echo "  build-enclave-docker          Build AWS Nitro .eif via nixos/nix docker image (no host Nix needed)"
 	@echo "  build-proxy                   Build proxy binary"
@@ -190,9 +171,9 @@ help:
 	@echo "  SP1_PROVER=$(SP1_PROVER)"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make build-client                      # mainnet (default)"
-	@echo "  make build-client NETWORK=testnet      # testnet"
-	@echo "  make build-enclave NETWORK=devnet      # devnet"
+	@echo "  make build-client-docker                    # mainnet (default)"
+	@echo "  make build-client-docker NETWORK=testnet    # testnet"
+	@echo "  make build-enclave NETWORK=devnet           # devnet"
 
 # ─── Genesis pre-download (for reproducible docker builds) ───────────────────
 
@@ -224,10 +205,11 @@ download-genesis-cache:
 
 # ─── Docker Compose ───────────────────────────────────────────────────────────
 
-## Build ELFs (reproducibly, via docker) and docker images for the compose
-## stack (one-shot). Uses the *-docker targets so ELFs are identical across
-## developer machines — critical because the enclave hardcodes EXPECTED_PCR0
-## and a non-reproducible build will cause attestation verification to fail.
+## Build docker images for the compose stack (one-shot). Both the sp1-client
+## and nitro-validator ELFs are now compiled inside the Dockerfile using the
+## pinned `ghcr.io/succinctlabs/sp1` image, so the host does not need
+## `cargo-prove` / `sp1up`. ELFs stay inside the image layers and are never
+## written to the repo root.
 ##
 ## Exports DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 so `docker-compose` v1
 ## routes through BuildKit (needed for --mount=type=cache in Dockerfile).
