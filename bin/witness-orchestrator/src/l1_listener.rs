@@ -236,8 +236,7 @@ async fn process_page(
     for log in &logs {
         let topic0 = log.topic0().copied().unwrap_or_default();
 
-        if topic0 == BatchCommitted::SIGNATURE_HASH
-            || topic0 == v0::BatchCommitted::SIGNATURE_HASH
+        if topic0 == BatchCommitted::SIGNATURE_HASH || topic0 == v0::BatchCommitted::SIGNATURE_HASH
         {
             // Both ABI variants carry the same (batch_index, numberOfBlocks)
             // pair — everything downstream needs. Decode per topic0 and drop
@@ -260,14 +259,13 @@ async fn process_page(
                         })?,
                     )
                 } else {
-                    let event = v0::BatchCommitted::decode_log_data(&log.inner.data).map_err(
-                        |e| {
+                    let event =
+                        v0::BatchCommitted::decode_log_data(&log.inner.data).map_err(|e| {
                             eyre!(
                                 "Failed to decode BatchCommitted v0 at L1 block {:?}: {e}",
                                 log.block_number
                             )
-                        },
-                    )?;
+                        })?;
                     (
                         event
                             .batchIndex

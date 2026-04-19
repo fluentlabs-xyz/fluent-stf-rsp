@@ -139,8 +139,12 @@ pub mod v0 {
 /// `batch_id` is found, then derive the L2 starting block from its
 /// `fromBlockHash` field.
 ///
-/// `fromBlockHash` in `BatchCommitted` is the hash of the **first** L2 block
-/// inside this batch, so `l2_from_block = fromBlockHash.number` directly.
+/// Sequencer convention: `fromBlockHash` is the hash of the **last block of
+/// the previous batch** (exclusive lower bound), `toBlockHash` is the hash of
+/// the **last block of the current batch** (inclusive upper bound). The batch
+/// covers `(fromBlockHash, toBlockHash]` = `[fromBlockHash.number + 1,
+/// toBlockHash.number]`. So `l2_from_block = fromBlockHash.number + 1`, and
+/// `numberOfBlocks = toBlockHash.number - fromBlockHash.number`.
 ///
 /// Returns `(l2_from_block, l1_event_block, num_blocks)`:
 /// - `l2_from_block`: first L2 block in the batch
@@ -264,6 +268,8 @@ pub async fn resolve_l2_start_checkpoint(
 
     let (anchor_hash, l2_from_block) = match anchor {
         Anchor::FromBlockHash(h) => {
+            // `fromBlockHash` is the LAST block of the PREVIOUS batch
+            // (exclusive lower bound), so the first block of THIS batch is `n + 1`.
             let n = l2_provider
                 .get_block_by_hash(h)
                 .await
@@ -277,7 +283,7 @@ pub async fn resolve_l2_start_checkpoint(
                 })?
                 .header
                 .number;
-            (h, n)
+            (h, n + 1)
         }
         Anchor::LastBlockHash(h) => {
             // Pre-upgrade ABI: batch carried only the **last** block hash.

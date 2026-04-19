@@ -49,7 +49,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::hub::WitnessHub;
+use crate::hub::{WitnessHub, DEFAULT_COLD_BATCH_SIZE};
 use alloy_network::{Ethereum, EthereumWallet};
 use alloy_primitives::Address;
 use alloy_provider::{ProviderBuilder, RootProvider};
@@ -256,6 +256,45 @@ async fn main() {
             }
         }
 
+        // ── Startup: advance checkpoint past already-finalized batches ─────────
+        //
+        // `finalize_dispatched_batch` stores `last_batch_end` but does not touch
+        // the checkpoint. If the L1-finalization path advanced past the
+        // checkpoint while the orchestrator was restarting, the checkpoint can
+        // end up stuck below `last_batch_end` — with the corresponding pending
+        // batches already deleted, `on_block_result`'s pending-gap path has no
+        // way to move it forward, and the driver re-witnesses those blocks on
+        // every restart. `last_batch_end` is monotonic (set only by L1
+        // finalization), so blocks up to it are definitively committed; we can
+        // safely jump to it here, then walk forward across any contiguous
+        // already-computed responses.
+        {
+            let current_ckpt = db_startup.get_checkpoint();
+            let last_batch_end = db_startup.get_last_batch_end();
+            let response_blocks: std::collections::HashSet<u64> =
+                db_startup.get_all_response_block_numbers().into_iter().collect();
+
+            let mut new_ckpt = current_ckpt;
+            if let Some(lbe) = last_batch_end {
+                if lbe > new_ckpt {
+                    new_ckpt = lbe;
+                }
+            }
+            while response_blocks.contains(&(new_ckpt + 1)) {
+                new_ckpt += 1;
+            }
+
+            if new_ckpt > current_ckpt {
+                info!(
+                    current_ckpt,
+                    last_batch_end,
+                    new_ckpt,
+                    "Startup forward-advance: jumping checkpoint past finalized batches"
+                );
+                db_startup.save_checkpoint(new_ckpt);
+            }
+        }
+
         let checkpoint = db_startup.get_checkpoint();
         let witness_from = if checkpoint > 0 { checkpoint + 1 } else { 0 };
 
@@ -341,8 +380,14 @@ async fn main() {
 
     // Cold witness store. Owned by `Driver`; external consumers reach it
     // indirectly through `Driver::get_or_build_witness`, which also provides
-    // the MDBX rebuild fallback on cold miss.
-    let hub = Arc::new(WitnessHub::new(cold_file, max_cold_bytes, witness_retention_blocks));
+    // the MDBX rebuild fallback on cold miss. Tip-following writes are
+    // buffered in batches of `DEFAULT_COLD_BATCH_SIZE` to amortize redb fsync.
+    let hub = Arc::new(WitnessHub::new(
+        cold_file,
+        max_cold_bytes,
+        witness_retention_blocks,
+        DEFAULT_COLD_BATCH_SIZE,
+    ));
 
     // ── Embedded forward-sync driver ─────────────────────────────────────────────
     let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
@@ -385,6 +430,7 @@ async fn main() {
         None
     };
 
+    let hub_for_shutdown = Arc::clone(&hub);
     let driver = Arc::new(
         Driver::new(DriverConfig {
             factory,
@@ -500,6 +546,14 @@ async fn main() {
             tracing::error!(err = %e, "driver_catchup join failed");
             exit_code = 1;
         }
+    }
+
+    // Flush any buffered cold-witness entries before exit. On a clean shutdown
+    // this makes `cold_last == mdbx_tip` so the next start needs no re-witness
+    // gap-fill. A failure here is logged but does not change the exit code —
+    // the re-witness fallback still handles any unflushed blocks on restart.
+    if let Err(e) = hub_for_shutdown.flush_pending().await {
+        tracing::error!(err = %e, "cold witness flush_pending failed at shutdown");
     }
 
     if exit_code != 0 {

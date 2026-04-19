@@ -3,6 +3,15 @@
 //! Used by the embedded forward-driver to durably store witnesses for
 //! re-execution lookups (enclave key rotation) and to survive orchestrator
 //! restarts. Zstd-compressed, byte-capped, block-window retention.
+//!
+//! Writes come in two flavours:
+//! - `push` — immediate single-block commit (re-witness path, witness-server
+//!   miss path). Returns after `redb` fsync.
+//! - `push_batched` — buffered commit for the tip-following path. Payloads are
+//!   zstd-compressed into an in-memory buffer; once the buffer reaches
+//!   `batch_size`, a single `redb` write txn persists the whole batch with one
+//!   fsync. A crash before flush loses the buffered block numbers, which the
+//!   driver rebuilds on restart via its re-witness fallback.
 
 #![allow(clippy::result_large_err)]
 
@@ -10,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use redb::{Database, ReadableTable, TableDefinition};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
 use crate::types::ProveRequest;
@@ -18,10 +28,19 @@ const COLD_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("cold_w
 const META_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("cold_meta");
 const TOTAL_BYTES_KEY: &str = "total_bytes";
 
+/// Default batch size for tip-following cold writes. 128 blocks amortizes one
+/// `redb` fsync across ~2 minutes of L2 production at 1 s/block, which on the
+/// observed hardware removes redb from the per-block critical path.
+pub const DEFAULT_COLD_BATCH_SIZE: usize = 128;
+
 pub struct WitnessHub {
     db: Arc<Database>,
     max_cold_bytes: u64,
     retention_blocks: u64,
+    batch_size: usize,
+    /// Compressed payloads awaiting a batched commit. Flushed when
+    /// `len >= batch_size` or by an explicit `flush_pending` call.
+    buffer: AsyncMutex<Vec<(u64, Vec<u8>)>>,
 }
 
 impl std::fmt::Debug for WitnessHub {
@@ -34,10 +53,20 @@ impl WitnessHub {
     /// Open or create a cold witness database at `cold_file`.
     ///
     /// `retention_blocks` defines the window of retained blocks. On every
-    /// successful `push(N)`, entries with `block_number < N - retention_blocks`
-    /// are removed in the same write transaction. `retention_blocks == 0`
-    /// disables retention (archive mode).
-    pub fn new(cold_file: PathBuf, max_cold_bytes: u64, retention_blocks: u64) -> Self {
+    /// successful commit (single or batched), entries with
+    /// `block_number < highest_committed - retention_blocks` are removed in
+    /// the same write transaction. `retention_blocks == 0` disables retention
+    /// (archive mode).
+    ///
+    /// `batch_size` controls the tip-following buffered write path:
+    /// `push_batched` flushes when the buffer reaches this length. Values `< 1`
+    /// are clamped to `1` (degenerate but safe: every push flushes immediately).
+    pub fn new(
+        cold_file: PathBuf,
+        max_cold_bytes: u64,
+        retention_blocks: u64,
+        batch_size: usize,
+    ) -> Self {
         if let Some(parent) = cold_file.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -55,42 +84,65 @@ impl WitnessHub {
             write_txn.commit().expect("commit fresh cold schema");
         }
 
-        Self { db: Arc::new(db), max_cold_bytes, retention_blocks }
-    }
-
-    /// Persist a witness payload for `block_number`. Returns only after the
-    /// `redb` commit (fsync) — await is the backpressure signal. Any failure
-    /// is a hard error so the driver can refuse to advance past an
-    /// unpersisted block (A2 atomicity invariant).
-    pub async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
-        let db = Arc::clone(&self.db);
-        let max_cold_bytes = self.max_cold_bytes;
-        let retention_blocks = self.retention_blocks;
-        let payload = payload.to_vec();
-
-        let join = tokio::task::spawn_blocking(move || -> eyre::Result<()> {
-            let compressed = zstd::encode_all(payload.as_slice(), 3)
-                .map_err(|e| eyre::eyre!("zstd encode: {e}"))?;
-            commit_one_blocking(&db, block_number, compressed, max_cold_bytes, retention_blocks)
-                .map_err(|e| eyre::eyre!("commit_one: {e}"))
-        })
-        .await;
-
-        match join {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                error!(block_number, err = %e, "Cold: witness commit failed");
-                Err(e)
-            }
-            Err(e) => {
-                error!(block_number, err = %e, "Cold: spawn_blocking join failed");
-                Err(eyre::eyre!("spawn_blocking join: {e}"))
-            }
+        Self {
+            db: Arc::new(db),
+            max_cold_bytes,
+            retention_blocks,
+            batch_size: batch_size.max(1),
+            buffer: AsyncMutex::new(Vec::new()),
         }
     }
 
-    /// Highest block number currently in the cold store. Under window retention
-    /// the newest row is never evicted, so `table.last()` is the resume point.
+    /// Persist a single witness payload immediately. Returns after the redb
+    /// commit (fsync). Used by the re-witness path and witness-server cold-miss
+    /// rebuild, where batching would delay durability without benefit.
+    pub async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
+        let compressed = compress_payload(payload).await?;
+        let entries = vec![(block_number, compressed)];
+        self.commit_entries(entries).await
+    }
+
+    /// Persist a witness payload via the buffered tip-following path. Compresses
+    /// inline on the blocking pool, appends to the buffer, and auto-flushes when
+    /// the buffer reaches `batch_size`. On crash before flush the buffered
+    /// blocks are lost from cold; the driver's re-witness fallback rebuilds them
+    /// from MDBX on restart.
+    pub async fn push_batched(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
+        let compressed = compress_payload(payload).await?;
+        let to_flush = {
+            let mut buf = self.buffer.lock().await;
+            buf.push((block_number, compressed));
+            if buf.len() >= self.batch_size {
+                Some(std::mem::take(&mut *buf))
+            } else {
+                None
+            }
+        };
+        if let Some(entries) = to_flush {
+            self.commit_entries(entries).await?;
+        }
+        Ok(())
+    }
+
+    /// Drain and commit any pending buffered entries. Safe to call on shutdown
+    /// or at phase boundaries; no-op if the buffer is empty.
+    pub async fn flush_pending(&self) -> eyre::Result<()> {
+        let entries = {
+            let mut buf = self.buffer.lock().await;
+            if buf.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *buf)
+        };
+        self.commit_entries(entries).await
+    }
+
+    /// Highest block number currently persisted to cold. Does NOT include
+    /// buffered-but-unflushed entries — callers that need exact liveness
+    /// should `flush_pending` first.
+    ///
+    /// Under window retention the newest row is never evicted, so
+    /// `table.last()` is the resume point.
     pub fn last_committed_block(&self) -> eyre::Result<Option<u64>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(COLD_TABLE)?;
@@ -99,10 +151,33 @@ impl WitnessHub {
     }
 
     /// Look up a single witness by block number. Returns `None` if missing
-    /// or on decode failure.
+    /// or on decode failure. Checks the in-memory buffer first so tip-following
+    /// callers can read back their own recent writes before the batch flushes.
     pub async fn get_witness(&self, block_number: u64) -> Option<ProveRequest> {
-        let db = Arc::clone(&self.db);
+        {
+            let buf = self.buffer.lock().await;
+            if let Some(compressed) =
+                buf.iter().rev().find_map(
+                    |(bn, c)| {
+                        if *bn == block_number {
+                            Some(c.clone())
+                        } else {
+                            None
+                        }
+                    },
+                )
+            {
+                drop(buf);
+                return tokio::task::spawn_blocking(move || -> Option<ProveRequest> {
+                    let payload = zstd::decode_all(compressed.as_slice()).ok()?;
+                    Some(ProveRequest { block_number, payload })
+                })
+                .await
+                .ok()?;
+            }
+        }
 
+        let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || -> Option<ProveRequest> {
             let read_txn = db.begin_read().ok()?;
             let table = read_txn.open_table(COLD_TABLE).ok()?;
@@ -113,36 +188,81 @@ impl WitnessHub {
         .await
         .ok()?
     }
+
+    async fn commit_entries(&self, entries: Vec<(u64, Vec<u8>)>) -> eyre::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let db = Arc::clone(&self.db);
+        let max_cold_bytes = self.max_cold_bytes;
+        let retention_blocks = self.retention_blocks;
+
+        let join = tokio::task::spawn_blocking(move || -> eyre::Result<()> {
+            commit_batch_blocking(&db, entries, max_cold_bytes, retention_blocks)
+                .map_err(|e| eyre::eyre!("commit_batch: {e}"))
+        })
+        .await;
+
+        match join {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                error!(err = %e, "Cold: witness commit failed");
+                Err(e)
+            }
+            Err(e) => {
+                error!(err = %e, "Cold: spawn_blocking join failed");
+                Err(eyre::eyre!("spawn_blocking join: {e}"))
+            }
+        }
+    }
 }
 
-/// Commit a single `(block_number, compressed)` entry in one write txn:
-/// insert, prune stale entries below the retention window, update
-/// `total_bytes`, log a warning if the size cap is exceeded.
-fn commit_one_blocking(
+async fn compress_payload(payload: &[u8]) -> eyre::Result<Vec<u8>> {
+    let payload = payload.to_vec();
+    tokio::task::spawn_blocking(move || zstd::encode_all(payload.as_slice(), 3))
+        .await
+        .map_err(|e| eyre::eyre!("zstd spawn_blocking join: {e}"))?
+        .map_err(|e| eyre::eyre!("zstd encode: {e}"))
+}
+
+/// Commit a batch of `(block_number, compressed)` entries in one write txn:
+/// insert all, prune stale entries below the retention window once using the
+/// highest committed block as the anchor, update `total_bytes`, log a warning
+/// if the size cap is exceeded.
+fn commit_batch_blocking(
     db: &Database,
-    block_number: u64,
-    compressed: Vec<u8>,
+    entries: Vec<(u64, Vec<u8>)>,
     max_cold_bytes: u64,
     retention_blocks: u64,
 ) -> Result<(), redb::Error> {
+    debug_assert!(!entries.is_empty());
+    let batched = entries.len();
     let write_txn = db.begin_write()?;
+    let highest_block;
     {
         let mut cold = write_txn.open_table(COLD_TABLE)?;
         let mut meta = write_txn.open_table(META_TABLE)?;
 
-        let compressed_len = compressed.len() as u64;
-        // Replacing an existing entry must update `total_bytes` by net delta,
-        // not by addition — otherwise retries / replays inflate the counter.
-        let prior_len: u64 = cold.get(block_number)?.map(|v| v.value().len() as u64).unwrap_or(0);
-        cold.insert(block_number, compressed.as_slice())?;
+        let mut total_bytes = read_total_bytes(&meta)?;
+        let mut highest = 0u64;
+        for (block_number, compressed) in &entries {
+            let compressed_len = compressed.len() as u64;
+            // Replacing an existing entry must update `total_bytes` by net
+            // delta, not by addition — otherwise retries / replays inflate
+            // the counter.
+            let prior_len: u64 =
+                cold.get(*block_number)?.map(|v| v.value().len() as u64).unwrap_or(0);
+            cold.insert(*block_number, compressed.as_slice())?;
+            total_bytes = total_bytes.saturating_sub(prior_len).saturating_add(compressed_len);
+            if *block_number > highest {
+                highest = *block_number;
+            }
+        }
 
-        let mut total_bytes =
-            read_total_bytes(&meta)?.saturating_sub(prior_len).saturating_add(compressed_len);
-
-        // Retention: drop every entry with key < block_number - retention_blocks
-        // in the same write txn. `retention_blocks == 0` → archive mode, no-op.
+        // Retention: drop every entry with key < highest - retention_blocks in
+        // the same write txn. `retention_blocks == 0` → archive mode, no-op.
         if retention_blocks > 0 {
-            let cutoff = block_number.saturating_sub(retention_blocks);
+            let cutoff = highest.saturating_sub(retention_blocks);
             if cutoff > 0 {
                 let stale: Vec<(u64, u64)> = cold
                     .range(..cutoff)?
@@ -153,7 +273,7 @@ fn commit_one_blocking(
                     total_bytes = total_bytes.saturating_sub(*size);
                 }
                 if !stale.is_empty() {
-                    info!(block_number, cutoff, pruned = stale.len(), "Cold: retention prune");
+                    info!(highest, cutoff, pruned = stale.len(), batched, "Cold: retention prune");
                 }
             }
         }
@@ -162,16 +282,17 @@ fn commit_one_blocking(
 
         if total_bytes > max_cold_bytes {
             warn!(
-                block_number,
+                highest,
                 total_bytes,
                 max_cold_bytes,
                 retention_blocks,
                 "Cold store exceeds size cap — lower WITNESS_RETENTION_BLOCKS or raise MAX_COLD_BYTES"
             );
         }
+        highest_block = highest;
     }
     write_txn.commit()?;
-    info!(block_number, "Cold: committed");
+    info!(highest_block, batched, "Cold: committed");
     Ok(())
 }
 
@@ -196,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn push_get_roundtrip() {
         let file = unique_cold_file("roundtrip");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
 
         hub.push(42, &vec![7u8; 1024]).await.unwrap();
 
@@ -212,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn push_overwrite_preserves_total_bytes() {
         let file = unique_cold_file("overwrite");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
 
         hub.push(1, &vec![7u8; 100_000]).await.unwrap();
         let total1 = {
@@ -236,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn last_committed_block_tracks_highest_push() {
         let file = unique_cold_file("last_committed");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
 
         assert_eq!(hub.last_committed_block().unwrap(), None);
 
@@ -254,13 +375,13 @@ mod tests {
     async fn survives_hub_drop_and_reopen() {
         let file = unique_cold_file("reopen");
         {
-            let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
+            let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
             for i in 1..=5u64 {
                 hub.push(i, &vec![i as u8; 300 * 1024]).await.unwrap();
             }
         }
 
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
         let got = hub.get_witness(3).await.expect("block 3 in cold");
         assert_eq!(got.payload.len(), 300 * 1024);
         assert_eq!(got.payload[0], 3u8);
@@ -273,7 +394,7 @@ mod tests {
     async fn push_prunes_blocks_below_retention_window() {
         let file = unique_cold_file("retention");
         // retention = 3: push(N) removes entries with key < N - 3.
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3, 1);
 
         for i in 1..=10u64 {
             hub.push(i, &vec![i as u8; 1024]).await.unwrap();
@@ -297,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn retention_zero_keeps_all() {
         let file = unique_cold_file("archive");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
 
         for i in 1..=20u64 {
             hub.push(i, &vec![i as u8; 256]).await.unwrap();
@@ -317,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn push_prune_updates_total_bytes() {
         let file = unique_cold_file("prune_meta");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3, 1);
 
         for i in 1..=10u64 {
             hub.push(i, &vec![i as u8; 300 * 1024]).await.unwrap();
@@ -330,6 +451,98 @@ mod tests {
             table.iter().unwrap().filter_map(|r| r.ok().map(|(_, v)| v.value().len() as u64)).sum();
         let total = meta.get(TOTAL_BYTES_KEY).unwrap().unwrap().value();
         assert_eq!(sum, total, "meta[total_bytes] must equal sum of remaining value lengths");
+
+        drop(read_txn);
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn push_batched_buffers_until_full_then_flushes() {
+        let file = unique_cold_file("batched_flush");
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 4);
+
+        // First 3 buffer only — cold store stays empty on disk.
+        for i in 1..=3u64 {
+            hub.push_batched(i, &vec![i as u8; 256]).await.unwrap();
+        }
+        assert_eq!(hub.last_committed_block().unwrap(), None);
+
+        // 4th push hits batch_size → triggers flush.
+        hub.push_batched(4, &vec![4u8; 256]).await.unwrap();
+        assert_eq!(hub.last_committed_block().unwrap(), Some(4));
+
+        for i in 1..=4u64 {
+            let got = hub.get_witness(i).await.expect("flushed block");
+            assert_eq!(got.block_number, i);
+            assert_eq!(got.payload[0], i as u8);
+        }
+
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn push_batched_buffered_entries_visible_via_get_witness() {
+        let file = unique_cold_file("batched_read_own_writes");
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 128);
+
+        hub.push_batched(77, &vec![0xAB; 1024]).await.unwrap();
+        // Not yet persisted.
+        assert_eq!(hub.last_committed_block().unwrap(), None);
+        // But readable from buffer.
+        let got = hub.get_witness(77).await.expect("buffered block readable");
+        assert_eq!(got.block_number, 77);
+        assert_eq!(got.payload.len(), 1024);
+        assert_eq!(got.payload[0], 0xAB);
+
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_commits_buffered_entries() {
+        let file = unique_cold_file("flush_pending");
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1024);
+
+        for i in 1..=5u64 {
+            hub.push_batched(i, &vec![i as u8; 256]).await.unwrap();
+        }
+        assert_eq!(hub.last_committed_block().unwrap(), None);
+
+        hub.flush_pending().await.unwrap();
+        assert_eq!(hub.last_committed_block().unwrap(), Some(5));
+
+        // Second flush is a no-op.
+        hub.flush_pending().await.unwrap();
+
+        drop(hub);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn push_batched_retention_prune_runs_once_per_batch() {
+        let file = unique_cold_file("batched_retention");
+        // retention = 3, batch = 5 → after flush at highest=10 keep 7..=10.
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3, 5);
+
+        // Seed with some earlier persisted entries.
+        for i in 1..=5u64 {
+            hub.push(i, &vec![i as u8; 256]).await.unwrap();
+        }
+        // Then buffer 6..=10 via batched API — flush triggers on 10th push.
+        for i in 6..=10u64 {
+            hub.push_batched(i, &vec![i as u8; 256]).await.unwrap();
+        }
+
+        let read_txn = hub.db.begin_read().unwrap();
+        let table = read_txn.open_table(COLD_TABLE).unwrap();
+        for i in 1..=6u64 {
+            assert!(table.get(i).unwrap().is_none(), "block {i} must be pruned");
+        }
+        for i in 7..=10u64 {
+            assert!(table.get(i).unwrap().is_some(), "block {i} must remain");
+        }
 
         drop(read_txn);
         drop(hub);

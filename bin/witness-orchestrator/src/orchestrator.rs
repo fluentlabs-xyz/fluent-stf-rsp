@@ -623,11 +623,7 @@ impl OrchestratorState {
         tokio::spawn(async move {
             match driver.get_or_build_witness(block_number).await {
                 Ok(Some(payload)) => {
-                    if h_tx
-                        .send(ExecutionTask { block_number, payload })
-                        .await
-                        .is_err()
-                    {
+                    if h_tx.send(ExecutionTask { block_number, payload }).await.is_err() {
                         warn!(block_number, "High-priority channel closed during re-execution");
                     }
                 }
@@ -1186,10 +1182,7 @@ async fn send_block_request(
         .body(payload);
     #[cfg(feature = "zstd-block-payload")]
     let req = req.header("content-encoding", "zstd");
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| eyre::eyre!("HTTP POST failed: {e}"))?;
+    let resp = req.send().await.map_err(|e| eyre::eyre!("HTTP POST failed: {e}"))?;
 
     let status = resp.status();
     if !status.is_success() {

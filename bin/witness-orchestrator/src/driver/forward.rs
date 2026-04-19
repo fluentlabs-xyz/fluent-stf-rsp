@@ -69,7 +69,7 @@ const RPC_ERROR_BACKOFF: Duration = Duration::from_secs(5);
 /// Number of blocks per JSON-RPC batch during the commit-only catch-up path.
 /// One HTTP POST carries `CATCHUP_BATCH_SIZE` `eth_getBlockByNumber` calls,
 /// cutting per-block HTTP overhead and reducing load on the remote node.
-const CATCHUP_BATCH_SIZE: u64 = 64;
+const CATCHUP_BATCH_SIZE: u64 = 800;
 
 /// Number of batch fetches kept in flight. With `CATCHUP_BATCH_SIZE = 64`
 /// and `CATCHUP_BATCH_PIPELINE = 2` the driver prefetches up to 128 blocks
@@ -311,30 +311,30 @@ impl Driver {
     pub(crate) fn new(cfg: DriverConfig) -> eyre::Result<Self> {
         ensure_genesis_initialized(&cfg.factory)?;
 
-        // Invariant: every block MDBX-committed by the driver WITH a witness must
-        // also have been cold-store-committed. Commit-only blocks (below
-        // witness_from_block) do not push to cold store — this is expected.
-        // If `cold_last < mdbx_tip` AND `mdbx_tip >= witness_from_block`, a previous
-        // run crashed between MDBX commit and the post-commit cold push for a
-        // witness block. When MDBX is still catching up below witness_from_block,
-        // cold_last trailing mdbx_tip is the normal commit-only state.
+        // Cold writes are buffered across up to `DEFAULT_COLD_BATCH_SIZE` blocks
+        // for tip-following; a crash between batch flushes leaves `cold_last`
+        // trailing `mdbx_tip`. This is recoverable: the driver's re-witness
+        // path (`try_take_new_block`, `block_number <= start_tip`) falls through
+        // to `rewitness_phase` on cold miss, which rebuilds the payload from
+        // MDBX and pushes it back into cold. So trailing `cold_last` is logged
+        // but not fatal. Only the inverse (`cold_last > mdbx_tip`) would
+        // indicate a real violation — redb committed a witness whose MDBX
+        // parent state is missing — but we do not currently write cold before
+        // MDBX, so that case cannot arise here.
         let witness_from_block = cfg.witness_from_block;
         let mdbx_tip =
             cfg.factory.best_block_number().map_err(|e| eyre!("best_block_number: {e}"))?;
         let cold_last =
             cfg.hub.last_committed_block().map_err(|e| eyre!("hub.last_committed_block: {e}"))?;
-        // `None` means a fresh cold store (or first run with cold-store enabled).
-        // Intentionally NOT an error: allows migrating an existing MDBX datadir
-        // to the new cold-store system — the first N blocks simply won't be in
-        // cold storage, which is acceptable since they've already been processed.
         if let Some(cl) = cold_last {
             if mdbx_tip >= witness_from_block && cl < mdbx_tip {
-                return Err(eyre!(
-                    "cold store last_committed_block {cl} is behind MDBX tip {mdbx_tip} — \
-                     previous run committed to MDBX without persisting to the cold store. \
-                     Restore the cold store from backup, or roll back the MDBX datadir \
-                     to the matching block, before resuming."
-                ));
+                warn!(
+                    cold_last = cl,
+                    mdbx_tip,
+                    gap = mdbx_tip - cl,
+                    "cold store trails MDBX tip — previous run likely crashed between batch \
+                     flushes; re-witness path will refill the gap on resume"
+                );
             }
         }
         let start_tip = mdbx_tip;
@@ -689,10 +689,11 @@ impl Driver {
         let payload =
             witness_phase(job, self.factory.clone(), Arc::clone(&self.host_executor)).await?;
 
-        // Atomicity invariant: cold push MUST complete before we advance
-        // state.next, otherwise a restart will see MDBX ahead of the cold
-        // store and fail loudly (Driver::new invariant check).
-        self.hub.push(block_number, &payload).await?;
+        // Buffered cold write: batches redb fsyncs across many blocks. A crash
+        // before the next flush loses the buffered block numbers from cold —
+        // the re-witness path rebuilds them from MDBX on restart (cold miss →
+        // rewitness_phase).
+        self.hub.push_batched(block_number, &payload).await?;
 
         run_pruner_if_needed(&mut state.pruner, block_number).await;
 
