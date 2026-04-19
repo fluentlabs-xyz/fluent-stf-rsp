@@ -2,6 +2,7 @@ use alloy_consensus::TxReceipt;
 use alloy_primitives::{b256, Address, FixedBytes, Keccak256, LogData, B256};
 use alloy_sol_types::sol;
 use bincode::Error;
+use fluent_stf_primitives::LEGACY_BRIDGE_WITHDRAWAL_TOPIC;
 use reth_execution_types::ExecutionOutcome;
 
 sol! {
@@ -162,6 +163,19 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
             .filter_map(|log| {
                 let topic = log.data.topics().first()?;
                 if topic == send_topic {
+                    if log.data.data.len() >= SEND_EVENT_MESSAGE_HASH_OFFSET + 32 {
+                        let hash: [u8; 32] = log.data.data
+                            [SEND_EVENT_MESSAGE_HASH_OFFSET..SEND_EVENT_MESSAGE_HASH_OFFSET + 32]
+                            .try_into()
+                            .unwrap();
+                        Some(B256::from(hash))
+                    } else {
+                        None
+                    }
+                }
+                // TODO: remove this dirty fix  
+                else if topic == &LEGACY_BRIDGE_WITHDRAWAL_TOPIC {
+                    const SEND_EVENT_MESSAGE_HASH_OFFSET: usize = 128;
                     if log.data.data.len() >= SEND_EVENT_MESSAGE_HASH_OFFSET + 32 {
                         let hash: [u8; 32] = log.data.data
                             [SEND_EVENT_MESSAGE_HASH_OFFSET..SEND_EVENT_MESSAGE_HASH_OFFSET + 32]
