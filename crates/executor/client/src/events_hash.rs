@@ -112,10 +112,12 @@ pub(crate) trait CalculateEventsHash {
 // cast sig-event "ReceivedMessage(bytes32,bool,bytes)"
 const RECEIVE_EVENT_MESSAGE_HASH_OFFSET: usize = 0;
 
-// cast sig-event "SentMessage(address,address,uint256,uint256,uint256,uint256,bytes32,bytes)"
+// cast sig-event
+// "SentMessage(address,address,uint256,uint256,uint256,uint256,uint256,bytes32,bytes)"
 // indexed: sender=topic[1], to=topic[2] → not in data
-// data: value(0) | chainId(32) | blockNumber(64) | nonce(96) | messageHash(128)
-const SEND_EVENT_MESSAGE_HASH_OFFSET: usize = 128;
+// data: value(0) | fee(32) | chainId(64) | validUntilBlockNumber(96) | nonce(128) |
+// messageHash(160)
+const SEND_EVENT_MESSAGE_HASH_OFFSET: usize = 160;
 
 // cast sig-event "RollbackMessage(bytes32,uint256)"
 // data: messageHash(0) | blockNumber(32)
