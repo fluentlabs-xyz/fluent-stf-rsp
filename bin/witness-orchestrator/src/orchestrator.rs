@@ -33,17 +33,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
-    accumulator::BatchAccumulator,
+    accumulator::{BatchAccumulator, DispatchedBatch},
     db::Db,
     driver::Driver,
     l1_listener::L1Event,
     types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse},
 };
+use l1_rollup_client::{
+    broadcast_preconfirm, build_preconfirm_tx, nitro_verifier::is_key_registered,
+};
 use l1_rollup_client::{nitro_verifier::is_key_registered, submit_preconfirmation};
 
 use alloy_eips::BlockNumberOrTag;
-use alloy_network::{Ethereum, EthereumWallet};
-use alloy_primitives::{Address, B256};
+use alloy_network::{Ethereum, EthereumWallet, TxSigner};
+use alloy_primitives::{Address, Signature, B256};
 use alloy_provider::{
     fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
@@ -1746,17 +1749,17 @@ struct RbfResumeState {
 /// RBF state).
 ///
 /// Lifecycle (fresh dispatch — `resume: None`):
-/// 1. Build the tx template (nonce + gas_limit + calldata) and estimate
-///    initial EIP-1559 fees, clamping to `max_fee_cap`.
-/// 2. Broadcast the initial tx, then emit `InitialBroadcast` so main persists
-///    the atomic pending→dispatched transition with nonce + fees + tx_hash.
+/// 1. Build the tx template (nonce + gas_limit + calldata) and estimate initial EIP-1559 fees,
+///    clamping to `max_fee_cap`.
+/// 2. Broadcast the initial tx, then emit `InitialBroadcast` so main persists the atomic
+///    pending→dispatched transition with nonce + fees + tx_hash.
 /// 3. Enter the bump loop.
 ///
 /// Lifecycle (resume — `resume: Some(..)`):
-/// 1. Build the tx template using the STORED nonce (so the first rebroadcast
-///    is a replacement for the in-mempool tx, not a fresh send).
-/// 2. Skip the initial broadcast — the pre-restart tx is already in the
-///    mempool under `resume.tx_hash` at `resume.max_fee_per_gas`.
+/// 1. Build the tx template using the STORED nonce (so the first rebroadcast is a replacement for
+///    the in-mempool tx, not a fresh send).
+/// 2. Skip the initial broadcast — the pre-restart tx is already in the mempool under
+///    `resume.tx_hash` at `resume.max_fee_per_gas`.
 /// 3. Enter the bump loop with that state preloaded.
 ///
 /// Bump loop (shared):
@@ -1833,8 +1836,8 @@ async fn run_rbf_dispatch(
 
     let mut at_cap_logged = max_fee_per_gas >= max_fee_cap;
 
-    if emit_initial
-        && bump_tx
+    if emit_initial &&
+        bump_tx
             .send((
                 batch_index,
                 RbfBumpEvent::InitialBroadcast {

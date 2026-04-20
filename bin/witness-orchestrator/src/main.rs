@@ -591,10 +591,10 @@ async fn main() -> eyre::Result<()> {
 /// Pure result of the startup checkpoint walk.
 ///
 /// Two invariants the caller must preserve after applying it:
-///   1. Checkpoint is never above a block with a missing response/dispatch
-///      (so the driver does not skip re-execution).
-///   2. Checkpoint is walked forward across every contiguous present block
-///      (so the driver does not re-walk already-computed blocks).
+///   1. Checkpoint is never above a block with a missing response/dispatch (so the driver does not
+///      skip re-execution).
+///   2. Checkpoint is walked forward across every contiguous present block (so the driver does not
+///      re-walk already-computed blocks).
 ///
 /// "Present" = response stored OR dispatched batch covers the block. A single
 /// forward walk that stops at the first gap preserves both invariants, which

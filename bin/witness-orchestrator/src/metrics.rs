@@ -6,8 +6,7 @@
 //! and a small set of named constants + helpers that the orchestrator hot
 //! paths call directly.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::U256;
 use alloy_rpc_types::TransactionReceipt;
