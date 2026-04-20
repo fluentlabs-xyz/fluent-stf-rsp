@@ -13,7 +13,7 @@ pub(crate) use nitro_types::{
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProveRequest {
     /// L2 block number this witness corresponds to.
-    pub block_number: u64,
+    pub(crate) block_number: u64,
     /// Bincode-serialized witness data.
-    pub payload: Vec<u8>,
+    pub(crate) payload: Vec<u8>,
 }

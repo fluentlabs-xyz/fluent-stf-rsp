@@ -49,7 +49,6 @@ pub(crate) enum L1Event {
 // Listener loop
 // ---------------------------------------------------------------------------
 
-const POLL_INTERVAL_SECS: u64 = 6;
 const MAX_POLL_BACKOFF_SECS: u64 = 120;
 
 const MIN_PAGE: u64 = 100;
@@ -67,9 +66,6 @@ fn is_too_many_results(err_msg: &str) -> bool {
         s.contains("range is too large")
 }
 
-/// Number of blocks to lag behind `latest` to avoid L1 reorgs.
-const L1_SAFE_BLOCKS: u64 = 3;
-
 /// Result of a single poll iteration.
 enum PollOutcome {
     /// All pages processed successfully up to this block.
@@ -86,16 +82,20 @@ pub(crate) async fn run(
     l1_provider: RootProvider,
     contract_addr: Address,
     mut from_block: u64,
+    poll_interval_secs: u64,
+    safe_blocks: u64,
     tx: mpsc::Sender<L1Event>,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
     info!(
         %contract_addr,
         from_block,
+        poll_interval_secs,
+        safe_blocks,
         "L1 listener started"
     );
 
-    let mut backoff_secs = POLL_INTERVAL_SECS;
+    let mut backoff_secs = poll_interval_secs;
     let mut page_size: u64 = INITIAL_PAGE;
 
     loop {
@@ -111,8 +111,16 @@ pub(crate) async fn run(
             break;
         }
 
-        match poll_once(&l1_provider, contract_addr, from_block, &mut page_size, &tx, &shutdown)
-            .await
+        match poll_once(
+            &l1_provider,
+            contract_addr,
+            from_block,
+            safe_blocks,
+            &mut page_size,
+            &tx,
+            &shutdown,
+        )
+        .await
         {
             Ok(PollOutcome::Complete(latest)) => {
                 if tx.send(L1Event::Checkpoint(latest)).await.is_err() {
@@ -120,7 +128,7 @@ pub(crate) async fn run(
                     break;
                 }
                 from_block = latest + 1;
-                backoff_secs = POLL_INTERVAL_SECS; // reset on full success
+                backoff_secs = poll_interval_secs; // reset on full success
             }
             Ok(PollOutcome::Partial(last_ok)) => {
                 if tx.send(L1Event::Checkpoint(last_ok)).await.is_err() {
@@ -153,17 +161,19 @@ pub(crate) async fn run(
 
 /// Single poll iteration: fetch logs from `from_block` to latest, paginated.
 /// Returns `Complete` on full success, `Partial` on page failure with progress saved.
+#[allow(clippy::too_many_arguments)]
 async fn poll_once(
     provider: &RootProvider,
     contract_addr: Address,
     from_block: u64,
+    safe_blocks: u64,
     page_size: &mut u64,
     tx: &mpsc::Sender<L1Event>,
     shutdown: &CancellationToken,
 ) -> Result<PollOutcome> {
     let raw_latest =
         provider.get_block_number().await.map_err(|e| eyre!("Failed to get latest block: {e}"))?;
-    let latest_block = raw_latest.saturating_sub(L1_SAFE_BLOCKS);
+    let latest_block = raw_latest.saturating_sub(safe_blocks);
 
     if from_block > latest_block {
         return Ok(PollOutcome::Complete(from_block.saturating_sub(1)));

@@ -53,10 +53,7 @@ use alloy_primitives::Address;
 use alloy_provider::{ProviderBuilder, RootProvider};
 use alloy_signer_local::PrivateKeySigner;
 use fluent_stf_primitives::fluent_chainspec;
-use reth_chainspec::{ChainSpec, EthereumHardfork, EthereumHardforks};
-use reth_config::PruneConfig;
-use reth_prune::PrunerBuilder;
-use reth_prune_types::{PruneMode, PruneModes, MINIMUM_UNWIND_SAFE_DISTANCE};
+use reth_chainspec::ChainSpec;
 use reth_tasks::Runtime;
 use rsp_host_executor::EthHostExecutor;
 use tokio::runtime::Handle;
@@ -80,7 +77,7 @@ const DEFAULT_WITNESS_RETENTION_BLOCKS: u64 = 172_800;
 const DEFAULT_WITNESS_HUB_LISTEN_ADDR: &str = "127.0.0.1:8090";
 
 #[tokio::main]
-async fn main() {
+async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -131,6 +128,23 @@ async fn main() {
         std::env::var("L1_ROLLUP_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let api_key = std::env::var("API_KEY").expect("API_KEY is required");
 
+    // RBF dispatch tuning: 15s cycle, +20% bump (safely above EIP-1559's
+    // +12.5% minimum), 500 gwei cap.
+    let rbf_bump_interval = Duration::from_secs(
+        std::env::var("RBF_BUMP_INTERVAL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
+    );
+    let rbf_bump_percent: u32 =
+        std::env::var("RBF_BUMP_PERCENT").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let rbf_max_fee_per_gas_wei: u128 = std::env::var("RBF_MAX_FEE_PER_GAS_WEI")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500_000_000_000u128);
+
+    let l1_poll_interval_secs: u64 =
+        std::env::var("L1_POLL_INTERVAL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+    let l1_safe_blocks: u64 =
+        std::env::var("L1_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(http_timeout_secs))
         .pool_max_idle_per_host(2)
@@ -139,12 +153,14 @@ async fn main() {
 
     // Build L1 provider for reading (events) — with retry layer for 429/5xx
     let l1_rpc_url_parsed: url::Url = l1_rpc_url.parse().expect("Invalid L1_RPC_URL");
-    let l1_read_provider: RootProvider = rsp_provider::create_provider(l1_rpc_url_parsed.clone());
+    let l1_read_provider: RootProvider = rsp_provider::create_provider(l1_rpc_url_parsed.clone())
+        .expect("failed to build L1 read provider");
 
     // L2 provider — used by the startup resolver (for `lastBlockHash` lookup)
     // AND later by the embedded driver + blob builder.
     let l2_rpc_parsed: url::Url = rpc_url.parse().expect("Invalid RPC_URL");
-    let l2_provider: RootProvider = rsp_provider::create_provider(l2_rpc_parsed);
+    let l2_provider: RootProvider =
+        rsp_provider::create_provider(l2_rpc_parsed).expect("failed to build L2 provider");
 
     // ── Startup: resolve L2 checkpoint from START_BATCH_ID ───────────────────────
     let (listener_from_block, witness_from_block, orchestrator_checkpoint): (u64, u64, u64) = {
@@ -188,58 +204,31 @@ async fn main() {
             }
         }
 
-        // ── Startup: recover from re-execution result gaps ──────────────────────
-        //
-        // If a previous run lost re-execution results (e.g. enclave key rotation
-        // followed by orchestrator restart), some pending batches may have gaps
-        // in their block_responses coverage. Roll the checkpoint back to
-        // `earliest_gap - 1` so the driver re-feeds the missing blocks on this
-        // run.
+        // ── Startup checkpoint normalisation ───────────────────────────────────
         {
             let pending = db_startup.load_batches();
             let dispatched_ranges = db_startup.load_dispatched_block_ranges();
-            let response_blocks: std::collections::HashSet<u64> =
+            let response_blocks: HashSet<u64> =
                 db_startup.get_all_response_block_numbers().into_iter().collect();
+            let current_ckpt = db_startup.get_checkpoint();
 
-            let dispatched_set: std::collections::HashSet<u64> =
-                dispatched_ranges.iter().flat_map(|&(f, t)| f..=t).collect();
+            let result = normalize_startup_checkpoint(
+                current_ckpt,
+                &pending,
+                &dispatched_ranges,
+                &response_blocks,
+            );
 
-            let mut earliest_gap: Option<u64> = None;
-            let mut gapped_batches: Vec<u64> = Vec::new();
-
-            for batch in &pending {
-                let mut batch_has_gap = false;
-                for b in batch.from_block..=batch.to_block {
-                    if dispatched_set.contains(&b) {
-                        continue;
-                    }
-                    if response_blocks.contains(&b) {
-                        continue;
-                    }
-                    batch_has_gap = true;
-                    earliest_gap = Some(match earliest_gap {
-                        Some(current) => current.min(b),
-                        None => b,
-                    });
-                }
-                if batch_has_gap {
-                    gapped_batches.push(batch.batch_index);
-                }
-            }
-
-            if let Some(gap) = earliest_gap {
-                let current_ckpt = db_startup.get_checkpoint();
-                let new_ckpt = gap.saturating_sub(1);
-                if new_ckpt < current_ckpt {
+            if let Some(gap) = result.earliest_gap {
+                if !result.stale_signature_indexes.is_empty() {
                     info!(
                         current_ckpt,
                         earliest_gap = gap,
-                        new_ckpt,
-                        gapped_batches = ?gapped_batches,
+                        new_ckpt = result.new_ckpt,
+                        gapped_batches = ?result.stale_signature_indexes,
                         "Startup gap recovery: rolling back checkpoint"
                     );
-                    db_startup.save_checkpoint(new_ckpt);
-                    for idx in &gapped_batches {
+                    for idx in &result.stale_signature_indexes {
                         db_startup.delete_batch_signature(*idx);
                     }
                 } else {
@@ -252,44 +241,12 @@ async fn main() {
             } else {
                 info!("Startup gap scan: no gaps detected");
             }
-        }
 
-        // ── Startup: advance checkpoint past already-finalized batches ─────────
-        //
-        // `finalize_dispatched_batch` stores `last_batch_end` but does not touch
-        // the checkpoint. If the L1-finalization path advanced past the
-        // checkpoint while the orchestrator was restarting, the checkpoint can
-        // end up stuck below `last_batch_end` — with the corresponding pending
-        // batches already deleted, `on_block_result`'s pending-gap path has no
-        // way to move it forward, and the driver re-witnesses those blocks on
-        // every restart. `last_batch_end` is monotonic (set only by L1
-        // finalization), so blocks up to it are definitively committed; we can
-        // safely jump to it here, then walk forward across any contiguous
-        // already-computed responses.
-        {
-            let current_ckpt = db_startup.get_checkpoint();
-            let last_batch_end = db_startup.get_last_batch_end();
-            let response_blocks: std::collections::HashSet<u64> =
-                db_startup.get_all_response_block_numbers().into_iter().collect();
-
-            let mut new_ckpt = current_ckpt;
-            if let Some(lbe) = last_batch_end {
-                if lbe > new_ckpt {
-                    new_ckpt = lbe;
-                }
-            }
-            while response_blocks.contains(&(new_ckpt + 1)) {
-                new_ckpt += 1;
-            }
-
-            if new_ckpt > current_ckpt {
-                info!(
-                    current_ckpt,
-                    last_batch_end,
-                    new_ckpt,
-                    "Startup forward-advance: jumping checkpoint past finalized batches"
-                );
-                db_startup.save_checkpoint(new_ckpt);
+            if result.new_ckpt != current_ckpt {
+                info!(current_ckpt, new_ckpt = result.new_ckpt, "Startup checkpoint normalised");
+                db_startup.save_checkpoint(result.new_ckpt);
+            } else {
+                info!(current_ckpt, "Startup checkpoint unchanged");
             }
         }
 
@@ -325,8 +282,13 @@ async fn main() {
         "Starting witness orchestrator"
     );
 
-    // Build L1 provider for writing (preconfirmBatch)
+    // Build L1 provider for writing (preconfirmBatch). Keep the signer as a
+    // separate Arc'd handle so the RBF worker can sign bumped txs with an
+    // explicit nonce + fees, bypassing alloy's NonceFiller / GasFiller.
     let signer: PrivateKeySigner = l1_submitter_key.parse().expect("Invalid L1_SUBMITTER_KEY");
+    let l1_signer_address = signer.address();
+    let l1_signer: Arc<dyn alloy_network::TxSigner<alloy_primitives::Signature> + Send + Sync> =
+        Arc::new(signer.clone());
     let wallet = EthereumWallet::from(signer);
     let l1_write_provider: orchestrator::L1WriteProvider =
         ProviderBuilder::new().wallet(wallet).connect_http(l1_rpc_url_parsed);
@@ -368,6 +330,8 @@ async fn main() {
                 l1_read_provider,
                 l1_rollup_addr,
                 listener_from_block,
+                l1_poll_interval_secs,
+                l1_safe_blocks,
                 l1_tx,
                 shutdown,
             )
@@ -385,7 +349,7 @@ async fn main() {
         max_cold_bytes,
         witness_retention_blocks,
         DEFAULT_COLD_BATCH_SIZE,
-    ));
+    )?);
 
     // ── Embedded forward-sync driver ─────────────────────────────────────────────
     let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
@@ -401,32 +365,18 @@ async fn main() {
     .expect("failed to open writable ProviderFactory");
     let host_executor = Arc::new(EthHostExecutor::eth(chain_spec.clone(), None));
 
-    // Optional pruner: mirror `reth --full` semantics exactly.
-    let prune_full: bool = std::env::var("PRUNE_FULL")
-        .ok()
-        .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    let pruner = if prune_full {
-        let segments = PruneModes {
-            sender_recovery: Some(PruneMode::Full),
-            transaction_lookup: None,
-            receipts: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
-            account_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
-            storage_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
-            bodies_history: chain_spec
-                .ethereum_fork_activation(EthereumHardfork::Paris)
-                .block_number()
-                .map(PruneMode::Before),
-            receipts_log_filter: Default::default(),
-        };
-        let prune_config =
-            PruneConfig { block_interval: PruneConfig::default().block_interval, segments };
-        info!(?prune_config, "Pruning enabled (reth --full equivalent)");
-        Some(PrunerBuilder::new(prune_config).build_with_provider_factory(factory.clone()))
-    } else {
-        info!("Pruning disabled — archive mode");
-        None
-    };
+    // TODO: re-enable pruner after adding runtime coupling between MDBX
+    // prune floor and WITNESS_RETENTION_BLOCKS. The risk scenario: driver
+    // runs far ahead while L1 is stalled (low ETH on submitter, rollup
+    // contract frozen, etc.); pruner drops state for blocks that still
+    // need re-witnessing on key rotation; re-exec fails with silent None
+    // from `get_or_build_witness` and retries forever. Re-enabling needs:
+    // (a) a runtime guard that stops the pruner when dispatch is lagging,
+    // (b) an explicit StateAtBlockNotAvailable error instead of Ok(None)
+    // from the driver's witness rebuild path. Until then — archive mode.
+    let _ = std::env::var("PRUNE_FULL"); // swallow env so misconfig doesn't silently fail
+    info!("Pruning disabled — archive mode");
+    let pruner: Option<driver::DriverPruner> = None;
 
     let hub_for_shutdown = Arc::clone(&hub);
     let driver = Arc::new(
@@ -490,16 +440,49 @@ async fn main() {
         l1_provider: l1_write_provider,
         api_key,
         l2_provider,
+        l1_signer,
+        l1_signer_address,
+        rbf_bump_interval,
+        rbf_bump_percent,
+        rbf_max_fee_per_gas_wei,
     };
+
+    // Shared channel + dedup set between the feeder (driver pull) and the
+    // orchestrator (worker pool consumer). Owned at the top level so the
+    // feeder can be supervised via `tasks`.
+    let (normal_tx, normal_rx) =
+        async_channel::bounded::<orchestrator::ExecutionTask>(orchestrator::EXECUTION_WORKERS * 2);
+    let known_responses: orchestrator::KnownResponses = Arc::new(RwLock::new(HashSet::new()));
+
+    // Spawn the feeder into the top-level JoinSet so a feeder crash (driver
+    // fatal, panic) cancels the root token via the `tasks.join_next()` race
+    // below and shuts down the whole process cleanly.
+    {
+        let driver = Arc::clone(&driver);
+        let normal_tx = normal_tx.clone();
+        let known_responses = Arc::clone(&known_responses);
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            let r = orchestrator::feeder_loop(driver, normal_tx, known_responses, shutdown).await;
+            ("feeder", r)
+        });
+    }
 
     // Orchestrator runs in the foreground. Race it against `tasks.join_next()`
     // so that ANY background task exiting first (signal handler, L1 listener,
-    // witness server) immediately cancels the root token. Catch-up is tracked
-    // separately via `catchup_handle` because its successful completion is
-    // expected and must not trigger shutdown.
+    // witness server, feeder) immediately cancels the root token. Catch-up is
+    // tracked separately via `catchup_handle` because its successful completion
+    // is expected and must not trigger shutdown.
     let mut exit_code = 0;
-    let mut orchestrator_fut =
-        std::pin::pin!(orchestrator::run(config, driver, l1_rx, shutdown.clone()));
+    let mut orchestrator_fut = std::pin::pin!(orchestrator::run(
+        config,
+        driver,
+        l1_rx,
+        shutdown.clone(),
+        normal_rx,
+        Arc::clone(&known_responses),
+    ));
+    drop(normal_tx);
 
     tokio::select! {
         () = orchestrator_fut.as_mut() => {
@@ -556,5 +539,170 @@ async fn main() {
 
     if exit_code != 0 {
         std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+/// Pure result of the startup checkpoint walk.
+///
+/// Two invariants the caller must preserve after applying it:
+///   1. Checkpoint is never above a block with a missing response/dispatch
+///      (so the driver does not skip re-execution).
+///   2. Checkpoint is walked forward across every contiguous present block
+///      (so the driver does not re-walk already-computed blocks).
+///
+/// "Present" = response stored OR dispatched batch covers the block. A single
+/// forward walk that stops at the first gap preserves both invariants, which
+/// rules out the gap-vs-`last_batch_end` race between those two conditions.
+pub(crate) struct StartupCheckpointResult {
+    pub(crate) new_ckpt: u64,
+    pub(crate) stale_signature_indexes: Vec<u64>,
+    pub(crate) earliest_gap: Option<u64>,
+}
+
+pub(crate) fn normalize_startup_checkpoint(
+    current_ckpt: u64,
+    pending: &[accumulator::PendingBatch],
+    dispatched_ranges: &[(u64, u64)],
+    response_blocks: &HashSet<u64>,
+) -> StartupCheckpointResult {
+    let dispatched_set: HashSet<u64> = dispatched_ranges.iter().flat_map(|&(f, t)| f..=t).collect();
+    let present = |b: u64| response_blocks.contains(&b) || dispatched_set.contains(&b);
+
+    let mut earliest_gap: Option<u64> = None;
+    let mut gapped_batches: Vec<u64> = Vec::new();
+    for batch in pending {
+        let mut batch_has_gap = false;
+        for b in batch.from_block..=batch.to_block {
+            if present(b) {
+                continue;
+            }
+            batch_has_gap = true;
+            earliest_gap = Some(match earliest_gap {
+                Some(cur) => cur.min(b),
+                None => b,
+            });
+        }
+        if batch_has_gap {
+            gapped_batches.push(batch.batch_index);
+        }
+    }
+
+    let mut new_ckpt = current_ckpt;
+    let mut stale_signature_indexes = Vec::new();
+    if let Some(gap) = earliest_gap {
+        let rollback = gap.saturating_sub(1);
+        if rollback < new_ckpt {
+            new_ckpt = rollback;
+            stale_signature_indexes = gapped_batches;
+        }
+    }
+    while present(new_ckpt + 1) {
+        new_ckpt += 1;
+    }
+
+    StartupCheckpointResult { new_ckpt, stale_signature_indexes, earliest_gap }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accumulator::PendingBatch;
+
+    fn batch(batch_index: u64, from: u64, to: u64) -> PendingBatch {
+        PendingBatch { batch_index, from_block: from, to_block: to, blobs_accepted: true }
+    }
+
+    #[test]
+    fn gap_below_lbe_rolls_back_not_forward() {
+        // Pathological ordering: gap at block 50 inside a pending batch,
+        // but checkpoint is already at 100 (as if a prior run advanced past
+        // blocks for which responses were later lost).
+        // The fix must pull the checkpoint DOWN to 49, not leave it at 100.
+        let pending = [batch(5, 40, 60)];
+        let dispatched: Vec<(u64, u64)> = vec![];
+        let mut response_blocks = HashSet::new();
+        for b in 40..=49 {
+            response_blocks.insert(b);
+        }
+        // blocks 50..=60 missing — pretend the response store lost them.
+
+        let r = normalize_startup_checkpoint(100, &pending, &dispatched, &response_blocks);
+
+        assert_eq!(r.earliest_gap, Some(50));
+        assert_eq!(r.new_ckpt, 49, "must roll back to gap-1, not stay at current_ckpt");
+        assert_eq!(r.stale_signature_indexes, vec![5]);
+    }
+
+    #[test]
+    fn walk_forward_stops_at_first_missing_block() {
+        let pending: Vec<PendingBatch> = vec![];
+        let dispatched = vec![(11u64, 15u64)];
+        let mut response_blocks = HashSet::new();
+        for b in 16..=20 {
+            response_blocks.insert(b);
+        }
+        // contiguous: 11..=20 present; 21 missing.
+
+        let r = normalize_startup_checkpoint(10, &pending, &dispatched, &response_blocks);
+
+        assert_eq!(r.new_ckpt, 20);
+        assert!(r.earliest_gap.is_none());
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn no_gap_no_rollback_keeps_current_ckpt() {
+        let pending = [batch(1, 5, 10)];
+        let dispatched: Vec<(u64, u64)> = vec![];
+        let mut response_blocks = HashSet::new();
+        for b in 5..=10 {
+            response_blocks.insert(b);
+        }
+
+        let r = normalize_startup_checkpoint(10, &pending, &dispatched, &response_blocks);
+
+        assert_eq!(r.new_ckpt, 10);
+        assert!(r.earliest_gap.is_none());
+    }
+
+    #[test]
+    fn gap_above_current_ckpt_does_not_rollback() {
+        // Gap at block 50, but current_ckpt is already 30 (below the gap).
+        // No rollback needed — the driver will naturally re-execute 31..50.
+        let pending = [batch(3, 40, 60)];
+        let dispatched: Vec<(u64, u64)> = vec![];
+        let mut response_blocks = HashSet::new();
+        for b in 40..=49 {
+            response_blocks.insert(b);
+        }
+
+        let r = normalize_startup_checkpoint(30, &pending, &dispatched, &response_blocks);
+
+        assert_eq!(r.earliest_gap, Some(50));
+        assert_eq!(r.new_ckpt, 30, "should not lower below current_ckpt");
+        assert!(r.stale_signature_indexes.is_empty(), "no rollback → no stale sigs");
+    }
+
+    #[test]
+    fn walk_forward_after_rollback_does_not_jump_past_gap() {
+        // Two pending batches, gap in the first. Walk-forward from the
+        // rolled-back checkpoint must NOT advance past the gap.
+        let pending = [batch(1, 10, 20), batch(2, 21, 30)];
+        let dispatched: Vec<(u64, u64)> = vec![];
+        let mut response_blocks = HashSet::new();
+        for b in 10..=14 {
+            response_blocks.insert(b);
+        }
+        // gap at 15..20; 21..30 also missing.
+
+        let r = normalize_startup_checkpoint(25, &pending, &dispatched, &response_blocks);
+
+        assert_eq!(r.earliest_gap, Some(15));
+        assert_eq!(r.new_ckpt, 14, "must stop at gap-1, not re-advance to 25");
+        // Only batch 1 contains the earliest gap; batch 2 also has a gap and
+        // is reported as well (all batches containing any gap).
+        assert!(r.stale_signature_indexes.contains(&1));
+        assert!(r.stale_signature_indexes.contains(&2));
     }
 }

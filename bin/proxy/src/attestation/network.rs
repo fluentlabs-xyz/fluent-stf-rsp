@@ -55,7 +55,7 @@ impl AttestationConfig {
 
         let l1_rpc = std::env::var("L1_RPC_URL").map_err(|_| eyre!("L1_RPC_URL not set"))?;
         let l1_url = Url::parse(&l1_rpc)?;
-        let l1_provider: RootProvider = rsp_provider::create_provider(l1_url);
+        let l1_provider: RootProvider = rsp_provider::create_provider(l1_url)?;
 
         let key_hex =
             std::env::var("L1_SUBMITTER_KEY").map_err(|_| eyre!("L1_SUBMITTER_KEY not set"))?;

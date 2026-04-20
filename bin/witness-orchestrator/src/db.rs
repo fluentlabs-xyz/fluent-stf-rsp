@@ -61,7 +61,10 @@ impl Db {
                 from_block  INTEGER NOT NULL,
                 to_block    INTEGER NOT NULL,
                 tx_hash     BLOB NOT NULL,
-                l1_block    INTEGER NOT NULL
+                l1_block    INTEGER NOT NULL,
+                nonce       INTEGER,
+                max_fee_per_gas          TEXT,
+                max_priority_fee_per_gas TEXT
             );
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
@@ -69,6 +72,27 @@ impl Db {
             );
         ",
         )?;
+
+        // Migration: add RBF columns to pre-existing dispatched_batches tables.
+        // SQLite has no IF NOT EXISTS for ADD COLUMN; we check PRAGMA first.
+        let existing_cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(dispatched_batches)")?;
+            let iter = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            iter.filter_map(|r| r.ok()).collect()
+        };
+        for (col, ddl) in [
+            ("nonce", "ALTER TABLE dispatched_batches ADD COLUMN nonce INTEGER"),
+            ("max_fee_per_gas", "ALTER TABLE dispatched_batches ADD COLUMN max_fee_per_gas TEXT"),
+            (
+                "max_priority_fee_per_gas",
+                "ALTER TABLE dispatched_batches ADD COLUMN max_priority_fee_per_gas TEXT",
+            ),
+        ] {
+            if !existing_cols.contains(col) {
+                conn.execute_batch(ddl)?;
+            }
+        }
+
         Ok(Self { conn })
     }
 
@@ -331,6 +355,31 @@ impl Db {
         }
     }
 
+    /// Return every `batch_index` currently present in `batch_signatures`.
+    /// Used at startup to detect orphan signature rows (rows whose matching
+    /// `pending_batches` / `dispatched_batches` row was lost to a mid-commit
+    /// crash).
+    pub(crate) fn load_batch_signature_indexes(&self) -> Vec<u64> {
+        let mut stmt = match self.conn.prepare("SELECT batch_index FROM batch_signatures") {
+            Ok(s) => s,
+            Err(e) => {
+                error!(err = %e, "Failed to prepare batch_signatures index scan");
+                return Vec::new();
+            }
+        };
+        let iter = match stmt.query_map([], |row| row.get::<_, u64>(0)) {
+            Ok(i) => i,
+            Err(e) => {
+                error!(err = %e, "Failed to query batch_signatures rows");
+                return Vec::new();
+            }
+        };
+        iter.collect::<Result<Vec<_>>>().unwrap_or_else(|e| {
+            error!(err = %e, "Failed to read batch_signatures rows");
+            Vec::new()
+        })
+    }
+
     // ── Pending blobs accepted ───────────────────────────────────────────────
 
     pub(crate) fn save_pending_blobs_accepted(&self, batch_index: u64) {
@@ -363,9 +412,66 @@ impl Db {
 
     // ── Dispatched batches ──────────────────────────────────────────────────
 
-    /// Atomically move a batch from pending to dispatched.
+    /// Atomically move a batch from pending to dispatched, persisting initial
+    /// RBF state (nonce + fees) alongside the transition.
     /// Single transaction: DELETE from pending + INSERT into dispatched.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn move_to_dispatched(
+        &mut self,
+        batch_index: u64,
+        from_block: u64,
+        to_block: u64,
+        tx_hash: &[u8],
+        l1_block: u64,
+        nonce: u64,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    ) {
+        let tx = match self.conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!(err = %e, batch_index, "Failed to begin move_to_dispatched tx");
+                return;
+            }
+        };
+        let ok = tx
+            .execute("DELETE FROM pending_batches WHERE batch_index = ?1", params![batch_index])
+            .and_then(|_| {
+                tx.execute(
+                    "INSERT OR REPLACE INTO dispatched_batches(
+                batch_index, from_block, to_block, tx_hash, l1_block,
+                nonce, max_fee_per_gas, max_priority_fee_per_gas
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        batch_index,
+                        from_block,
+                        to_block,
+                        tx_hash,
+                        l1_block,
+                        nonce,
+                        max_fee_per_gas.to_string(),
+                        max_priority_fee_per_gas.to_string(),
+                    ],
+                )
+            });
+        match ok {
+            Ok(_) => {
+                if let Err(e) = tx.commit() {
+                    error!(err = %e, batch_index, "Failed to commit move_to_dispatched");
+                }
+            }
+            Err(e) => {
+                error!(err = %e, batch_index, "Failed to move batch to dispatched — rolling back");
+            }
+        }
+    }
+
+    /// Atomically move a batch from pending to dispatched WITHOUT RBF state.
+    /// Used for externally-preconfirmed batches (observed via L1 event) where
+    /// we are not the submitter and therefore have no local nonce or fees.
+    /// Single transaction: DELETE from pending + INSERT into dispatched with
+    /// NULL RBF columns.
+    pub(crate) fn move_to_dispatched_external(
         &mut self,
         batch_index: u64,
         from_block: u64,
@@ -376,7 +482,7 @@ impl Db {
         let tx = match self.conn.transaction() {
             Ok(tx) => tx,
             Err(e) => {
-                error!(err = %e, batch_index, "Failed to begin move_to_dispatched tx");
+                error!(err = %e, batch_index, "Failed to begin move_to_dispatched_external tx");
                 return;
             }
         };
@@ -391,12 +497,47 @@ impl Db {
         match ok {
             Ok(_) => {
                 if let Err(e) = tx.commit() {
-                    error!(err = %e, batch_index, "Failed to commit move_to_dispatched");
+                    error!(err = %e, batch_index, "Failed to commit move_to_dispatched_external");
                 }
             }
             Err(e) => {
-                error!(err = %e, batch_index, "Failed to move batch to dispatched — rolling back");
+                error!(err = %e, batch_index, "Failed to move external batch to dispatched — rolling back");
             }
+        }
+    }
+
+    /// Update the RBF state of a dispatched batch after a fee bump + rebroadcast.
+    /// Atomic: updates tx_hash, max_fee_per_gas, max_priority_fee_per_gas.
+    pub(crate) fn update_rbf_state(
+        &mut self,
+        batch_index: u64,
+        tx_hash: &[u8],
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    ) {
+        if let Err(e) = self.conn.execute(
+            "UPDATE dispatched_batches
+             SET tx_hash = ?2, max_fee_per_gas = ?3, max_priority_fee_per_gas = ?4
+             WHERE batch_index = ?1",
+            params![
+                batch_index,
+                tx_hash,
+                max_fee_per_gas.to_string(),
+                max_priority_fee_per_gas.to_string(),
+            ],
+        ) {
+            error!(err = %e, batch_index, "Failed to update RBF state");
+        }
+    }
+
+    /// Update l1_block once the tx lands. Separate from `update_rbf_state`
+    /// because RBF bumps happen many times, but l1_block updates exactly once.
+    pub(crate) fn update_dispatched_l1_block(&mut self, batch_index: u64, l1_block: u64) {
+        if let Err(e) = self.conn.execute(
+            "UPDATE dispatched_batches SET l1_block = ?2 WHERE batch_index = ?1",
+            params![batch_index, l1_block],
+        ) {
+            error!(err = %e, batch_index, "Failed to update dispatched l1_block");
         }
     }
 
@@ -441,6 +582,58 @@ impl Db {
         }
     }
 
+    /// Move a dispatched batch back to pending AND rewrite its range, and
+    /// clear the stale signature, in one atomic transaction. Used when a
+    /// shrinking-range reorg replaces an already-dispatched batch with a
+    /// smaller one — the old signature no longer matches the new range and
+    /// must be dropped alongside the pending-row rewrite.
+    ///
+    /// `blobs_accepted = 1`: the blob submit event already hit L1 for this
+    /// batch (otherwise it could not have been dispatched); a shrinking reorg
+    /// does not typically remove the `BatchSubmitted` event.
+    pub(crate) fn undispatch_and_reregister(
+        &mut self,
+        batch_index: u64,
+        new_from_block: u64,
+        new_to_block: u64,
+    ) {
+        let tx = match self.conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!(err = %e, batch_index, "Failed to begin undispatch_and_reregister tx");
+                return;
+            }
+        };
+        let ok = tx
+            .execute(
+                "DELETE FROM dispatched_batches WHERE batch_index = ?1",
+                params![batch_index],
+            )
+            .and_then(|_| {
+                tx.execute(
+                    "INSERT OR REPLACE INTO pending_batches(batch_index, from_block, to_block, blobs_accepted)
+                     VALUES(?1, ?2, ?3, 1)",
+                    params![batch_index, new_from_block, new_to_block],
+                )
+            })
+            .and_then(|_| {
+                tx.execute(
+                    "DELETE FROM batch_signatures WHERE batch_index = ?1",
+                    params![batch_index],
+                )
+            });
+        match ok {
+            Ok(_) => {
+                if let Err(e) = tx.commit() {
+                    error!(err = %e, batch_index, "Failed to commit undispatch_and_reregister");
+                }
+            }
+            Err(e) => {
+                error!(err = %e, batch_index, "Failed undispatch_and_reregister — rolling back");
+            }
+        }
+    }
+
     /// Move a dispatched batch back to pending (reorg recovery).
     /// Single transaction: DELETE from dispatched + INSERT into pending.
     pub(crate) fn undispatch_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
@@ -471,9 +664,16 @@ impl Db {
         }
     }
 
-    pub(crate) fn load_dispatched_batches(&self) -> Vec<(u64, u64, u64, Vec<u8>, u64)> {
+    /// Returns per-row: (batch_index, from_block, to_block, tx_hash, l1_block,
+    /// nonce, max_fee_per_gas, max_priority_fee_per_gas). The last three are
+    /// `Option` because legacy rows (pre-migration) have NULL in those columns.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn load_dispatched_batches(
+        &self,
+    ) -> Vec<(u64, u64, u64, Vec<u8>, u64, Option<u64>, Option<u128>, Option<u128>)> {
         let mut stmt = match self.conn.prepare(
-            "SELECT batch_index, from_block, to_block, tx_hash, l1_block
+            "SELECT batch_index, from_block, to_block, tx_hash, l1_block,
+                    nonce, max_fee_per_gas, max_priority_fee_per_gas
              FROM dispatched_batches ORDER BY batch_index",
         ) {
             Ok(s) => s,
@@ -489,6 +689,9 @@ impl Db {
                 row.get::<_, i64>(2)? as u64,
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, i64>(4)? as u64,
+                row.get::<_, Option<i64>>(5)?.map(|n| n as u64),
+                row.get::<_, Option<String>>(6)?.and_then(|s| s.parse::<u128>().ok()),
+                row.get::<_, Option<String>>(7)?.and_then(|s| s.parse::<u128>().ok()),
             ))
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())

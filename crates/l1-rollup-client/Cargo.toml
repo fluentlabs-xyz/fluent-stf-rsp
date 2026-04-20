@@ -10,9 +10,13 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-network.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types.workspace = true
+alloy-signer.workspace = true
 alloy-sol-types.workspace = true
 eyre.workspace = true
 tokio.workspace = true

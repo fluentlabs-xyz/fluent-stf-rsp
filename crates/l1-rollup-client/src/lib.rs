@@ -19,7 +19,10 @@ pub mod nitro_verifier;
 
 pub use nitro_verifier::is_key_registered;
 
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_network::TxSigner;
+use alloy_primitives::{Address, Bytes, Signature, TxKind, B256, U256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::{Filter, TransactionRequest};
 use alloy_sol_types::{sol, SolCall, SolEvent};
@@ -346,61 +349,110 @@ pub async fn fetch_batch_range(
 }
 
 // =====================================================================
-// Write helpers
+// Write helpers (RBF-aware)
 // =====================================================================
 
-/// Metadata from a confirmed L1 transaction, used for finalization tracking.
+/// Immutable metadata for an in-flight `preconfirmBatch` transaction. Built
+/// once at dispatch start by [`build_preconfirm_tx`] and reused across RBF
+/// bumps — only `max_fee_per_gas` / `max_priority_fee_per_gas` change on each
+/// rebroadcast.
 #[derive(Debug, Clone)]
-pub struct SubmitReceipt {
-    pub tx_hash: B256,
-    pub l1_block: u64,
+pub struct PreconfirmTxTemplate {
+    pub to: Address,
+    pub input: Bytes,
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub chain_id: u64,
+    pub batch_index: u64,
 }
 
-/// Submit `preconfirmBatch` to L1 and wait for the receipt.
-pub async fn submit_preconfirmation(
+/// Build the calldata + nonce + gas-limit for a `preconfirmBatch` dispatch.
+///
+/// When `stored_nonce` is `Some`, use it verbatim — this is the startup-
+/// resume path, where we must replay against the same nonce that the
+/// pre-restart tx was signed under (so the rebroadcast is a replacement,
+/// not a fresh send at a new nonce). When `None`, query the pending
+/// transaction count to obtain a fresh nonce.
+pub async fn build_preconfirm_tx(
     provider: &impl Provider,
     contract_addr: Address,
     nitro_verifier_addr: Address,
     batch_index: u64,
     signature: Vec<u8>,
-) -> Result<SubmitReceipt> {
+    signer: Address,
+    stored_nonce: Option<u64>,
+) -> Result<PreconfirmTxTemplate> {
     let call = preconfirmBatchCall {
         nitroVerifier: nitro_verifier_addr,
         batchIndex: U256::from(batch_index),
         signature: Bytes::from(signature),
     };
+    let input = Bytes::from(call.abi_encode());
 
-    let tx = TransactionRequest {
-        to: Some(contract_addr.into()),
-        input: Bytes::from(call.abi_encode()).into(),
-        ..Default::default()
+    let nonce = match stored_nonce {
+        Some(n) => n,
+        None => provider
+            .get_transaction_count(signer)
+            .pending()
+            .await
+            .map_err(|e| eyre!("get_transaction_count(pending) failed: {e}"))?,
     };
 
-    let pending = provider
-        .send_transaction(tx)
+    let chain_id = provider.get_chain_id().await.map_err(|e| eyre!("get_chain_id failed: {e}"))?;
+
+    let est_req = TransactionRequest {
+        from: Some(signer),
+        to: Some(contract_addr.into()),
+        input: input.clone().into(),
+        ..Default::default()
+    };
+    let gas_limit =
+        provider.estimate_gas(est_req).await.map_err(|e| eyre!("estimate_gas failed: {e}"))?;
+
+    Ok(PreconfirmTxTemplate { to: contract_addr, input, nonce, gas_limit, chain_id, batch_index })
+}
+
+/// Sign + broadcast one EIP-1559 transaction with explicit nonce + fees.
+/// Returns the tx hash. Does NOT wait for a receipt — the caller is
+/// responsible for polling and, if needed, bumping fees + rebroadcasting.
+pub async fn broadcast_preconfirm(
+    provider: &impl Provider,
+    signer: &(dyn TxSigner<Signature> + Send + Sync),
+    template: &PreconfirmTxTemplate,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> Result<B256> {
+    let mut tx = TxEip1559 {
+        chain_id: template.chain_id,
+        nonce: template.nonce,
+        gas_limit: template.gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        to: TxKind::Call(template.to),
+        value: U256::ZERO,
+        access_list: Default::default(),
+        input: template.input.clone(),
+    };
+    let sig = signer
+        .sign_transaction(&mut tx)
         .await
-        .map_err(|e| eyre!("preconfirmBatch tx send failed: {e}"))?;
+        .map_err(|e| eyre!("sign_transaction failed: {e}"))?;
+    let envelope = TxEnvelope::Eip1559(tx.into_signed(sig));
+    let mut buf = Vec::new();
+    envelope.encode_2718(&mut buf);
 
+    let pending = provider
+        .send_raw_transaction(&buf)
+        .await
+        .map_err(|e| eyre!("send_raw_transaction failed: {e}"))?;
     let tx_hash = *pending.tx_hash();
-    info!(%tx_hash, batch_index, "preconfirmBatch tx sent");
-
-    let receipt =
-        pending.get_receipt().await.map_err(|e| eyre!("preconfirmBatch receipt failed: {e}"))?;
-
-    if !receipt.status() {
-        return Err(eyre!("preconfirmBatch reverted (tx {tx_hash}, batch {batch_index})"));
-    }
-
-    let l1_block =
-        receipt.block_number.ok_or_else(|| eyre!("receipt missing block_number (tx {tx_hash})"))?;
-
     info!(
         %tx_hash,
-        batch_index,
-        l1_block,
-        gas_used = receipt.gas_used,
-        "preconfirmBatch confirmed"
+        batch_index = template.batch_index,
+        nonce = template.nonce,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        "broadcast_preconfirm"
     );
-
-    Ok(SubmitReceipt { tx_hash, l1_block })
+    Ok(tx_hash)
 }

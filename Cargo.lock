@@ -4964,9 +4964,13 @@ dependencies = [
 name = "l1-rollup-client"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-network",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types",
+ "alloy-signer",
  "alloy-sol-types",
  "eyre",
  "tokio",
@@ -8547,6 +8551,8 @@ dependencies = [
  "alloy-provider",
  "alloy-rpc-client",
  "alloy-transport",
+ "alloy-transport-http",
+ "eyre",
  "url",
 ]
 
