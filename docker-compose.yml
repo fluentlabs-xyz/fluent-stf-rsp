@@ -138,6 +138,7 @@ services:
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
       L1_START_BATCH_ID: ${L1_START_BATCH_ID}
       L1_ROLLUP_DEPLOY_BLOCK: ${L1_ROLLUP_DEPLOY_BLOCK}
+      FLUENT_METRICS_ADDR: ${FLUENT_METRICS_ADDR}
     logging:
       driver: json-file
       options:
