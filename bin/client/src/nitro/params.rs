@@ -15,7 +15,7 @@ pub const VSOCK_READ_TIMEOUT_SECS: u64 = 60;
 ///
 /// MUST match the enclave vCPU allocation — update `enclave_cli run` config in lock-step.
 /// Provisional default, pending confirmation of the production vCPU count.
-pub const EXECUTE_WORKER_COUNT: usize = 8;
+pub const EXECUTE_WORKER_COUNT: usize = 32;
 
 /// The Reserved Context ID (CID) for the parent host.
 /// In the Nitro Enclave architecture, the host is always reachable at CID 3.

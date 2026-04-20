@@ -49,6 +49,15 @@ build-client-docker: download-genesis-cache
 		--output type=local,dest=. \
 		--no-cache \
 		-f Dockerfile .
+	@if [ -f nitro-validator-$(NETWORK).vkey ]; then \
+		python3 scripts/update_readme_vkeys.py \
+			rsp-client-$(NETWORK).vkey \
+			nitro-validator-$(NETWORK).vkey \
+			README.md \
+			$(NETWORK); \
+	else \
+		echo "note: nitro-validator-$(NETWORK).vkey missing — skipping README vkey update (run build-nitro-validator-docker to populate)"; \
+	fi
 
 # ─── Nitro validator ELF (attestation proving) ───────────────────────────────
 
@@ -62,6 +71,15 @@ build-nitro-validator-docker:
 		--output type=local,dest=. \
 		--no-cache \
 		-f Dockerfile .
+	@if [ -f rsp-client-$(NETWORK).vkey ]; then \
+		python3 scripts/update_readme_vkeys.py \
+			rsp-client-$(NETWORK).vkey \
+			nitro-validator-$(NETWORK).vkey \
+			README.md \
+			$(NETWORK); \
+	else \
+		echo "note: rsp-client-$(NETWORK).vkey missing — skipping README vkey update (run build-client-docker to populate)"; \
+	fi
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────
 

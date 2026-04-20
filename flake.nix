@@ -88,11 +88,18 @@
             # for cargo; the sibling crates/ stays reachable via relative paths.
             #
             # The filter is scoped to bin/client + crates/ only — unrelated
-            # subtrees (bin/aws-nitro-validator, bin/proxy, bin/witness-*)
-            # must NOT influence the source hash, otherwise mutating their
-            # files (e.g. scripts/update_expected_pcr0.py rewriting
-            # EXPECTED_PCR0 in aws-nitro-validator/src/lib.rs after each
-            # build) would cascade into a different PCR0 on every rebuild.
+            # subtrees (bin/aws-nitro-validator, bin/proxy, bin/witness-*,
+            # scripts/, Makefile, Dockerfile, README*.md, docs/) MUST NOT
+            # influence the source hash, otherwise mutating their files
+            # (e.g. scripts/update_expected_pcr0.py rewriting EXPECTED_PCR0
+            # in aws-nitro-validator/src/lib.rs after each build, or
+            # scripts/update_readme_vkeys.py rewriting README.md after
+            # each ELF build) would cascade into a different PCR0 on every
+            # rebuild. This filter is an ALLOWLIST: anything not explicitly
+            # matched by `inWanted` below is excluded. Do NOT broaden
+            # `inWanted` without understanding this contract — in particular,
+            # never add README.md, scripts/, or any of the host-side
+            # crates here.
             src = pkgs.lib.cleanSourceWith {
               src = ./.;
               filter = path: type:
