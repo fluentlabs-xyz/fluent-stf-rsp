@@ -7,7 +7,6 @@ use reth_chainspec::{
     Hardfork,
 };
 use reth_primitives_traits::{Header, SealedHeader};
-use std::collections::BTreeMap;
 
 pub fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardforks {
     ChainHardforks::new(vec![
