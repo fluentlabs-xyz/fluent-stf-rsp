@@ -59,6 +59,10 @@ redb = "2.1"
 vsock = "0.5.2"
 derive_more = { version = "2.0.1", features = ["full"] }
 
+# --- observability ---
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+
 # --- gRPC ---
 tonic = "0.14.5"
 tonic-prost = "0.14.5"

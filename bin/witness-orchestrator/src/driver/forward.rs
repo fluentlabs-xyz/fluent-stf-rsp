@@ -612,6 +612,7 @@ impl Driver {
                     payload_bytes = cached.payload.len() as u64,
                     "Re-witness served from cold store (skipped rebuild + re-push)"
                 );
+                metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
                 state.next = block_number + 1;
                 return Ok(Some(ProveRequest { block_number, payload: cached.payload }));
             }
@@ -933,6 +934,7 @@ async fn witness_phase(
         payload_bytes,
         "Block witness built"
     );
+    metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
 
     Ok(payload)
 }

@@ -320,6 +320,7 @@ async fn execution_worker(
         let mut attempts: u32 = 0;
         loop {
             attempts += 1;
+            let t_start = std::time::Instant::now();
             match send_block_request(
                 &http_client,
                 &proxy_url,
@@ -330,6 +331,8 @@ async fn execution_worker(
             .await
             {
                 Ok(response) => {
+                    metrics::histogram!(crate::metrics::SIGN_BLOCK_EXECUTION_DURATION)
+                        .record(t_start.elapsed().as_secs_f64());
                     if attempts > 1 {
                         info!(
                             worker_id,
@@ -348,6 +351,14 @@ async fn execution_worker(
                     break;
                 }
                 Err(e) => {
+                    metrics::histogram!(crate::metrics::SIGN_BLOCK_EXECUTION_DURATION)
+                        .record(t_start.elapsed().as_secs_f64());
+                    metrics::counter!(
+                        crate::metrics::SIGN_FAILURES_TOTAL,
+                        "stage" => "block",
+                        "kind" => crate::metrics::sign_failure_kind(&e),
+                    )
+                    .increment(1);
                     warn!(
                         worker_id,
                         block = task.block_number,
@@ -756,6 +767,9 @@ impl OrchestratorState {
         info!(block_number, "Block execution response received");
         accumulator.insert_response(result.response).await;
 
+        metrics::gauge!(crate::metrics::LAST_BLOCK_EXECUTED).set(block_number as f64);
+        metrics::gauge!(crate::metrics::LAST_BLOCK_SIGNED).set(block_number as f64);
+
         self.known_responses.write().unwrap_or_else(|e| e.into_inner()).insert(block_number);
 
         self.confirmed.insert(block_number);
@@ -961,6 +975,12 @@ impl OrchestratorState {
                 // be long when L1 finalization is slow). `known_responses`
                 // stays populated so any stale in-flight result is deduped.
                 if let Some(batch) = accumulator.get(batch_index) {
+                    metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED).set(batch_index as f64);
+                    metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_FROM_BLOCK)
+                        .set(batch.from_block as f64);
+                    metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_TO_BLOCK)
+                        .set(batch.to_block as f64);
+
                     let blocks: Vec<u64> = (batch.from_block..=batch.to_block).collect();
                     accumulator.purge_responses(&blocks).await;
                 }
@@ -1138,6 +1158,15 @@ impl OrchestratorState {
                 self.global_next_dispatch_allowed = None;
 
                 accumulator.record_dispatched_l1_block(batch_index, l1_block).await;
+
+                if let Some(batch) = accumulator.get(batch_index) {
+                    metrics::gauge!(crate::metrics::LAST_BATCH_DISPATCHED).set(batch_index as f64);
+                    metrics::gauge!(crate::metrics::LAST_BATCH_DISPATCHED_FROM_BLOCK)
+                        .set(batch.from_block as f64);
+                    metrics::gauge!(crate::metrics::LAST_BATCH_DISPATCHED_TO_BLOCK)
+                        .set(batch.to_block as f64);
+                }
+
                 info!(
                     batch_index,
                     %tx_hash,
@@ -1149,6 +1178,7 @@ impl OrchestratorState {
             }
 
             DispatchOutcome::Reverted { tx_hash } => {
+                metrics::counter!(crate::metrics::L1_DISPATCH_REJECTED_TOTAL).increment(1);
                 error!(
                     batch_index,
                     %tx_hash,
@@ -1529,6 +1559,7 @@ async fn sign_batch_io(
 
     let mut backoff = Duration::from_secs(1);
     loop {
+        let t_start = std::time::Instant::now();
         match call_sign_batch_root(
             http_client,
             proxy_url,
@@ -1542,6 +1573,8 @@ async fn sign_batch_io(
         .await
         {
             Ok(resp) => {
+                metrics::histogram!(crate::metrics::SIGN_BATCH_ROOT_DURATION)
+                    .record(t_start.elapsed().as_secs_f64());
                 let db = Arc::clone(&db);
                 let resp_clone = resp.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -1557,6 +1590,8 @@ async fn sign_batch_io(
                 return SignOutcome::Signed { response: resp };
             }
             Err(SignBatchError::InvalidSignatures { invalid_blocks, enclave_address }) => {
+                metrics::histogram!(crate::metrics::SIGN_BATCH_ROOT_DURATION)
+                    .record(t_start.elapsed().as_secs_f64());
                 warn!(
                     batch_index,
                     ?invalid_blocks,
@@ -1566,6 +1601,14 @@ async fn sign_batch_io(
                 return SignOutcome::InvalidSignatures { invalid_blocks, enclave_address };
             }
             Err(SignBatchError::Other(e)) => {
+                metrics::histogram!(crate::metrics::SIGN_BATCH_ROOT_DURATION)
+                    .record(t_start.elapsed().as_secs_f64());
+                metrics::counter!(
+                    crate::metrics::SIGN_FAILURES_TOTAL,
+                    "stage" => "batch",
+                    "kind" => crate::metrics::sign_failure_kind(&e),
+                )
+                .increment(1);
                 warn!(batch_index, err = %e, ?backoff, "sign-batch-root failed — retrying");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -1822,6 +1865,7 @@ async fn run_rbf_dispatch(
 
         match provider.get_transaction_receipt(current_hash).await {
             Ok(Some(receipt)) => {
+                crate::metrics::observe_dispatch_cost(&receipt);
                 let Some(l1_block) = receipt.block_number else {
                     warn!(
                         batch_index,
@@ -1916,6 +1960,7 @@ async fn run_rbf_dispatch(
                 if msg.contains("nonce too low") {
                     match provider.get_transaction_receipt(current_hash).await {
                         Ok(Some(receipt)) => {
+                            crate::metrics::observe_dispatch_cost(&receipt);
                             let l1_block = receipt.block_number.unwrap_or(0);
                             if receipt.status() {
                                 return Ok(DispatchOutcome::Submitted {
