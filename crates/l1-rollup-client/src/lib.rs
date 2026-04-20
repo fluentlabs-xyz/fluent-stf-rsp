@@ -103,6 +103,36 @@ sol! {
     /// Emitted when a prover claims their proof reward.
     event ProofRewardClaimed(address indexed prover, uint256 amount);
 
+    // ============ Types ============
+
+    /// Mirrors `enum BatchStatus` in `IRollupTypes.sol`. Ordinal values are
+    /// consensus-critical — any reorder here would silently flip on-chain
+    /// status comparisons.
+    enum BatchStatus {
+        None,
+        Committed,
+        Submitted,
+        Preconfirmed,
+        Challenged,
+        Finalized
+    }
+
+    /// Mirrors `struct BatchRecord` in `IRollupTypes.sol`. Only the fields
+    /// actually read by this crate are annotated in comments; the rest are
+    /// kept in-struct so decoding matches the contract layout.
+    struct BatchRecord {
+        bytes32 batchRoot;
+        uint32 acceptedAtBlock;
+        uint8 expectedBlobs;
+        BatchStatus status;
+        uint64 sentMessageCursorStart;
+        uint24 submitBlobsWindowSnapshot;
+        uint24 preconfirmationWindowSnapshot;
+        uint24 challengeWindowSnapshot;
+        uint24 finalizationDelaySnapshot;
+        uint24 numberOfBlocks;
+    }
+
     // ============ Functions ============
 
     /// Submit enclave signature to L1, proving batch validity.
@@ -111,6 +141,13 @@ sol! {
         uint256 batchIndex,
         bytes signature
     ) external;
+
+    /// View: full batch record, including current lifecycle status and the
+    /// L1 block at which the batch was committed. Used by the orchestrator
+    /// to detect already-preconfirmed / finalized batches on restart,
+    /// avoiding a deterministic revert loop when dispatch retries a batch
+    /// whose state moved past `Submitted` while the orchestrator was down.
+    function getBatch(uint256 batchIndex) external view returns (BatchRecord memory);
 }
 
 /// Pre-upgrade ABI of the `BatchCommitted` event. On-chain the event name is
@@ -346,6 +383,105 @@ pub async fn fetch_batch_range(
     .await?;
     let to_block = l2_from_block + num_blocks - 1;
     Ok((l2_from_block, to_block))
+}
+
+/// Resolved L1 identity of a `BatchPreconfirmed` event for a given batch.
+/// Populated by [`find_batch_preconfirm_event`] and consumed by the
+/// orchestrator's startup-reconciliation path to seed `dispatched_batches`
+/// with the winning transaction's coordinates (so the finalization ticker
+/// can drive the batch to completion).
+#[derive(Debug, Clone, Copy)]
+pub struct BatchPreconfirmInfo {
+    pub tx_hash: B256,
+    pub l1_block: u64,
+}
+
+/// Canonical lifecycle status ordinals for `enum BatchStatus` in
+/// `IRollupTypes.sol`. Kept as `u8` constants (not an enum) to avoid coupling
+/// callers to the `sol!`-generated type's local module path.
+pub mod batch_status {
+    pub const NONE: u8 = 0;
+    pub const COMMITTED: u8 = 1;
+    pub const SUBMITTED: u8 = 2;
+    pub const PRECONFIRMED: u8 = 3;
+    pub const CHALLENGED: u8 = 4;
+    pub const FINALIZED: u8 = 5;
+}
+
+/// Minimal subset of `BatchRecord` the orchestrator needs for on-chain
+/// reconciliation: current lifecycle status and the L1 block at which the
+/// batch was first committed (lower bound for a targeted event scan).
+#[derive(Debug, Clone, Copy)]
+pub struct BatchOnChain {
+    pub status: u8,
+    pub accepted_at_block: u64,
+}
+
+/// View-call `getBatch(batchIndex)` and project the fields used by the
+/// orchestrator's startup-reconciliation / pre-flight path. One RPC round
+/// trip; returns `status` as the `batch_status::*` ordinal alongside
+/// `acceptedAtBlock` to bound subsequent event scans.
+pub async fn get_batch_on_chain(
+    l1_provider: &impl Provider,
+    contract_addr: Address,
+    batch_index: u64,
+) -> Result<BatchOnChain> {
+    let call = getBatchCall { batchIndex: U256::from(batch_index) };
+    let input = Bytes::from(call.abi_encode());
+    let req = TransactionRequest {
+        to: Some(contract_addr.into()),
+        input: input.into(),
+        ..Default::default()
+    };
+    let raw = l1_provider
+        .call(req)
+        .await
+        .map_err(|e| eyre!("eth_call getBatch({batch_index}) failed: {e}"))?;
+    let decoded = getBatchCall::abi_decode_returns(&raw)
+        .map_err(|e| eyre!("decode getBatch({batch_index}) return: {e}"))?;
+    Ok(BatchOnChain {
+        status: decoded.status as u8,
+        accepted_at_block: u64::from(decoded.acceptedAtBlock),
+    })
+}
+
+/// Scan L1 for the `BatchPreconfirmed(batchIndex=…)` event in the given
+/// block range. Returns the first matching log's transaction hash and block
+/// number, or `None` if no such event exists in the window.
+///
+/// Used by the orchestrator when a pre-flight status check reveals that the
+/// target batch is already `Preconfirmed` or `Finalized` on L1 — the stored
+/// `l1_checkpoint` may have already advanced past the event, so the
+/// live-listener path will never replay it.
+pub async fn find_batch_preconfirm_event(
+    l1_provider: &impl Provider,
+    contract_addr: Address,
+    batch_index: u64,
+    from_l1_block: u64,
+    to_l1_block: u64,
+) -> Result<Option<BatchPreconfirmInfo>> {
+    if from_l1_block > to_l1_block {
+        return Ok(None);
+    }
+    let topic1 = B256::from(U256::from(batch_index));
+    let filter = Filter::new()
+        .address(contract_addr)
+        .event_signature(BatchPreconfirmed::SIGNATURE_HASH)
+        .topic1(topic1)
+        .from_block(from_l1_block)
+        .to_block(to_l1_block);
+    let logs = l1_provider
+        .get_logs(&filter)
+        .await
+        .map_err(|e| eyre!("eth_getLogs BatchPreconfirmed[{batch_index}] failed: {e}"))?;
+    let Some(log) = logs.into_iter().next() else { return Ok(None) };
+    let tx_hash = log
+        .transaction_hash
+        .ok_or_else(|| eyre!("BatchPreconfirmed[{batch_index}] log missing transaction_hash"))?;
+    let l1_block = log
+        .block_number
+        .ok_or_else(|| eyre!("BatchPreconfirmed[{batch_index}] log missing block_number"))?;
+    Ok(Some(BatchPreconfirmInfo { tx_hash, l1_block }))
 }
 
 // =====================================================================

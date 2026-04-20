@@ -40,7 +40,8 @@ use crate::{
     types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse},
 };
 use l1_rollup_client::{
-    broadcast_preconfirm, build_preconfirm_tx, nitro_verifier::is_key_registered,
+    batch_status, broadcast_preconfirm, build_preconfirm_tx, find_batch_preconfirm_event,
+    get_batch_on_chain, nitro_verifier::is_key_registered,
 };
 use l1_rollup_client::{nitro_verifier::is_key_registered, submit_preconfirmation};
 
@@ -201,6 +202,14 @@ enum DispatchOutcome {
     /// preconfirmed. Typically permanent; caller undispatches and applies
     /// backoff to give operators time to inspect before retrying.
     Reverted { tx_hash: B256 },
+    /// Pre-flight L1 view-call revealed the batch is already `Preconfirmed`
+    /// (or `Finalized`) — almost certainly by a previous instance of this
+    /// orchestrator that crashed between broadcast and the `mark_dispatched`
+    /// DB write. `l1_checkpoint` may have already advanced past the original
+    /// `BatchPreconfirmed` event, so the live listener will not replay it;
+    /// the main loop seeds `dispatched_batches` with the discovered on-chain
+    /// coordinates and advances past this batch without sending a tx.
+    AlreadyPreconfirmed { tx_hash: B256, l1_block: u64 },
     /// Task panicked or was dropped mid-flight. Treated identically to
     /// `Failed` by the main loop (clears gate, applies backoff).
     TaskFailed,
@@ -621,6 +630,12 @@ pub(crate) async fn run(
                 info!("Shutdown requested — exiting orchestrator loop");
                 break;
             }
+            _ = finalization_ticker.tick() =>
+                state.try_start_finalization(&accumulator),
+
+            Some(done) = finalization_done_rx.recv() =>
+                state.on_finalization_done(done, &mut accumulator, &mut missing_receipt_first_seen).await,
+
             // ── Block execution results ────────────────────────────────
             Some(result) = result_rx.recv() =>
                 state.on_block_result(result, &mut accumulator).await,
@@ -658,13 +673,6 @@ pub(crate) async fn run(
                     state.spawn_key_check(addr, Some(Duration::from_secs(10)));
                 }
             }
-
-            // ── Finalization checker ───────────────────────────────────
-            _ = finalization_ticker.tick() =>
-                state.try_start_finalization(&accumulator),
-
-            Some(done) = finalization_done_rx.recv() =>
-                state.on_finalization_done(done, &mut accumulator, &mut missing_receipt_first_seen).await,
         }
     }
 
@@ -1189,6 +1197,19 @@ impl OrchestratorState {
                 );
                 accumulator.undispatch(batch_index).await;
                 self.apply_dispatch_backoff("Dispatch reverted");
+            }
+
+            DispatchOutcome::AlreadyPreconfirmed { tx_hash, l1_block } => {
+                self.global_dispatch_attempts = 0;
+                self.global_next_dispatch_allowed = None;
+                info!(
+                    batch_index,
+                    %tx_hash,
+                    l1_block,
+                    "Batch already preconfirmed on L1 — seeding dispatched state from on-chain event"
+                );
+                accumulator.mark_dispatched_external(batch_index, tx_hash, l1_block).await;
+                self.try_dispatch_next_batch(accumulator);
             }
 
             DispatchOutcome::Failed => {
@@ -1790,6 +1811,136 @@ async fn run_rbf_dispatch(
     bump_tx: mpsc::Sender<(u64, RbfBumpEvent)>,
     resume: Option<RbfResumeState>,
 ) -> eyre::Result<DispatchOutcome> {
+    // Pre-flight on-chain reconciliation.
+    //
+    // A crash window between `broadcast_preconfirm` and the first
+    // `InitialBroadcast` event can leave a batch preconfirmed on L1 while
+    // SQLite still holds it in `pending_batches` with no dispatched row.
+    // On the next startup the `l1_checkpoint` may already sit past the
+    // original `BatchPreconfirmed` event, so the live listener will never
+    // replay it, and every retry here would fail deterministically inside
+    // `build_preconfirm_tx → estimate_gas → execution reverted:
+    // InvalidBatchStatus` — classic infinite backoff loop.
+    //
+    // The resume path is just as vulnerable: a stored nonce does NOT let
+    // us skip `estimate_gas` — `build_preconfirm_tx` re-runs it on every
+    // RBF iteration, and it reverts the instant the batch moves past
+    // `Submitted`. So the pre-flight has to run regardless of `resume`.
+    //
+    // Reconciliation cheap-path: one `eth_call getBatch(i)` tells us the
+    // real on-chain status. Any of `Preconfirmed`, `Challenged`, `Finalized`
+    // means the `BatchPreconfirmed(batchIndex)` event *may* have been
+    // emitted — Preconfirmed and Finalized unambiguously so, Challenged
+    // conditionally (a block-challenge can be opened from either `Submitted`
+    // or `Preconfirmed`; only the latter carries a preceding event). We
+    // treat the three uniformly: look for the event in the safe (finalized)
+    // L1 range; if found, surface `AlreadyPreconfirmed`; if not, the batch
+    // was challenged out of `Submitted` (or the event is still in the
+    // unfinalized window) and we back off.
+    //
+    // The event scan is bounded at the L1 `finalized` head. Without that
+    // bound a reorg could revert the event out of canonical history while
+    // we've already seeded `dispatched_batches` from its tx_hash, leaving
+    // the finalization ticker forever waiting for a receipt that no longer
+    // exists. Reconciliation latency = L1 finality delay (~13 min on
+    // mainnet), which is fine — the alternative was an infinite retry loop.
+    {
+        info!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+        let on_chain = get_batch_on_chain(provider, contract, batch_index)
+            .await
+            .map_err(|e| eyre::eyre!("pre-flight getBatch({batch_index}) failed: {e}"))?;
+        match on_chain.status {
+            batch_status::SUBMITTED => {
+                // Normal path — proceed to build + broadcast.
+            }
+            batch_status::PRECONFIRMED | batch_status::CHALLENGED | batch_status::FINALIZED => {
+                let finalized_head = provider
+                    .get_block_by_number(BlockNumberOrTag::Finalized)
+                    .await
+                    .map_err(|e| eyre::eyre!("get_block(Finalized) failed: {e}"))?
+                    .ok_or_else(|| {
+                        eyre::eyre!("L1 RPC returned no finalized block — chain not progressing?")
+                    })?
+                    .header
+                    .number;
+                if on_chain.accepted_at_block > finalized_head {
+                    // Batch was committed more recently than finality — its
+                    // preconfirm event cannot possibly be in the finalized
+                    // range yet. Back off and re-check after L1 finality
+                    // catches up.
+                    warn!(
+                        batch_index,
+                        status = on_chain.status,
+                        accepted_at_block = on_chain.accepted_at_block,
+                        finalized_head,
+                        "pre-flight: batch commit still unfinalized on L1 — backing off"
+                    );
+                    return Ok(DispatchOutcome::Failed);
+                }
+                let info = find_batch_preconfirm_event(
+                    provider,
+                    contract,
+                    batch_index,
+                    on_chain.accepted_at_block,
+                    finalized_head,
+                )
+                .await
+                .map_err(|e| {
+                    eyre::eyre!("find_batch_preconfirm_event({batch_index}) failed: {e}")
+                })?;
+                let Some(info) = info else {
+                    // Two legitimate reasons for a miss:
+                    // 1. `Challenged` opened from `Submitted` — no preceding
+                    //    BatchPreconfirmed event was ever emitted.
+                    // 2. Event was emitted but not yet finalized; we'll
+                    //    pick it up on the next retry once finality catches up.
+                    // Either way, do not broadcast — preconfirmBatch would
+                    // revert with InvalidBatchStatus.
+                    warn!(
+                        batch_index,
+                        status = on_chain.status,
+                        "pre-flight: batch not Submitted and no finalized \
+                         BatchPreconfirmed event — backing off"
+                    );
+                    return Ok(DispatchOutcome::Failed);
+                };
+                info!(
+                    batch_index,
+                    status = on_chain.status,
+                    tx_hash = %info.tx_hash,
+                    l1_block = info.l1_block,
+                    "pre-flight: batch already preconfirmed on L1 — skipping broadcast"
+                );
+                return Ok(DispatchOutcome::AlreadyPreconfirmed {
+                    tx_hash: info.tx_hash,
+                    l1_block: info.l1_block,
+                });
+            }
+            batch_status::NONE | batch_status::COMMITTED => {
+                // Either the batch doesn't exist on L1 yet (listener hasn't
+                // caught up to its BatchCommitted) or DA is still pending
+                // (BatchSubmitted not yet emitted). Either way `preconfirmBatch`
+                // would revert with InvalidBatchStatus. Back off; the normal
+                // L1 event stream will wake us up when the batch reaches
+                // Submitted.
+                warn!(
+                    batch_index,
+                    status = on_chain.status,
+                    "pre-flight: batch not yet Submitted on L1 — backing off"
+                );
+                return Ok(DispatchOutcome::Failed);
+            }
+            other => {
+                warn!(
+                    batch_index,
+                    status = other,
+                    "pre-flight: unexpected on-chain batch status — backing off"
+                );
+                return Ok(DispatchOutcome::Failed);
+            }
+        }
+    }
+
     let template = build_preconfirm_tx(
         provider,
         contract,

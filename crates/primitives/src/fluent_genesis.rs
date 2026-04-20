@@ -1,12 +1,12 @@
 // @generated — do not edit manually
 #![allow(clippy::all, unused_imports)]
-use alloy_genesis::{ChainConfig, Genesis, GenesisAccount};
-use alloy_primitives::{address, b256, Address, Bloom, Bytes, U256};
-use reth_chainspec::{
-    BaseFeeParams, BaseFeeParamsKind, ChainHardforks, ChainSpec, EthereumHardfork, ForkCondition,
-    Hardfork,
-};
-use reth_primitives_traits::{Header, SealedHeader};
+use alloy_primitives::{address, b256, U256, Bytes, Address, Bloom};
+use alloy_genesis::{Genesis, GenesisAccount, ChainConfig};
+use reth_primitives_traits::Header;
+use reth_chainspec::{ChainSpec, ChainHardforks, EthereumHardfork, ForkCondition, BaseFeeParamsKind, BaseFeeParams, Hardfork};
+use reth_primitives_traits::SealedHeader;
+use std::collections::BTreeMap;
+
 
 pub fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardforks {
     ChainHardforks::new(vec![
@@ -127,12 +127,8 @@ mod mainnet_genesis {
             ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
             beneficiary: address!("0000000000000000000000000000000000000000"),
             state_root: b256!("88388cf21f4e342fa9615b3b6a76361625fefd3e739f59de2860b8d8b667d5d9"),
-            transactions_root: b256!(
-                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-            ),
-            receipts_root: b256!(
-                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-            ),
+            transactions_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+            receipts_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
             logs_bloom: Bloom::ZERO,
             difficulty: U256::ZERO,
             number: 0u64,
@@ -143,17 +139,11 @@ mod mainnet_genesis {
             mix_hash: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
             nonce: 0x0000000000000000u64.into(),
             base_fee_per_gas: Some(1000000000u64),
-            withdrawals_root: Some(b256!(
-                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-            )),
+            withdrawals_root: Some(b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")),
             blob_gas_used: Some(0u64),
             excess_blob_gas: Some(0u64),
-            parent_beacon_block_root: Some(b256!(
-                "0000000000000000000000000000000000000000000000000000000000000000"
-            )),
-            requests_hash: Some(b256!(
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            )),
+            parent_beacon_block_root: Some(b256!("0000000000000000000000000000000000000000000000000000000000000000")),
+            requests_hash: Some(b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")),
         }
     }
 
@@ -268,12 +258,8 @@ mod testnet_genesis {
             ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
             beneficiary: address!("0000000000000000000000000000000000000000"),
             state_root: b256!("ae371f85d48ef3213ceb5739ec3b3a4f9c3cbfcbfd83dad8c83a4f53e862644a"),
-            transactions_root: b256!(
-                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-            ),
-            receipts_root: b256!(
-                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-            ),
+            transactions_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+            receipts_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
             logs_bloom: Bloom::ZERO,
             difficulty: U256::ZERO,
             number: 0u64,
@@ -284,17 +270,11 @@ mod testnet_genesis {
             mix_hash: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
             nonce: 0x0000000000000000u64.into(),
             base_fee_per_gas: Some(1000000000u64),
-            withdrawals_root: Some(b256!(
-                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-            )),
+            withdrawals_root: Some(b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")),
             blob_gas_used: Some(0u64),
             excess_blob_gas: Some(0u64),
-            parent_beacon_block_root: Some(b256!(
-                "0000000000000000000000000000000000000000000000000000000000000000"
-            )),
-            requests_hash: Some(b256!(
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            )),
+            parent_beacon_block_root: Some(b256!("0000000000000000000000000000000000000000000000000000000000000000")),
+            requests_hash: Some(b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")),
         }
     }
 
@@ -409,12 +389,8 @@ mod devnet_genesis {
             ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
             beneficiary: address!("0000000000000000000000000000000000000000"),
             state_root: b256!("d733087d118b1f04478eae870f58f7fd7ad69cb141416504e316b95ee478f215"),
-            transactions_root: b256!(
-                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-            ),
-            receipts_root: b256!(
-                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-            ),
+            transactions_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+            receipts_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
             logs_bloom: Bloom::ZERO,
             difficulty: U256::ZERO,
             number: 0u64,
@@ -425,17 +401,11 @@ mod devnet_genesis {
             mix_hash: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
             nonce: 0x0000000000000000u64.into(),
             base_fee_per_gas: Some(1000000000u64),
-            withdrawals_root: Some(b256!(
-                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-            )),
+            withdrawals_root: Some(b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")),
             blob_gas_used: Some(0u64),
             excess_blob_gas: Some(0u64),
-            parent_beacon_block_root: Some(b256!(
-                "0000000000000000000000000000000000000000000000000000000000000000"
-            )),
-            requests_hash: Some(b256!(
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            )),
+            parent_beacon_block_root: Some(b256!("0000000000000000000000000000000000000000000000000000000000000000")),
+            requests_hash: Some(b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")),
         }
     }
 
@@ -457,3 +427,4 @@ mod devnet_genesis {
 
 #[cfg(feature = "devnet")]
 pub use devnet_genesis::*;
+
