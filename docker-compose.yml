@@ -140,10 +140,10 @@ services:
       L1_ROLLUP_DEPLOY_BLOCK: ${L1_ROLLUP_DEPLOY_BLOCK}
       FLUENT_METRICS_ADDR: ${FLUENT_METRICS_ADDR}
     logging:
-      driver: json-file
+      driver: gelf
       options:
-        max-size: "50m"
-        max-file: "5"
+        gelf-address: ${GRAYLOG_ADDRESS}
+        tag: "{{.ImageName}}/{{.Name}}"
     ulimits:
       nofile:
         soft: 65536
