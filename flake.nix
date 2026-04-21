@@ -111,19 +111,8 @@
                     || rel == "crates"   || pkgs.lib.hasPrefix "crates/" rel
                     || rel == "Cargo.toml" || rel == "Cargo.lock";
                   isAncestor = rel == "" || rel == "bin";
-                  # crates/primitives/build.rs generates fluent_genesis.rs +
-                  # fluent_genesis_bin/ into the working tree (both are
-                  # .gitignored). If present from a prior non-Nix build, they
-                  # would be hashed into the source derivation and break PCR0
-                  # reproducibility — exclude them explicitly so Nix always
-                  # regenerates them fresh inside the sandbox.
-                  isGenerated =
-                    rel == "crates/primitives/src/fluent_genesis.rs"
-                    || rel == "crates/primitives/src/fluent_genesis_bin"
-                    || pkgs.lib.hasPrefix "crates/primitives/src/fluent_genesis_bin/" rel;
                 in
                   (inWanted || isAncestor)
-                  && !isGenerated
                   && (type == "directory"
                       || craneLib.filterCargoSources path type
                       || builtins.match ".*/bin/client/trusted_setup\\.txt$" path != null);

@@ -155,4 +155,10 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "/busybox wget -q -O - http://$${FLUENT_METRICS_ADDR}/metrics || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 

@@ -117,6 +117,10 @@ pub const NITRO_VERIFIER_ADDR: alloy_primitives::Address =
     alloy_primitives::Address::new(NITRO_VERIFIER_ADDRESS);
 
 pub mod account_proof;
-pub(crate) mod fluent_genesis;
+
+#[allow(clippy::all, unused_imports)]
+pub(crate) mod fluent_genesis {
+    include!(concat!(env!("OUT_DIR"), "/fluent_genesis.rs"));
+}
 
 pub use fluent_genesis::chainspec as fluent_chainspec;

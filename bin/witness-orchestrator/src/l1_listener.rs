@@ -6,6 +6,8 @@
 //!   `lastBlockHash` is also matched for historical logs)
 //! - `BatchSubmitted(batchIndex)` — all blobs submitted for the batch
 //! - `BatchPreconfirmed(batchIndex, verifierContract, verifier)` — preconfirmation accepted
+//! - `BatchReverted(fromBatchIndex)` — admin force-revert: orchestrator wipes state and restarts
+//!   from the reverted batch index.
 //!
 //! Events are sent to the orchestrator via an mpsc channel.
 //!
@@ -16,7 +18,7 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::Filter;
 use alloy_sol_types::SolEvent;
 use eyre::{eyre, Result};
-use l1_rollup_client::{BatchCommitted, BatchPreconfirmed, BatchSubmitted};
+use l1_rollup_client::{BatchCommitted, BatchPreconfirmed, BatchReverted, BatchSubmitted};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -36,6 +38,12 @@ pub(crate) enum L1Event {
     BatchSubmitted { batch_index: u64 },
     /// `BatchPreconfirmed` — carries the real tx_hash and l1_block.
     BatchPreconfirmed { batch_index: u64, tx_hash: B256, l1_block: u64 },
+    /// `BatchReverted` — admin force-reverted batches from `from_batch_index`
+    /// onward. Orchestrator wipes its DB, persists `from_batch_index` as the
+    /// next start batch and `l1_block` as the L1 checkpoint, then triggers a
+    /// graceful shutdown so the startup path re-resolves the L2 checkpoint
+    /// from L1.
+    BatchReverted { from_batch_index: u64, l1_block: u64 },
     /// All events up to this L1 block have been sent.
     /// Orchestrator persists this as the L1 checkpoint.
     Checkpoint(u64),
@@ -53,13 +61,13 @@ const INITIAL_PAGE: u64 = 2_000;
 
 fn is_too_many_results(err_msg: &str) -> bool {
     let s = err_msg.to_lowercase();
-    s.contains("-32005")
-        || s.contains("limit exceeded")
-        || s.contains("too many results")
-        || s.contains("log response size exceeded")
-        || s.contains("query returned more than")
-        || s.contains("please limit your query")
-        || s.contains("range is too large")
+    s.contains("-32005") ||
+        s.contains("limit exceeded") ||
+        s.contains("too many results") ||
+        s.contains("log response size exceeded") ||
+        s.contains("query returned more than") ||
+        s.contains("please limit your query") ||
+        s.contains("range is too large")
 }
 
 /// Result of a single poll iteration.
@@ -74,6 +82,7 @@ enum PollOutcome {
 ///
 /// Polls L1 logs starting from `from_block` and sends parsed events to `tx`.
 /// This function runs forever.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     l1_provider: RootProvider,
     l2_provider: RootProvider,
@@ -184,7 +193,7 @@ async fn poll_once(
     while current <= latest_block {
         let page_end = (current + *page_size - 1).min(latest_block);
 
-        match process_page(provider,&l2_provider, contract_addr, current, page_end, tx).await {
+        match process_page(provider, l2_provider, contract_addr, current, page_end, tx).await {
             Ok(()) => {
                 last_ok = page_end;
                 current = page_end + 1;
@@ -234,6 +243,7 @@ async fn process_page(
             BatchCommitted::SIGNATURE_HASH,
             BatchSubmitted::SIGNATURE_HASH,
             BatchPreconfirmed::SIGNATURE_HASH,
+            BatchReverted::SIGNATURE_HASH,
         ])
         .from_block(from)
         .to_block(to);
@@ -264,9 +274,7 @@ async fn process_page(
                 .map_err(|e| eyre!("L2 RPC failed to fetch fromBlockHash ({}): {}", from_hash, e))?
                 .ok_or_else(|| eyre!("Block {} not found on L2 Node", from_hash))?;
 
-            let from_block_number = from_block
-                .header
-                .number + 1;
+            let from_block_number = from_block.header.number + 1;
 
             let to_block = l2_provider
                 .get_block_by_hash(to_hash)
@@ -274,13 +282,19 @@ async fn process_page(
                 .map_err(|e| eyre!("L2 RPC failed to fetch toBlockHash ({}): {}", to_hash, e))?
                 .ok_or_else(|| eyre!("Block {} not found on L2 Node", to_hash))?;
 
-            let to_block_number = to_block
-                .header
-                .number;
+            let to_block_number = to_block.header.number;
 
             info!(batch_index, from_block_number, to_block_number, "BatchCommitted event");
 
-            if tx.send(L1Event::BatchCommitted { batch_index, from: from_block_number, to: to_block_number }).await.is_err() {
+            if tx
+                .send(L1Event::BatchCommitted {
+                    batch_index,
+                    from: from_block_number,
+                    to: to_block_number,
+                })
+                .await
+                .is_err()
+            {
                 return Err(eyre!("L1 event channel closed"));
             }
         } else if topic0 == BatchSubmitted::SIGNATURE_HASH {
@@ -312,6 +326,20 @@ async fn process_page(
             info!(batch_index, %tx_hash, l1_block, "BatchPreconfirmed event");
             if tx.send(L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block }).await.is_err()
             {
+                return Err(eyre!("L1 event channel closed"));
+            }
+        } else if topic0 == BatchReverted::SIGNATURE_HASH {
+            let event = BatchReverted::decode_log_data(&log.inner.data).map_err(|e| {
+                eyre!("Failed to decode BatchReverted at L1 block {:?}: {e}", log.block_number)
+            })?;
+            let from_batch_index: u64 = event
+                .fromBatchIndex
+                .try_into()
+                .map_err(|_| eyre!("fromBatchIndex overflow: {}", event.fromBatchIndex))?;
+            let l1_block =
+                log.block_number.ok_or_else(|| eyre!("BatchReverted log missing block_number"))?;
+            info!(from_batch_index, l1_block, "BatchReverted event");
+            if tx.send(L1Event::BatchReverted { from_batch_index, l1_block }).await.is_err() {
                 return Err(eyre!("L1 event channel closed"));
             }
         }

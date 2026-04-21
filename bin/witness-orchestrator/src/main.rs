@@ -71,7 +71,12 @@ mod orchestrator;
 mod types;
 mod witness_server;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use crate::hub::{WitnessHub, DEFAULT_COLD_BATCH_SIZE};
 use alloy_network::{Ethereum, EthereumWallet};
@@ -156,7 +161,7 @@ async fn main() -> eyre::Result<()> {
         .expect("Invalid L1_ROLLUP_ADDR");
     let l1_submitter_key = std::env::var("L1_SUBMITTER_KEY").expect("L1_SUBMITTER_KEY is required");
     let nitro_verifier_addr: Address = fluent_stf_primitives::NITRO_VERIFIER_ADDR;
-    let start_batch_id: Option<u64> =
+    let env_start_batch_id: Option<u64> =
         std::env::var("L1_START_BATCH_ID").ok().and_then(|s| s.parse().ok());
     let l1_deploy_block: u64 =
         std::env::var("L1_ROLLUP_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -200,9 +205,20 @@ async fn main() -> eyre::Result<()> {
     let (listener_from_block, witness_from_block, orchestrator_checkpoint): (u64, u64, u64) = {
         let db_startup = crate::db::Db::open(&db_path).expect("Failed to open DB for startup");
 
+        // DB-persisted start batch id takes precedence over the env var.
+        // It is written by the BatchReverted handler after wiping all state,
+        // so a restart re-resolves the L2 checkpoint from the reverted batch
+        // instead of the stale env value that bootstrapped the deployment.
+        let db_start_batch_id = db_startup.get_start_batch_id();
+        let start_batch_id: Option<u64> = db_start_batch_id.or(env_start_batch_id);
+
         if let Some(batch_id) = start_batch_id {
             if db_startup.get_checkpoint() == 0 {
-                info!(batch_id, "L1_START_BATCH_ID set — resolving L2 start checkpoint from L1");
+                info!(
+                    batch_id,
+                    from_db = db_start_batch_id.is_some(),
+                    "Resolving L2 start checkpoint from L1"
+                );
                 let (l2_from_block, l1_event_block, _num_blocks) =
                     l1_rollup_client::resolve_l2_start_checkpoint(
                         &l1_read_provider,
@@ -216,10 +232,22 @@ async fn main() -> eyre::Result<()> {
 
                 let l2_checkpoint = l2_from_block.saturating_sub(1);
                 db_startup.save_checkpoint(l2_checkpoint);
-                db_startup.save_l1_checkpoint(l1_event_block.saturating_sub(1));
+                // For env-var bootstrap we rewind l1_checkpoint one block
+                // behind the committing event so the listener re-observes it.
+                // For BatchReverted recovery the DB already holds the event
+                // block — keep whichever is later.
+                if db_start_batch_id.is_none() {
+                    db_startup.save_l1_checkpoint(l1_event_block.saturating_sub(1));
+                }
 
                 if db_startup.get_last_batch_end().is_none() {
                     db_startup.save_last_batch_end(l2_checkpoint);
+                }
+
+                // Clear the one-shot revert anchor so a manual env-var
+                // restart later is not shadowed by a stale DB entry.
+                if db_start_batch_id.is_some() {
+                    db_startup.clear_start_batch_id();
                 }
 
                 info!(
@@ -244,6 +272,8 @@ async fn main() -> eyre::Result<()> {
             let dispatched_ranges = db_startup.load_dispatched_block_ranges();
             let response_blocks: HashSet<u64> =
                 db_startup.get_all_response_block_numbers().into_iter().collect();
+            let signed_batch_indexes: HashSet<u64> =
+                db_startup.load_batch_signature_indexes().into_iter().collect();
             let current_ckpt = db_startup.get_checkpoint();
 
             let result = normalize_startup_checkpoint(
@@ -251,6 +281,7 @@ async fn main() -> eyre::Result<()> {
                 &pending,
                 &dispatched_ranges,
                 &response_blocks,
+                &signed_batch_indexes,
             );
 
             if let Some(gap) = result.earliest_gap {
@@ -310,7 +341,7 @@ async fn main() -> eyre::Result<()> {
         %l1_rollup_addr,
         %nitro_verifier_addr,
         listener_from_block,
-        start_batch_id,
+        env_start_batch_id,
         l1_deploy_block,
         witness_from_block,
         "Starting witness orchestrator"
@@ -599,9 +630,12 @@ async fn main() -> eyre::Result<()> {
 ///   2. Checkpoint is walked forward across every contiguous present block (so the driver does not
 ///      re-walk already-computed blocks).
 ///
-/// "Present" = response stored OR dispatched batch covers the block. A single
-/// forward walk that stops at the first gap preserves both invariants, which
-/// rules out the gap-vs-`last_batch_end` race between those two conditions.
+/// "Present" = response stored OR dispatched batch covers the block OR the
+/// block belongs to a pending batch whose signature is already cached
+/// (signing early-purges responses, so a signed-but-not-dispatched batch has
+/// no response rows yet its work is complete). A single forward walk that
+/// stops at the first gap preserves both invariants, which rules out the
+/// gap-vs-`last_batch_end` race between those two conditions.
 pub(crate) struct StartupCheckpointResult {
     pub(crate) new_ckpt: u64,
     pub(crate) stale_signature_indexes: Vec<u64>,
@@ -613,13 +647,28 @@ pub(crate) fn normalize_startup_checkpoint(
     pending: &[accumulator::PendingBatch],
     dispatched_ranges: &[(u64, u64)],
     response_blocks: &HashSet<u64>,
+    signed_batch_indexes: &HashSet<u64>,
 ) -> StartupCheckpointResult {
-    let dispatched_set: HashSet<u64> = dispatched_ranges.iter().flat_map(|&(f, t)| f..=t).collect();
-    let present = |b: u64| response_blocks.contains(&b) || dispatched_set.contains(&b);
+    let mut present_set: HashSet<u64> =
+        dispatched_ranges.iter().flat_map(|&(f, t)| f..=t).collect();
+    // Signed pending batches have their responses early-purged right after
+    // signing (see `on_sign_done`), so treat their full block range as
+    // present — the work is complete even though no response rows remain.
+    for batch in pending {
+        if signed_batch_indexes.contains(&batch.batch_index) {
+            present_set.extend(batch.from_block..=batch.to_block);
+        }
+    }
+    let present = |b: u64| response_blocks.contains(&b) || present_set.contains(&b);
 
     let mut earliest_gap: Option<u64> = None;
     let mut gapped_batches: Vec<u64> = Vec::new();
     for batch in pending {
+        // Signed batches are complete by construction — skip the gap scan so
+        // their signatures are never marked stale.
+        if signed_batch_indexes.contains(&batch.batch_index) {
+            continue;
+        }
         let mut batch_has_gap = false;
         for b in batch.from_block..=batch.to_block {
             if present(b) {
@@ -674,8 +723,9 @@ mod tests {
             response_blocks.insert(b);
         }
         // blocks 50..=60 missing — pretend the response store lost them.
+        let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(100, &pending, &dispatched, &response_blocks);
+        let r = normalize_startup_checkpoint(100, &pending, &dispatched, &response_blocks, &signed);
 
         assert_eq!(r.earliest_gap, Some(50));
         assert_eq!(r.new_ckpt, 49, "must roll back to gap-1, not stay at current_ckpt");
@@ -691,8 +741,9 @@ mod tests {
             response_blocks.insert(b);
         }
         // contiguous: 11..=20 present; 21 missing.
+        let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(10, &pending, &dispatched, &response_blocks);
+        let r = normalize_startup_checkpoint(10, &pending, &dispatched, &response_blocks, &signed);
 
         assert_eq!(r.new_ckpt, 20);
         assert!(r.earliest_gap.is_none());
@@ -707,8 +758,9 @@ mod tests {
         for b in 5..=10 {
             response_blocks.insert(b);
         }
+        let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(10, &pending, &dispatched, &response_blocks);
+        let r = normalize_startup_checkpoint(10, &pending, &dispatched, &response_blocks, &signed);
 
         assert_eq!(r.new_ckpt, 10);
         assert!(r.earliest_gap.is_none());
@@ -724,8 +776,9 @@ mod tests {
         for b in 40..=49 {
             response_blocks.insert(b);
         }
+        let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(30, &pending, &dispatched, &response_blocks);
+        let r = normalize_startup_checkpoint(30, &pending, &dispatched, &response_blocks, &signed);
 
         assert_eq!(r.earliest_gap, Some(50));
         assert_eq!(r.new_ckpt, 30, "should not lower below current_ckpt");
@@ -743,8 +796,9 @@ mod tests {
             response_blocks.insert(b);
         }
         // gap at 15..20; 21..30 also missing.
+        let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(25, &pending, &dispatched, &response_blocks);
+        let r = normalize_startup_checkpoint(25, &pending, &dispatched, &response_blocks, &signed);
 
         assert_eq!(r.earliest_gap, Some(15));
         assert_eq!(r.new_ckpt, 14, "must stop at gap-1, not re-advance to 25");
@@ -752,5 +806,40 @@ mod tests {
         // is reported as well (all batches containing any gap).
         assert!(r.stale_signature_indexes.contains(&1));
         assert!(r.stale_signature_indexes.contains(&2));
+    }
+
+    #[test]
+    fn signed_pending_batch_is_not_treated_as_gap() {
+        // Regression: on `on_sign_done`, responses for a signed batch are
+        // early-purged while the batch row stays in `pending_batches` until
+        // dispatched. At startup the gap scan must NOT flag the signed batch
+        // as stale, its signature must NOT be deleted, and the checkpoint
+        // must walk forward over the signed range.
+        let pending = [batch(7, 100, 110)];
+        let dispatched: Vec<(u64, u64)> = vec![];
+        let response_blocks = HashSet::new(); // all responses purged post-signing
+        let signed: HashSet<u64> = [7].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(99, &pending, &dispatched, &response_blocks, &signed);
+
+        assert!(r.earliest_gap.is_none(), "signed batch must not register as a gap");
+        assert!(r.stale_signature_indexes.is_empty(), "signed batch signature must be preserved");
+        assert_eq!(r.new_ckpt, 110, "checkpoint must walk forward across the signed range");
+    }
+
+    #[test]
+    fn signed_batch_before_unsigned_gap_still_detects_gap() {
+        // Signed batch 7 (100..=110) is complete (responses purged).
+        // Unsigned batch 8 (111..=120) has no responses — real gap at 111.
+        let pending = [batch(7, 100, 110), batch(8, 111, 120)];
+        let dispatched: Vec<(u64, u64)> = vec![];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [7].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(115, &pending, &dispatched, &response_blocks, &signed);
+
+        assert_eq!(r.earliest_gap, Some(111));
+        assert_eq!(r.new_ckpt, 110, "walk must stop at the signed batch's last block");
+        assert_eq!(r.stale_signature_indexes, vec![8], "only the unsigned gap batch is stale");
     }
 }

@@ -286,13 +286,6 @@ impl BatchAccumulator {
             (batch.from_block..=batch.to_block).all(|b| self.responses.contains_key(&b))
     }
 
-    /// Iterator over every block number with a stored response.
-    /// Used at orchestrator startup to seed the shared `known_responses`
-    /// dedup set.
-    pub(crate) fn response_block_numbers(&self) -> impl Iterator<Item = u64> + '_ {
-        self.responses.keys().copied()
-    }
-
     #[cfg(test)]
     pub(crate) fn first_ready(&self) -> Option<u64> {
         self.batches.values().find(|b| self.is_batch_ready(b)).map(|b| b.batch_index)
@@ -323,7 +316,8 @@ impl BatchAccumulator {
     }
 
     /// Returns the highest `to_block` across all pending and dispatched batches, or `None` if
-    /// empty. Used on restart to recover `next_batch_from_block` without reading a DB key.
+    /// empty.
+    #[cfg(test)]
     pub(crate) fn max_to_block(&self) -> Option<u64> {
         let pending_max = self.batches.values().map(|b| b.to_block).max();
         let dispatched_max = self.dispatched.values().map(|d| d.to_block).max();

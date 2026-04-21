@@ -141,6 +141,78 @@ impl Db {
         }
     }
 
+    // ── Pending start batch id (BatchReverted recovery) ─────────────────────────
+    //
+    // On `BatchReverted`, the orchestrator wipes its DB and persists the
+    // reverted batch index here. The startup path prefers this over the
+    // `L1_START_BATCH_ID` env var so the next restart resolves the L2
+    // checkpoint from the reverted batch, not the stale env value.
+
+    pub(crate) fn get_start_batch_id(&self) -> Option<u64> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = 'start_batch_id'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+            .and_then(|s| s.parse().ok())
+    }
+
+    pub(crate) fn clear_start_batch_id(&self) {
+        if let Err(e) = self.conn.execute("DELETE FROM meta WHERE key = 'start_batch_id'", []) {
+            error!(err = %e, "Failed to clear start_batch_id");
+        }
+    }
+
+    /// Atomically wipe all orchestrator state and persist the recovery
+    /// anchors for the next startup: `start_batch_id` (reverted batch index)
+    /// and `l1_checkpoint` (L1 block of the `BatchReverted` event).
+    ///
+    /// Wipes every data table — `block_responses`, `pending_batches`,
+    /// `pending_blobs_accepted`, `batch_signatures`, `dispatched_batches`,
+    /// and the entire `meta` table — before writing the two new meta rows.
+    pub(crate) fn wipe_for_revert(&mut self, start_batch_id: u64, l1_block: u64) {
+        let tx = match self.conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!(err = %e, "wipe_for_revert: begin tx failed");
+                return;
+            }
+        };
+        let res = tx
+            .execute_batch(
+                "DELETE FROM block_responses;
+                 DELETE FROM pending_batches;
+                 DELETE FROM pending_blobs_accepted;
+                 DELETE FROM batch_signatures;
+                 DELETE FROM dispatched_batches;
+                 DELETE FROM meta;",
+            )
+            .and_then(|()| {
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES('start_batch_id', ?1)",
+                    params![start_batch_id.to_string()],
+                )
+                .map(|_| ())
+            })
+            .and_then(|()| {
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES('l1_checkpoint', ?1)",
+                    params![l1_block.to_string()],
+                )
+                .map(|_| ())
+            });
+        match res {
+            Ok(()) => {
+                if let Err(e) = tx.commit() {
+                    error!(err = %e, "wipe_for_revert: commit failed");
+                }
+            }
+            Err(e) => {
+                error!(err = %e, "wipe_for_revert: statement failed — rolling back");
+            }
+        }
+    }
+
     // ── Last batch end ────────────────────────────────────────────────────────────
 
     /// to_block of the last successfully preconfirmed batch.

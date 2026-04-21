@@ -43,7 +43,6 @@ use l1_rollup_client::{
     batch_status, broadcast_preconfirm, build_preconfirm_tx, find_batch_preconfirm_event,
     get_batch_on_chain, nitro_verifier::is_key_registered,
 };
-use l1_rollup_client::{nitro_verifier::is_key_registered, submit_preconfirmation};
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::{Ethereum, EthereumWallet, TxSigner};
@@ -562,6 +561,7 @@ pub(crate) async fn run(
         key_check_attempts: 0,
         known_responses: Arc::clone(&known_responses),
         last_batch_end,
+        shutdown: shutdown.clone(),
     };
 
     // Startup resume: for every still-dispatched batch with persisted RBF
@@ -738,6 +738,10 @@ struct OrchestratorState {
     /// `on_block_result` to drop results for already-finalized blocks
     /// (their rows were purged by `finalize_dispatched_batch`).
     last_batch_end: Option<u64>,
+    /// Top-level process shutdown token. Fired by `BatchReverted` handling
+    /// after DB wipe — the supervisor restarts the process, and the startup
+    /// path picks up the persisted `start_batch_id` + `l1_checkpoint`.
+    shutdown: CancellationToken,
 }
 
 impl OrchestratorState {
@@ -795,11 +799,7 @@ impl OrchestratorState {
     }
 
     /// Handle an L1 event: register a new batch or mark blobs accepted.
-    async fn on_l1_event(
-        &mut self,
-        event: L1Event,
-        accumulator: &mut BatchAccumulator,
-    ) {
+    async fn on_l1_event(&mut self, event: L1Event, accumulator: &mut BatchAccumulator) {
         match event {
             L1Event::BatchCommitted { batch_index, from, to } => {
                 accumulator.set_batch(batch_index, from, to).await;
@@ -835,6 +835,34 @@ impl OrchestratorState {
                 {
                     warn!(l1_block, err = %e, "save_l1_checkpoint: spawn_blocking failed");
                 }
+            }
+            L1Event::BatchReverted { from_batch_index, l1_block } => {
+                // Admin force-reverted batches from `from_batch_index` onward.
+                // Wipe the entire orchestrator DB and persist the recovery
+                // anchors for the next startup, then trigger graceful
+                // shutdown — the supervisor restarts the process, and the
+                // startup path re-resolves the L2 checkpoint from the
+                // reverted batch via `resolve_l2_start_checkpoint`.
+                info!(
+                    from_batch_index,
+                    l1_block, "BatchReverted — wiping DB and scheduling restart"
+                );
+                let db = Arc::clone(&self.db);
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    db.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .wipe_for_revert(from_batch_index, l1_block);
+                })
+                .await
+                {
+                    error!(
+                        from_batch_index,
+                        l1_block,
+                        err = %e,
+                        "wipe_for_revert: spawn_blocking failed"
+                    );
+                }
+                self.shutdown.cancel();
             }
         }
     }
@@ -1840,10 +1868,10 @@ async fn run_rbf_dispatch(
                 })?;
                 let Some(info) = info else {
                     // Two legitimate reasons for a miss:
-                    // 1. `Challenged` opened from `Submitted` — no preceding
-                    //    BatchPreconfirmed event was ever emitted.
-                    // 2. Event was emitted but not yet finalized; we'll
-                    //    pick it up on the next retry once finality catches up.
+                    // 1. `Challenged` opened from `Submitted` — no preceding BatchPreconfirmed
+                    //    event was ever emitted.
+                    // 2. Event was emitted but not yet finalized; we'll pick it up on the next
+                    //    retry once finality catches up.
                     // Either way, do not broadcast — preconfirmBatch would
                     // revert with InvalidBatchStatus.
                     warn!(

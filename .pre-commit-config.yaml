@@ -1,0 +1,18 @@
+repos:
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: Run `rustfmt`
+        language: rust
+        types: [rust]
+        entry: cargo +nightly fmt --all -- --check
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: clippy
+        name: Run cargo clippy
+        language: rust
+        types: [rust]
+        entry: cargo +stable clippy --all --all-targets -- -D warnings
+        pass_filenames: false
+        stages: [pre-commit]
