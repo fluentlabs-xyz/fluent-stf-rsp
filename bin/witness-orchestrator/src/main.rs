@@ -193,7 +193,7 @@ async fn main() -> eyre::Result<()> {
     // L2 provider — used by the startup resolver (for `lastBlockHash` lookup)
     // AND later by the embedded driver + blob builder.
     let l2_rpc_parsed: url::Url = rpc_url.parse().expect("Invalid RPC_URL");
-    let l2_provider: RootProvider =
+    let l2_provider =
         rsp_provider::create_provider(l2_rpc_parsed).expect("failed to build L2 provider");
 
     // ── Startup: resolve L2 checkpoint from START_BATCH_ID ───────────────────────
@@ -366,6 +366,8 @@ async fn main() -> eyre::Result<()> {
         });
     }
 
+    let l1_listened_l2_provider = l2_provider.clone();
+
     // Start L1 event listener
     let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(64);
     {
@@ -373,6 +375,7 @@ async fn main() -> eyre::Result<()> {
         tasks.spawn(async move {
             let r = l1_listener::run(
                 l1_read_provider,
+                l1_listened_l2_provider,
                 l1_rollup_addr,
                 listener_from_block,
                 l1_poll_interval_secs,

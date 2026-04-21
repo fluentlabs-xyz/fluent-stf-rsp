@@ -483,16 +483,6 @@ pub(crate) async fn run(
             .expect("startup accumulator load panicked")
     };
 
-    let mut next_batch_from_block: Option<u64> =
-        accumulator.max_to_block().map(|e| e + 1).or_else(|| {
-            db.lock().unwrap_or_else(|e| e.into_inner()).get_last_batch_end().map(|e| e + 1)
-        });
-
-    {
-        let initial: HashSet<u64> = accumulator.response_block_numbers().collect();
-        *known_responses.write().unwrap_or_else(|e| e.into_inner()) = initial;
-    }
-
     let mut last_batch_end: Option<u64> =
         db.lock().unwrap_or_else(|e| e.into_inner()).get_last_batch_end();
 
@@ -642,7 +632,7 @@ pub(crate) async fn run(
 
             // ── L1 events ──────────────────────────────────────────────
             Some(event) = l1_events.recv() =>
-                state.on_l1_event(event, &mut accumulator, &mut next_batch_from_block, from_block).await,
+                state.on_l1_event(event, &mut accumulator).await,
 
             // ── Batch signing completions ──────────────────────────────
             Some((batch_index, outcome)) = sign_done_rx.recv() =>
@@ -809,52 +799,13 @@ impl OrchestratorState {
         &mut self,
         event: L1Event,
         accumulator: &mut BatchAccumulator,
-        next_batch_from_block: &mut Option<u64>,
-        from_block: u64,
     ) {
         match event {
-            L1Event::BatchCommitted { batch_index, num_blocks } => {
-                // On L1 reorg this event may re-fire for an already-registered
-                // batch. The `next_batch_from_block` tracker is stale in that
-                // case (points past the old — now purged — higher batches),
-                // so anchor `from` to the existing entry's `from_block` to
-                // preserve L2 block alignment. The new `to` shifts with the
-                // re-emitted `num_blocks`. Accumulator's set_batch then purges
-                // stale state for batches > batch_index.
-                let from = accumulator
-                    .get(batch_index)
-                    .map(|b| b.from_block)
-                    .unwrap_or_else(|| next_batch_from_block.unwrap_or(from_block));
-                let to = from + num_blocks.saturating_sub(1);
-                info!(batch_index, from, to, num_blocks, "Setting batch from L1 event");
-                // Orphan prevention: if a re-emitted BatchCommitted shrinks the
-                // range of an already-dispatched batch, `set_batch` below will
-                // undispatch_and_reregister it. Cancel the in-flight RBF worker
-                // first so it stops bumping against a nonce that the new
-                // re-dispatch will also acquire.
-                if let Some(existing) = accumulator.dispatched.get(&batch_index) {
-                    if existing.from_block != from || existing.to_block != to {
-                        if let Some(token) = self.dispatch_cancel.remove(&batch_index) {
-                            info!(
-                                batch_index,
-                                "Cancelling RBF worker before reorg-shrink undispatch"
-                            );
-                            token.cancel();
-                        }
-                    }
-                }
+            L1Event::BatchCommitted { batch_index, from, to } => {
                 accumulator.set_batch(batch_index, from, to).await;
-                *next_batch_from_block = Some(to + 1);
-                // Responses may have been buffered ahead of this event and
-                // `BatchSubmitted` may have already arrived (via
-                // `pending_blobs_accepted`); drive the batch forward now.
-                self.try_sign_next_batch(accumulator);
-                self.try_dispatch_next_batch(accumulator);
             }
             L1Event::BatchSubmitted { batch_index } => {
                 accumulator.mark_batch_submitted(batch_index).await;
-                self.try_sign_next_batch(accumulator);
-                self.try_dispatch_next_batch(accumulator);
             }
             L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block } => {
                 // Do NOT cancel the RBF worker here: cancel maps to
@@ -1845,7 +1796,6 @@ async fn run_rbf_dispatch(
     // exists. Reconciliation latency = L1 finality delay (~13 min on
     // mainnet), which is fine — the alternative was an infinite retry loop.
     {
-        info!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
         let on_chain = get_batch_on_chain(provider, contract, batch_index)
             .await
             .map_err(|e| eyre::eyre!("pre-flight getBatch({batch_index}) failed: {e}"))?;

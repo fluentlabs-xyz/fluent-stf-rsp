@@ -22,7 +22,7 @@ pub use nitro_verifier::is_key_registered;
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSigner;
-use alloy_primitives::{Address, Bytes, Signature, TxKind, B256, U256};
+use alloy_primitives::{Address, Bytes, FixedBytes, Signature, TxKind, B256, U256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::{Filter, TransactionRequest};
 use alloy_sol_types::{sol, SolCall, SolEvent};
@@ -150,27 +150,6 @@ sol! {
     function getBatch(uint256 batchIndex) external view returns (BatchRecord memory);
 }
 
-/// Pre-upgrade ABI of the `BatchCommitted` event. On-chain the event name is
-/// still `BatchCommitted`, so the topic0 hash is `keccak256("BatchCommitted(...)")`
-/// with the old parameter list. Kept in a nested `sol!` block (wrapped in its
-/// own module) so the Rust type name stays distinct from the current variant.
-pub mod v0 {
-    use alloy_sol_types::sol;
-
-    sol! {
-        /// Historical variant: single `lastBlockHash` instead of
-        /// `fromBlockHash + toBlockHash`. Proxy address is unchanged, so
-        /// both variants appear in the log stream.
-        event BatchCommitted(
-            uint256 indexed batchIndex,
-            bytes32 batchRoot,
-            bytes32 lastBlockHash,
-            uint24 numberOfBlocks,
-            uint256 expectedBlobs
-        );
-    }
-}
-
 // =====================================================================
 // Read helpers
 // =====================================================================
@@ -222,24 +201,13 @@ pub async fn resolve_l2_start_checkpoint(
     let mut target: Option<(u64, u64, B256)> = None; // (l1_event_block, num_blocks, from_block_hash)
     let mut current = l1_deploy_block;
 
-    // Anchor hash resolved to an L2 block number and interpretation
-    // (start-of-batch vs end-of-batch) differ between ABI versions — record
-    // which one we matched so post-lookup math stays correct.
-    enum Anchor {
-        FromBlockHash(B256),
-        LastBlockHash(B256),
-    }
-
-    let mut anchor: Option<Anchor> = None;
+    let mut anchor: Option<FixedBytes<32>> = None;
 
     'outer: while current <= latest {
         let page_end = (current + PAGE - 1).min(latest);
         let filter = Filter::new()
             .address(contract_addr)
-            .event_signature(vec![
-                BatchCommitted::SIGNATURE_HASH,
-                v0::BatchCommitted::SIGNATURE_HASH,
-            ])
+            .event_signature(vec![BatchCommitted::SIGNATURE_HASH])
             .from_block(current)
             .to_block(page_end);
         let logs = l1_provider
@@ -261,19 +229,7 @@ pub async fn resolve_l2_start_checkpoint(
                         .numberOfBlocks
                         .try_into()
                         .map_err(|_| eyre!("numberOfBlocks overflow: {}", ev.numberOfBlocks))?;
-                    (idx, nb, Anchor::FromBlockHash(ev.fromBlockHash))
-                } else if topic0 == v0::BatchCommitted::SIGNATURE_HASH {
-                    let ev = v0::BatchCommitted::decode_log_data(&log.inner.data)
-                        .map_err(|e| eyre!("decode BatchCommitted v0: {e}"))?;
-                    let idx: u64 = ev
-                        .batchIndex
-                        .try_into()
-                        .map_err(|_| eyre!("batchIndex overflow: {}", ev.batchIndex))?;
-                    let nb: u64 = ev
-                        .numberOfBlocks
-                        .try_into()
-                        .map_err(|_| eyre!("numberOfBlocks overflow: {}", ev.numberOfBlocks))?;
-                    (idx, nb, Anchor::LastBlockHash(ev.lastBlockHash))
+                    (idx, nb, ev.fromBlockHash)
                 } else {
                     continue;
                 };
@@ -306,47 +262,25 @@ pub async fn resolve_l2_start_checkpoint(
     })?;
     let anchor = anchor.expect("anchor set whenever target is set");
 
-    let (anchor_hash, l2_from_block) = match anchor {
-        Anchor::FromBlockHash(h) => {
-            // `fromBlockHash` is the LAST block of the PREVIOUS batch
-            // (exclusive lower bound), so the first block of THIS batch is `n + 1`.
-            let n = l2_provider
-                .get_block_by_hash(h)
-                .await
-                .map_err(|e| eyre!("eth_getBlockByHash({h}) on L2: {e}"))?
-                .ok_or_else(|| {
-                    eyre!(
-                        "L2 block with hash {h} (from BatchCommitted.fromBlockHash \
+    let (anchor_hash, l2_from_block) = {
+        let h = anchor;
+
+        // `fromBlockHash` is the LAST block of the PREVIOUS batch
+        // (exclusive lower bound), so the first block of THIS batch is `n + 1`.
+        let n = l2_provider
+            .get_block_by_hash(anchor)
+            .await
+            .map_err(|e| eyre!("eth_getBlockByHash({h}) on L2: {e}"))?
+            .ok_or_else(|| {
+                eyre!(
+                    "L2 block with hash {h} (from BatchCommitted.fromBlockHash \
                          for batch {batch_id}) not found — L2 RPC may be pointing \
                          at the wrong chain or be missing history."
-                    )
-                })?
-                .header
-                .number;
-            (h, n + 1)
-        }
-        Anchor::LastBlockHash(h) => {
-            // Pre-upgrade ABI: batch carried only the **last** block hash.
-            // Derive the first-block number by subtracting (num_blocks - 1)
-            // from the last-block number.
-            let last_n = l2_provider
-                .get_block_by_hash(h)
-                .await
-                .map_err(|e| eyre!("eth_getBlockByHash({h}) on L2: {e}"))?
-                .ok_or_else(|| {
-                    eyre!(
-                        "L2 block with hash {h} (from v0::BatchCommitted.lastBlockHash \
-                         for batch {batch_id}) not found — L2 RPC may be pointing \
-                         at the wrong chain or be missing history."
-                    )
-                })?
-                .header
-                .number;
-            if num_blocks == 0 {
-                return Err(eyre!("v0::BatchCommitted for batch {batch_id} has num_blocks=0"));
-            }
-            (h, last_n.saturating_sub(num_blocks - 1))
-        }
+                )
+            })?
+            .header
+            .number;
+        (h, n + 1)
     };
     let from_block_hash = anchor_hash;
 
