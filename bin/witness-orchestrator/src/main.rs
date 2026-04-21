@@ -269,7 +269,6 @@ async fn main() -> eyre::Result<()> {
         // ── Startup checkpoint normalisation ───────────────────────────────────
         {
             let pending = db_startup.load_batches();
-            let dispatched_ranges = db_startup.load_dispatched_block_ranges();
             let response_blocks: HashSet<u64> =
                 db_startup.get_all_response_block_numbers().into_iter().collect();
             let signed_batch_indexes: HashSet<u64> =
@@ -279,7 +278,6 @@ async fn main() -> eyre::Result<()> {
             let result = normalize_startup_checkpoint(
                 current_ckpt,
                 &pending,
-                &dispatched_ranges,
                 &response_blocks,
                 &signed_batch_indexes,
             );
@@ -624,78 +622,54 @@ async fn main() -> eyre::Result<()> {
 
 /// Pure result of the startup checkpoint walk.
 ///
-/// Two invariants the caller must preserve after applying it:
-///   1. Checkpoint is never above a block with a missing response/dispatch (so the driver does not
-///      skip re-execution).
-///   2. Checkpoint is walked forward across every contiguous present block (so the driver does not
-///      re-walk already-computed blocks).
-///
-/// "Present" = response stored OR dispatched batch covers the block OR the
-/// block belongs to a pending batch whose signature is already cached
-/// (signing early-purges responses, so a signed-but-not-dispatched batch has
-/// no response rows yet its work is complete). A single forward walk that
-/// stops at the first gap preserves both invariants, which rules out the
-/// gap-vs-`last_batch_end` race between those two conditions.
+/// Single pass over `pending` (ordered by `batch_index`):
+/// - Signed batch: advance `new_ckpt` to its `to_block`.
+/// - Unsigned batch: scan blocks in its range against `response_blocks`. On first missing block
+///   `b`, set `new_ckpt = b - 1`, `earliest_gap = Some(b)`, mark signatures of later batches as
+///   stale, and stop.
 pub(crate) struct StartupCheckpointResult {
     pub(crate) new_ckpt: u64,
     pub(crate) stale_signature_indexes: Vec<u64>,
+    /// First missing block number in an unsigned pending batch, if any.
     pub(crate) earliest_gap: Option<u64>,
 }
 
 pub(crate) fn normalize_startup_checkpoint(
     current_ckpt: u64,
     pending: &[accumulator::PendingBatch],
-    dispatched_ranges: &[(u64, u64)],
     response_blocks: &HashSet<u64>,
     signed_batch_indexes: &HashSet<u64>,
 ) -> StartupCheckpointResult {
-    let mut present_set: HashSet<u64> =
-        dispatched_ranges.iter().flat_map(|&(f, t)| f..=t).collect();
-    // Signed pending batches have their responses early-purged right after
-    // signing (see `on_sign_done`), so treat their full block range as
-    // present — the work is complete even though no response rows remain.
-    for batch in pending {
-        if signed_batch_indexes.contains(&batch.batch_index) {
-            present_set.extend(batch.from_block..=batch.to_block);
-        }
-    }
-    let present = |b: u64| response_blocks.contains(&b) || present_set.contains(&b);
+    let mut new_ckpt = current_ckpt;
+    let mut earliest_gap = None;
+    let mut stale_signature_indexes = Vec::new();
 
-    let mut earliest_gap: Option<u64> = None;
-    let mut gapped_batches: Vec<u64> = Vec::new();
-    for batch in pending {
-        // Signed batches are complete by construction — skip the gap scan so
-        // their signatures are never marked stale.
+    for (i, batch) in pending.iter().enumerate() {
         if signed_batch_indexes.contains(&batch.batch_index) {
+            new_ckpt = batch.to_block;
             continue;
         }
+
         let mut batch_has_gap = false;
         for b in batch.from_block..=batch.to_block {
-            if present(b) {
+            if response_blocks.contains(&b) {
+                new_ckpt = b;
                 continue;
             }
+            earliest_gap = Some(b);
+            new_ckpt = b.saturating_sub(1);
             batch_has_gap = true;
-            earliest_gap = Some(match earliest_gap {
-                Some(cur) => cur.min(b),
-                None => b,
-            });
+            break;
         }
-        if batch_has_gap {
-            gapped_batches.push(batch.batch_index);
-        }
-    }
 
-    let mut new_ckpt = current_ckpt;
-    let mut stale_signature_indexes = Vec::new();
-    if let Some(gap) = earliest_gap {
-        let rollback = gap.saturating_sub(1);
-        if rollback < new_ckpt {
-            new_ckpt = rollback;
-            stale_signature_indexes = gapped_batches;
+        if batch_has_gap {
+            stale_signature_indexes = pending[i..]
+                .iter()
+                .filter(|b| signed_batch_indexes.contains(&b.batch_index))
+                .map(|b| b.batch_index)
+                .collect();
+            break;
         }
-    }
-    while present(new_ckpt + 1) {
-        new_ckpt += 1;
     }
 
     StartupCheckpointResult { new_ckpt, stale_signature_indexes, earliest_gap }
@@ -711,39 +685,33 @@ mod tests {
     }
 
     #[test]
-    fn gap_below_lbe_rolls_back_not_forward() {
-        // Pathological ordering: gap at block 50 inside a pending batch,
-        // but checkpoint is already at 100 (as if a prior run advanced past
-        // blocks for which responses were later lost).
-        // The fix must pull the checkpoint DOWN to 49, not leave it at 100.
+    fn fallback_rolls_back_on_block_gap_below_current_ckpt() {
+        // Fallback path (no signed batches): gap at block 50, ckpt=100.
         let pending = [batch(5, 40, 60)];
-        let dispatched: Vec<(u64, u64)> = vec![];
         let mut response_blocks = HashSet::new();
         for b in 40..=49 {
             response_blocks.insert(b);
         }
-        // blocks 50..=60 missing — pretend the response store lost them.
         let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(100, &pending, &dispatched, &response_blocks, &signed);
+        let r = normalize_startup_checkpoint(100, &pending, &response_blocks, &signed);
 
         assert_eq!(r.earliest_gap, Some(50));
-        assert_eq!(r.new_ckpt, 49, "must roll back to gap-1, not stay at current_ckpt");
-        assert_eq!(r.stale_signature_indexes, vec![5]);
+        assert_eq!(r.new_ckpt, 49);
+        assert!(r.stale_signature_indexes.is_empty());
     }
 
     #[test]
-    fn walk_forward_stops_at_first_missing_block() {
-        let pending: Vec<PendingBatch> = vec![];
-        let dispatched = vec![(11u64, 15u64)];
+    fn fallback_walk_forward_advances_over_contiguous_responses() {
+        // All blocks 11..=20 are in responses; ckpt starts at 10.
+        let pending = [batch(1, 11, 20)];
         let mut response_blocks = HashSet::new();
-        for b in 16..=20 {
+        for b in 11..=20 {
             response_blocks.insert(b);
         }
-        // contiguous: 11..=20 present; 21 missing.
         let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(10, &pending, &dispatched, &response_blocks, &signed);
+        let r = normalize_startup_checkpoint(10, &pending, &response_blocks, &signed);
 
         assert_eq!(r.new_ckpt, 20);
         assert!(r.earliest_gap.is_none());
@@ -751,95 +719,164 @@ mod tests {
     }
 
     #[test]
-    fn no_gap_no_rollback_keeps_current_ckpt() {
+    fn fallback_no_gap_keeps_current_ckpt() {
         let pending = [batch(1, 5, 10)];
-        let dispatched: Vec<(u64, u64)> = vec![];
         let mut response_blocks = HashSet::new();
         for b in 5..=10 {
             response_blocks.insert(b);
         }
         let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(10, &pending, &dispatched, &response_blocks, &signed);
+        let r = normalize_startup_checkpoint(10, &pending, &response_blocks, &signed);
 
         assert_eq!(r.new_ckpt, 10);
         assert!(r.earliest_gap.is_none());
     }
 
     #[test]
-    fn gap_above_current_ckpt_does_not_rollback() {
-        // Gap at block 50, but current_ckpt is already 30 (below the gap).
-        // No rollback needed — the driver will naturally re-execute 31..50.
+    fn fallback_gap_above_current_ckpt_advances_ckpt_to_gap_minus_one() {
         let pending = [batch(3, 40, 60)];
-        let dispatched: Vec<(u64, u64)> = vec![];
         let mut response_blocks = HashSet::new();
         for b in 40..=49 {
             response_blocks.insert(b);
         }
         let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(30, &pending, &dispatched, &response_blocks, &signed);
+        let r = normalize_startup_checkpoint(30, &pending, &response_blocks, &signed);
 
         assert_eq!(r.earliest_gap, Some(50));
-        assert_eq!(r.new_ckpt, 30, "should not lower below current_ckpt");
-        assert!(r.stale_signature_indexes.is_empty(), "no rollback → no stale sigs");
+        assert_eq!(r.new_ckpt, 49);
+        assert!(r.stale_signature_indexes.is_empty());
     }
 
     #[test]
-    fn walk_forward_after_rollback_does_not_jump_past_gap() {
-        // Two pending batches, gap in the first. Walk-forward from the
-        // rolled-back checkpoint must NOT advance past the gap.
+    fn fallback_walk_forward_after_rollback_does_not_jump_past_gap() {
         let pending = [batch(1, 10, 20), batch(2, 21, 30)];
-        let dispatched: Vec<(u64, u64)> = vec![];
         let mut response_blocks = HashSet::new();
         for b in 10..=14 {
             response_blocks.insert(b);
         }
-        // gap at 15..20; 21..30 also missing.
         let signed = HashSet::new();
 
-        let r = normalize_startup_checkpoint(25, &pending, &dispatched, &response_blocks, &signed);
+        let r = normalize_startup_checkpoint(25, &pending, &response_blocks, &signed);
 
         assert_eq!(r.earliest_gap, Some(15));
-        assert_eq!(r.new_ckpt, 14, "must stop at gap-1, not re-advance to 25");
-        // Only batch 1 contains the earliest gap; batch 2 also has a gap and
-        // is reported as well (all batches containing any gap).
-        assert!(r.stale_signature_indexes.contains(&1));
-        assert!(r.stale_signature_indexes.contains(&2));
+        assert_eq!(r.new_ckpt, 14);
+        assert!(r.stale_signature_indexes.is_empty());
     }
 
     #[test]
-    fn signed_pending_batch_is_not_treated_as_gap() {
-        // Regression: on `on_sign_done`, responses for a signed batch are
-        // early-purged while the batch row stays in `pending_batches` until
-        // dispatched. At startup the gap scan must NOT flag the signed batch
-        // as stale, its signature must NOT be deleted, and the checkpoint
-        // must walk forward over the signed range.
+    fn signed_single_batch_anchors_at_its_to_block() {
         let pending = [batch(7, 100, 110)];
-        let dispatched: Vec<(u64, u64)> = vec![];
-        let response_blocks = HashSet::new(); // all responses purged post-signing
-        let signed: HashSet<u64> = [7].into_iter().collect();
-
-        let r = normalize_startup_checkpoint(99, &pending, &dispatched, &response_blocks, &signed);
-
-        assert!(r.earliest_gap.is_none(), "signed batch must not register as a gap");
-        assert!(r.stale_signature_indexes.is_empty(), "signed batch signature must be preserved");
-        assert_eq!(r.new_ckpt, 110, "checkpoint must walk forward across the signed range");
-    }
-
-    #[test]
-    fn signed_batch_before_unsigned_gap_still_detects_gap() {
-        // Signed batch 7 (100..=110) is complete (responses purged).
-        // Unsigned batch 8 (111..=120) has no responses — real gap at 111.
-        let pending = [batch(7, 100, 110), batch(8, 111, 120)];
-        let dispatched: Vec<(u64, u64)> = vec![];
         let response_blocks = HashSet::new();
         let signed: HashSet<u64> = [7].into_iter().collect();
 
-        let r = normalize_startup_checkpoint(115, &pending, &dispatched, &response_blocks, &signed);
+        let r = normalize_startup_checkpoint(99, &pending, &response_blocks, &signed);
 
-        assert_eq!(r.earliest_gap, Some(111));
-        assert_eq!(r.new_ckpt, 110, "walk must stop at the signed batch's last block");
-        assert_eq!(r.stale_signature_indexes, vec![8], "only the unsigned gap batch is stale");
+        assert_eq!(r.new_ckpt, 110);
+        assert!(r.earliest_gap.is_none());
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn signed_reports_block_gap_inside_next_pending_batch() {
+        // Signed 7 (100..=110) + unsigned 8 (111..=120), no responses for 8.
+        // Anchor at 110; earliest_gap = first missing block in batch 8 = 111.
+        let pending = [batch(7, 100, 110), batch(8, 111, 120)];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [7].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(115, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 110);
+        assert_eq!(r.earliest_gap, Some(111), "first missing block in batch N+1");
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn signed_next_batch_fully_present_walks_through_responses() {
+        // Signed 7 (100..=110), unsigned 8 (111..=120) fully in responses.
+        // Walk-forward advances ckpt through batch 8's response blocks.
+        let pending = [batch(7, 100, 110), batch(8, 111, 120)];
+        let mut response_blocks = HashSet::new();
+        for b in 111..=120 {
+            response_blocks.insert(b);
+        }
+        let signed: HashSet<u64> = [7].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(105, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 120);
+        assert!(r.earliest_gap.is_none());
+    }
+
+    #[test]
+    fn signed_batch_index_gap_in_pending_is_not_detected() {
+        // batch_signatures = {101, 102, 104}; batch 103 missing from pending.
+        // Simple single-pass walk advances through all signed batches without
+        // cross-checking batch-index contiguity — ckpt reaches last signed
+        // batch's to_block, no gap reported.
+        let pending = [batch(101, 100, 110), batch(102, 111, 120), batch(104, 131, 140)];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [101, 102, 104].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(140, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 140);
+        assert!(r.stale_signature_indexes.is_empty());
+        assert!(r.earliest_gap.is_none());
+    }
+
+    #[test]
+    fn unsigned_batch_between_signed_reports_block_gap_and_marks_later_signed_stale() {
+        // Signed {101, 102, 104}, unsigned 103 in pending with partial
+        // responses 121..=125. Walk anchors to 102.to_block=120, advances
+        // through 103's responses to 125, stops at missing 126. Signature of
+        // 104 is stale since it sits past the gap.
+        let pending = [
+            batch(101, 100, 110),
+            batch(102, 111, 120),
+            batch(103, 121, 130),
+            batch(104, 131, 140),
+        ];
+        let mut response_blocks = HashSet::new();
+        for b in 121..=125 {
+            response_blocks.insert(b);
+        }
+        let signed: HashSet<u64> = [101, 102, 104].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(140, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 125);
+        assert_eq!(r.stale_signature_indexes, vec![104]);
+        assert_eq!(r.earliest_gap, Some(126), "first missing block in batch 103");
+    }
+
+    #[test]
+    fn signed_all_contiguous_anchors_at_max_no_gap() {
+        let pending = [batch(101, 100, 110), batch(102, 111, 120), batch(103, 121, 130)];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [101, 102, 103].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(50, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 130);
+        assert!(r.earliest_gap.is_none());
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn signed_anchor_missing_from_pending_falls_through_to_fallback() {
+        // Signed = {101} but batch 101 is not in pending (dispatched+removed).
+        // Signed-first path can't anchor → fallback takes over.
+        let pending: Vec<PendingBatch> = vec![];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [101].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(77, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 77, "fallback has no pending to scan, ckpt unchanged");
+        assert!(r.earliest_gap.is_none());
+        assert!(r.stale_signature_indexes.is_empty());
     }
 }

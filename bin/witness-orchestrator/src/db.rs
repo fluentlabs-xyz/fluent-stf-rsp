@@ -769,20 +769,4 @@ impl Db {
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
     }
-
-    /// Return `(from_block, to_block)` for every dispatched batch — needed
-    /// by startup gap recovery to exclude these ranges from gap detection.
-    pub(crate) fn load_dispatched_block_ranges(&self) -> Vec<(u64, u64)> {
-        let mut stmt =
-            match self.conn.prepare("SELECT from_block, to_block FROM dispatched_batches") {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(err = %e, "load_dispatched_block_ranges prepare failed");
-                    return vec![];
-                }
-            };
-        stmt.query_map([], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)))
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-    }
 }
