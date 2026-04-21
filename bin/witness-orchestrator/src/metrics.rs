@@ -38,6 +38,16 @@ pub(crate) const SIGN_BATCH_ROOT_DURATION: &str = "orchestrator_sign_batch_root_
 // Errors
 pub(crate) const SIGN_FAILURES_TOTAL: &str = "orchestrator_sign_failures_total";
 pub(crate) const L1_DISPATCH_REJECTED_TOTAL: &str = "orchestrator_l1_dispatch_rejected_total";
+/// Counter for every `preconfirmBatch` broadcast attempt that the L1 RPC
+/// rejected before the tx reached the mempool. Labeled by `kind` (see
+/// [`broadcast_failure_kind`]) so `nonce_too_low` spikes are distinguishable
+/// from transient network failures and from stuck-at-cap giveups.
+///
+/// Alert suggestion:
+/// `rate(orchestrator_l1_broadcast_failures_total[5m]) > 0.05` warns on a
+/// sustained L1 send problem; filtering `kind="nonce_too_low"` catches the
+/// exact race the `NonceAllocator` was introduced to prevent.
+pub(crate) const L1_BROADCAST_FAILURES_TOTAL: &str = "orchestrator_l1_broadcast_failures_total";
 
 // Cost
 pub(crate) const L1_DISPATCH_COST_ETH_TOTAL: &str = "orchestrator_l1_dispatch_cost_eth_total";
@@ -132,6 +142,11 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
         L1_DISPATCH_REJECTED_TOTAL,
         "preconfirmBatch txs that were mined with status=0 (on-chain revert)"
     );
+    metrics::describe_counter!(
+        L1_BROADCAST_FAILURES_TOTAL,
+        "preconfirmBatch broadcast attempts rejected by the L1 RPC before mempool \
+         admission. Labels: kind=nonce_too_low|stuck_at_cap|other"
+    );
 
     metrics::describe_counter!(
         L1_DISPATCH_COST_ETH_TOTAL,
@@ -200,6 +215,17 @@ pub(crate) fn observe_dispatch_cost(receipt: &TransactionReceipt) {
     let eth = wei_to_eth_f64(wei);
     metrics::counter!(L1_DISPATCH_COST_ETH_TOTAL).increment(eth as u64);
     metrics::histogram!(L1_DISPATCH_COST_ETH).record(eth);
+}
+
+/// Classify a `send_raw_transaction` failure string into a stable label
+/// suitable for the `kind` field of [`L1_BROADCAST_FAILURES_TOTAL`].
+/// Keeps cardinality bounded — any unclassified error collapses to `other`.
+pub(crate) fn broadcast_failure_kind(err: &str) -> &'static str {
+    if l1_rollup_client::is_nonce_too_low_error(err) {
+        "nonce_too_low"
+    } else {
+        "other"
+    }
 }
 
 /// Best-effort conversion of a wei U256 to ETH as f64.

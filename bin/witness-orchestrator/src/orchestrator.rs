@@ -41,7 +41,7 @@ use crate::{
 };
 use l1_rollup_client::{
     batch_status, broadcast_preconfirm, build_preconfirm_tx, find_batch_preconfirm_event,
-    get_batch_on_chain, nitro_verifier::is_key_registered,
+    get_batch_on_chain, is_nonce_too_low_error, nitro_verifier::is_key_registered, NonceAllocator,
 };
 
 use alloy_eips::BlockNumberOrTag;
@@ -76,9 +76,21 @@ pub(crate) type L1WriteProvider = FillProvider<
     Ethereum,
 >;
 
-/// Time window before a persistently missing receipt is treated as a reorg
-/// and the batch is undispatched.
-const RECEIPT_MISSING_WINDOW: Duration = Duration::from_secs(60);
+/// Time window after which a still-missing receipt triggers a single warn-level
+/// log per batch (then resets). With RBF in place the worker owns the broadcast
+/// lifecycle, so this is purely a visibility aid — no action is taken. The
+/// value is chosen to be meaningfully larger than a normal fee-bump climb to
+/// the configured cap, so the log fires only on genuinely stuck dispatches
+/// rather than on every in-flight bump cycle.
+const RECEIPT_MISSING_WINDOW: Duration = Duration::from_secs(600);
+
+/// Maximum wall-clock time the RBF worker will keep rebroadcasting at the
+/// fee cap after the cap is first reached. Once this elapses with no
+/// receipt, the worker returns `Failed` so the main loop can undispatch,
+/// apply global backoff, and retry from scratch (including re-running
+/// pre-flight reconciliation). Prevents a stuck-at-cap worker from running
+/// forever against a mempool that refuses to mine it.
+const STUCK_AT_CAP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Number of persistent execution workers sending blocks to the Nitro proxy.
 pub(crate) const EXECUTION_WORKERS: usize = 32;
@@ -539,6 +551,22 @@ pub(crate) async fn run(
     let mut finalization_ticker = tokio::time::interval(Duration::from_secs(30));
     finalization_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Seed the nonce allocator from the max of (RPC pending, persisted
+    // dispatched nonces + 1). Runs BEFORE the resume-worker spawn loop so
+    // the first fresh dispatch after restart never collides with a resume
+    // worker's in-mempool tx.
+    let stored_nonce_floor: Option<u64> =
+        accumulator.dispatched.values().filter_map(|d| d.nonce).max().map(|n| n + 1);
+    let nonce_allocator = Arc::new(
+        NonceAllocator::bootstrap(
+            &config.l1_provider,
+            config.l1_signer_address,
+            stored_nonce_floor,
+        )
+        .await
+        .expect("NonceAllocator bootstrap failed — L1 RPC unreachable at startup"),
+    );
+
     let mut state = OrchestratorState {
         config: config.clone(),
         db: Arc::clone(&db),
@@ -562,6 +590,7 @@ pub(crate) async fn run(
         known_responses: Arc::clone(&known_responses),
         last_batch_end,
         shutdown: shutdown.clone(),
+        nonce_allocator,
     };
 
     // Startup resume: for every still-dispatched batch with persisted RBF
@@ -742,6 +771,13 @@ struct OrchestratorState {
     /// after DB wipe — the supervisor restarts the process, and the startup
     /// path picks up the persisted `start_batch_id` + `l1_checkpoint`.
     shutdown: CancellationToken,
+    /// Single writer for L1 signer nonces across all dispatch paths. Fresh
+    /// dispatches pull their nonce via [`NonceAllocator::allocate`]; resume
+    /// dispatches carry the persisted nonce verbatim. Avoids the RPC
+    /// `get_transaction_count(pending)` race that historically surfaced as
+    /// "nonce too low" errors when resume workers and a fresh worker shared
+    /// the same signer against a load-balanced RPC endpoint.
+    nonce_allocator: Arc<NonceAllocator>,
 }
 
 impl OrchestratorState {
@@ -1086,6 +1122,7 @@ impl OrchestratorState {
         let max_fee_cap = self.config.rbf_max_fee_per_gas_wei;
         let done_tx = self.dispatch_done_tx.clone();
         let bump_tx = self.rbf_bump_tx.clone();
+        let nonce_allocator = Arc::clone(&self.nonce_allocator);
         let is_resume = resume.is_some();
 
         tokio::spawn(async move {
@@ -1104,6 +1141,7 @@ impl OrchestratorState {
                 cancel,
                 bump_tx,
                 resume,
+                &nonce_allocator,
             )
             .await
             .unwrap_or_else(|e| {
@@ -1489,14 +1527,21 @@ async fn apply_finalization_changes(
                 // and is the sole authority on "is this tx landed". Force-
                 // undispatching here would collide on the same nonce the RBF
                 // worker is still bumping against. Log only; the worker will
-                // either eventually land the tx (at cap) or be cancelled.
+                // either eventually land the tx or bail via STUCK_AT_CAP_TIMEOUT,
+                // at which point main applies backoff + retry.
+                //
+                // warn-level (not error) because this branch takes no action —
+                // the RBF worker is authoritative. STUCK_AT_CAP_TIMEOUT caps
+                // the actual stuck-forever failure mode. RECEIPT_MISSING_WINDOW
+                // is deliberately chosen to be > a full cap climb so this log
+                // fires only on genuinely stalled dispatches.
                 if elapsed >= RECEIPT_MISSING_WINDOW {
-                    error!(
+                    warn!(
                         batch_index,
                         %tx_hash,
                         elapsed_secs = elapsed.as_secs(),
-                        "Receipt missing beyond window — RBF worker should still be active; \
-                         inspect logs"
+                        "Receipt still missing beyond window — RBF worker owns recovery; \
+                         inspect RBF logs for batch"
                     );
                     // Reset timer so this logs at most once per window.
                     missing_receipt_first_seen.insert(batch_index, now);
@@ -1789,6 +1834,7 @@ async fn run_rbf_dispatch(
     cancel: CancellationToken,
     bump_tx: mpsc::Sender<(u64, RbfBumpEvent)>,
     resume: Option<RbfResumeState>,
+    nonce_allocator: &NonceAllocator,
 ) -> eyre::Result<DispatchOutcome> {
     // Pre-flight on-chain reconciliation.
     //
@@ -1919,25 +1965,52 @@ async fn run_rbf_dispatch(
         }
     }
 
-    let template = build_preconfirm_tx(
+    // Nonce assignment: fresh dispatches pull from the shared allocator (a
+    // single-writer `fetch_add`, so no race against concurrent resume workers);
+    // resume carries the persisted nonce verbatim so rebroadcast replaces the
+    // already-in-mempool tx.
+    let nonce = match resume {
+        Some(r) => r.nonce,
+        None => nonce_allocator.allocate(),
+    };
+
+    // For fresh dispatches, any failure before `broadcast_preconfirm` succeeds
+    // must return the allocated nonce so future allocations don't skip a slot
+    // (which would leave the signer's outbox wedged until manual top-up).
+    // `release` is a tail-CAS: it closes the gap only when no other allocation
+    // raced in between, which is the common case under `dispatching_batch`
+    // serialization.
+    let template = match build_preconfirm_tx(
         provider,
         contract,
         verifier,
         batch_index,
         signature,
         signer_addr,
-        resume.map(|r| r.nonce),
+        nonce,
     )
-    .await?;
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            if resume.is_none() {
+                nonce_allocator.release(nonce);
+            }
+            return Err(e);
+        }
+    };
 
     let (mut max_fee_per_gas, mut max_priority_fee_per_gas, initial_hash, emit_initial) =
         match resume {
             Some(r) => (r.max_fee_per_gas, r.max_priority_fee_per_gas, r.tx_hash, false),
             None => {
-                let est = provider
-                    .estimate_eip1559_fees()
-                    .await
-                    .map_err(|e| eyre::eyre!("estimate_eip1559_fees failed: {e}"))?;
+                let est = match provider.estimate_eip1559_fees().await {
+                    Ok(est) => est,
+                    Err(e) => {
+                        nonce_allocator.release(nonce);
+                        return Err(eyre::eyre!("estimate_eip1559_fees failed: {e}"));
+                    }
+                };
                 let mut fee = est.max_fee_per_gas;
                 let mut tip = est.max_priority_fee_per_gas;
                 if fee >= max_fee_cap {
@@ -1950,7 +2023,40 @@ async fn run_rbf_dispatch(
                         max_fee_cap, "RBF: initial fee at/above cap — clamping and proceeding"
                     );
                 }
-                let hash = broadcast_preconfirm(provider, signer, &template, fee, tip).await?;
+                let hash = match broadcast_preconfirm(provider, signer, &template, fee, tip).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        metrics::counter!(
+                            crate::metrics::L1_BROADCAST_FAILURES_TOTAL,
+                            "kind" => crate::metrics::broadcast_failure_kind(&msg),
+                        )
+                        .increment(1);
+                        if is_nonce_too_low_error(&msg) {
+                            // Our `pending` view was stale; chain is ahead.
+                            // Resync the allocator so the next fresh dispatch
+                            // skips any consumed slots rather than replaying
+                            // the same error.
+                            if let Err(sync_err) =
+                                nonce_allocator.resync(provider, signer_addr).await
+                            {
+                                warn!(
+                                    batch_index,
+                                    err = %sync_err,
+                                    "NonceAllocator resync after nonce-too-low failed"
+                                );
+                            }
+                            // Do NOT release: a tx at this nonce already
+                            // exists on-chain (whoever beat us to it). The
+                            // caller will observe Failed, undispatch, and
+                            // pre-flight reconciliation on the next retry
+                            // will surface AlreadyPreconfirmed if it was us.
+                        } else {
+                            nonce_allocator.release(nonce);
+                        }
+                        return Err(eyre::eyre!("initial broadcast failed: {msg}"));
+                    }
+                };
                 info!(
                     batch_index,
                     nonce = template.nonce,
@@ -1964,6 +2070,11 @@ async fn run_rbf_dispatch(
         };
 
     let mut at_cap_logged = max_fee_per_gas >= max_fee_cap;
+    // When bumping clamps to the cap for the first time, we stamp the
+    // instant so a subsequent stuck-at-cap window can time out the worker
+    // rather than loop forever against a mempool that refuses to mine.
+    let mut stuck_at_cap_since: Option<tokio::time::Instant> =
+        at_cap_logged.then(tokio::time::Instant::now);
 
     if emit_initial &&
         bump_tx
@@ -2037,25 +2148,53 @@ async fn run_rbf_dispatch(
             }
         }
 
+        // Bail if we've been pinned at the fee cap for longer than the
+        // configured timeout. Returning Failed here lets the main loop
+        // undispatch, apply global backoff, and re-run pre-flight
+        // reconciliation on retry — which will surface AlreadyPreconfirmed
+        // if a bumped hash we stopped tracking actually landed.
+        if let Some(since) = stuck_at_cap_since {
+            let elapsed = since.elapsed();
+            if elapsed >= STUCK_AT_CAP_TIMEOUT {
+                metrics::counter!(
+                    crate::metrics::L1_BROADCAST_FAILURES_TOTAL,
+                    "kind" => "stuck_at_cap",
+                )
+                .increment(1);
+                warn!(
+                    batch_index,
+                    elapsed_secs = elapsed.as_secs(),
+                    stuck_at_cap_timeout_secs = STUCK_AT_CAP_TIMEOUT.as_secs(),
+                    "RBF: stuck at fee cap past timeout — giving up so main can retry"
+                );
+                return Ok(DispatchOutcome::Failed);
+            }
+        }
+
         let (new_fee, new_tip, clamped) =
             bump_fees(max_fee_per_gas, max_priority_fee_per_gas, bump_percent, max_fee_cap);
         max_fee_per_gas = new_fee;
         max_priority_fee_per_gas = new_tip;
 
-        if clamped && !at_cap_logged {
-            warn!(
-                batch_index,
-                max_fee_cap, "RBF: fee cap reached — continuing to rebroadcast at cap"
-            );
-            if bump_tx
-                .send((batch_index, RbfBumpEvent::CapReached { max_fee_per_gas: max_fee_cap }))
-                .await
-                .is_err()
-            {
-                warn!(batch_index, "RBF bump channel closed after CapReached — aborting");
-                return Ok(DispatchOutcome::Failed);
+        if clamped {
+            if stuck_at_cap_since.is_none() {
+                stuck_at_cap_since = Some(tokio::time::Instant::now());
             }
-            at_cap_logged = true;
+            if !at_cap_logged {
+                warn!(
+                    batch_index,
+                    max_fee_cap, "RBF: fee cap reached — continuing to rebroadcast at cap"
+                );
+                if bump_tx
+                    .send((batch_index, RbfBumpEvent::CapReached { max_fee_per_gas: max_fee_cap }))
+                    .await
+                    .is_err()
+                {
+                    warn!(batch_index, "RBF bump channel closed after CapReached — aborting");
+                    return Ok(DispatchOutcome::Failed);
+                }
+                at_cap_logged = true;
+            }
         }
 
         match broadcast_preconfirm(provider, signer, &template, new_fee, new_tip).await {
@@ -2086,14 +2225,29 @@ async fn run_rbf_dispatch(
             }
             Err(e) => {
                 let msg = format!("{e}");
-                // Alloy surfaces the JSON-RPC "nonce too low" error string verbatim. It
-                // means a prior broadcast already landed — our in-mempool replacement
-                // no longer has a slot. Poll the latest observed hash for a receipt.
-                if msg.contains("nonce too low") {
+                metrics::counter!(
+                    crate::metrics::L1_BROADCAST_FAILURES_TOTAL,
+                    "kind" => crate::metrics::broadcast_failure_kind(&msg),
+                )
+                .increment(1);
+                // "nonce too low" during bump means a prior broadcast already
+                // landed — our in-mempool replacement no longer has a slot.
+                // Poll the latest observed hash for a receipt. No allocator
+                // resync here: the nonce we used was already consumed by our
+                // own earlier broadcast (fresh allocation) or stored (resume),
+                // so the allocator's counter is already ahead of it.
+                if is_nonce_too_low_error(&msg) {
                     match provider.get_transaction_receipt(current_hash).await {
                         Ok(Some(receipt)) => {
                             crate::metrics::observe_dispatch_cost(&receipt);
-                            let l1_block = receipt.block_number.unwrap_or(0);
+                            let Some(l1_block) = receipt.block_number else {
+                                warn!(
+                                    batch_index,
+                                    %current_hash,
+                                    "RBF: nonce-too-low + receipt without block_number — retrying next interval"
+                                );
+                                continue;
+                            };
                             if receipt.status() {
                                 return Ok(DispatchOutcome::Submitted {
                                     tx_hash: current_hash,

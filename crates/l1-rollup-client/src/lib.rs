@@ -19,6 +19,8 @@ pub mod nitro_verifier;
 
 pub use nitro_verifier::is_key_registered;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSigner;
@@ -27,7 +29,8 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::{Filter, TransactionRequest};
 use alloy_sol_types::{sol, SolCall, SolEvent};
 use eyre::{eyre, Result};
-use tracing::info;
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::{info, warn};
 
 // =====================================================================
 // Contract ABI (Rollup.sol @ release/v1.0.0)
@@ -436,13 +439,14 @@ pub struct PreconfirmTxTemplate {
     pub batch_index: u64,
 }
 
-/// Build the calldata + nonce + gas-limit for a `preconfirmBatch` dispatch.
+/// Build the calldata + gas-limit for a `preconfirmBatch` dispatch using an
+/// explicit `nonce` supplied by the caller.
 ///
-/// When `stored_nonce` is `Some`, use it verbatim — this is the startup-
-/// resume path, where we must replay against the same nonce that the
-/// pre-restart tx was signed under (so the rebroadcast is a replacement,
-/// not a fresh send at a new nonce). When `None`, query the pending
-/// transaction count to obtain a fresh nonce.
+/// Nonce allocation is intentionally lifted OUT of this helper: fresh dispatches
+/// pull from a shared [`NonceAllocator`] (so concurrent resume workers and fresh
+/// workers never race on `get_transaction_count(pending)`), and startup-resume
+/// paths pass the persisted nonce verbatim so the rebroadcast replaces the
+/// still-in-mempool tx rather than opening a new slot.
 pub async fn build_preconfirm_tx(
     provider: &impl Provider,
     contract_addr: Address,
@@ -450,7 +454,7 @@ pub async fn build_preconfirm_tx(
     batch_index: u64,
     signature: Vec<u8>,
     signer: Address,
-    stored_nonce: Option<u64>,
+    nonce: u64,
 ) -> Result<PreconfirmTxTemplate> {
     let call = preconfirmBatchCall {
         nitroVerifier: nitro_verifier_addr,
@@ -458,15 +462,6 @@ pub async fn build_preconfirm_tx(
         signature: Bytes::from(signature),
     };
     let input = Bytes::from(call.abi_encode());
-
-    let nonce = match stored_nonce {
-        Some(n) => n,
-        None => provider
-            .get_transaction_count(signer)
-            .pending()
-            .await
-            .map_err(|e| eyre!("get_transaction_count(pending) failed: {e}"))?,
-    };
 
     let chain_id = provider.get_chain_id().await.map_err(|e| eyre!("get_chain_id failed: {e}"))?;
 
@@ -480,6 +475,127 @@ pub async fn build_preconfirm_tx(
         provider.estimate_gas(est_req).await.map_err(|e| eyre!("estimate_gas failed: {e}"))?;
 
     Ok(PreconfirmTxTemplate { to: contract_addr, input, nonce, gas_limit, chain_id, batch_index })
+}
+
+/// Returns true when the JSON-RPC error string from `send_raw_transaction`
+/// indicates the signed nonce is already consumed by a landed or pending
+/// transaction. Used by the RBF worker to decide whether to resync the
+/// allocator / harvest the receipt of the winning hash.
+pub fn is_nonce_too_low_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("nonce too low") ||
+        lower.contains("nonce_too_low") ||
+        lower.contains("invalid nonce") ||
+        lower.contains("oldnonce") ||
+        lower.contains("old nonce")
+}
+
+// =====================================================================
+// Nonce allocator
+// =====================================================================
+
+/// Single writer for L1 signer nonces across the orchestrator.
+///
+/// Motivation: `provider.get_transaction_count(signer).pending()` is the only
+/// RPC-derivable "next nonce" value, but it is not a reliable single source of
+/// truth when several workers share one signer:
+///
+/// * Resume workers at startup each own a persisted nonce from a prior process lifetime; they may
+///   still be rebroadcasting into the mempool.
+/// * Load-balanced RPC endpoints can return stale `pending` counts that do not yet reflect those
+///   resume-workers' pending txs.
+/// * Mempool evictions / reorgs can briefly make `pending` non-monotonic.
+///
+/// Any of those drifts, combined with a concurrent fresh dispatch calling
+/// `get_transaction_count(pending)`, surfaces as a "nonce too low" error on
+/// broadcast — the symptom the user saw in production.
+///
+/// This allocator centralizes nonce assignment:
+///
+/// * One `AtomicU64` holds the next-to-hand-out nonce; `allocate()` is a single `fetch_add` so
+///   concurrent callers never observe the same nonce.
+/// * [`Self::bootstrap`] seeds it with `max(rpc_pending, max_stored_nonce+1)` so already-dispatched
+///   (resume) rows are respected.
+/// * [`Self::release`] returns an unused nonce on pre-broadcast failure via a tail-CAS — safe in
+///   the common case (one fresh dispatch gated by `dispatching_batch`).
+/// * [`Self::resync`] is a coarse recovery for the rare case when our view drifted past RPC (e.g.,
+///   after a reorg that evicted our pending tx); it rereads `pending` under a lock and jumps the
+///   counter forward if RPC is ahead.
+#[derive(Debug)]
+pub struct NonceAllocator {
+    next: AtomicU64,
+    resync_lock: AsyncMutex<()>,
+}
+
+impl NonceAllocator {
+    /// Seed the allocator at orchestrator startup. `stored_floor` is the
+    /// smallest nonce that is safe to hand out next — typically
+    /// `max(persisted_dispatched_nonce) + 1`, or `None` when no
+    /// dispatched rows exist. The effective start is
+    /// `max(rpc_pending, stored_floor)`.
+    pub async fn bootstrap(
+        provider: &impl Provider,
+        signer: Address,
+        stored_floor: Option<u64>,
+    ) -> Result<Self> {
+        let pending =
+            provider.get_transaction_count(signer).pending().await.map_err(|e| {
+                eyre!("NonceAllocator::bootstrap: get_transaction_count(pending): {e}")
+            })?;
+        let start = pending.max(stored_floor.unwrap_or(0));
+        info!(
+            rpc_pending = pending,
+            stored_floor = stored_floor.unwrap_or(0),
+            start,
+            "NonceAllocator bootstrapped"
+        );
+        Ok(Self { next: AtomicU64::new(start), resync_lock: AsyncMutex::new(()) })
+    }
+
+    /// Hand out the next nonce. Monotonic; never returns the same value twice.
+    pub fn allocate(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Attempt to reclaim `nonce` when a pre-broadcast step failed (e.g.,
+    /// `estimate_gas` hiccup). Only succeeds when `nonce + 1` is still the
+    /// head of the counter — if another allocation happened in between, the
+    /// gap cannot be closed and is left as-is (the next successful broadcast
+    /// at a higher nonce will eventually be unblocked by manual top-up, or
+    /// the gap is filled by an admin tx).
+    pub fn release(&self, nonce: u64) {
+        let _ = self.next.compare_exchange(nonce + 1, nonce, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Reread `pending` from RPC under a lock and advance the counter past
+    /// it. Used after a broadcast failure with "nonce too low": the chain has
+    /// moved beyond what we allocated, so future allocations must not try to
+    /// reuse any nonce below RPC's current pending.
+    pub async fn resync(&self, provider: &impl Provider, signer: Address) -> Result<u64> {
+        let _guard = self.resync_lock.lock().await;
+        let pending =
+            provider.get_transaction_count(signer).pending().await.map_err(|e| {
+                eyre!("NonceAllocator::resync: get_transaction_count(pending): {e}")
+            })?;
+        let current = self.next.load(Ordering::SeqCst);
+        let new = pending.max(current);
+        if new != current {
+            warn!(
+                old = current,
+                new,
+                rpc_pending = pending,
+                "NonceAllocator resynced past stale local view"
+            );
+            self.next.store(new, Ordering::SeqCst);
+        }
+        Ok(new)
+    }
+
+    /// Peek the next nonce that would be handed out. Test/diagnostic only.
+    #[doc(hidden)]
+    pub fn peek(&self) -> u64 {
+        self.next.load(Ordering::SeqCst)
+    }
 }
 
 /// Sign + broadcast one EIP-1559 transaction with explicit nonce + fees.
@@ -525,4 +641,50 @@ pub async fn broadcast_preconfirm(
         "broadcast_preconfirm"
     );
     Ok(tx_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_nonce_too_low_matches_common_variants() {
+        assert!(is_nonce_too_low_error("nonce too low"));
+        assert!(is_nonce_too_low_error("Nonce Too Low: expected 42"));
+        assert!(is_nonce_too_low_error(
+            "server returned an error response: error code -32000: nonce too low"
+        ));
+        assert!(is_nonce_too_low_error("invalid nonce; got 41, want 42"));
+        assert!(!is_nonce_too_low_error("insufficient funds"));
+        assert!(!is_nonce_too_low_error("already known"));
+        assert!(!is_nonce_too_low_error("replacement transaction underpriced"));
+    }
+
+    #[test]
+    fn nonce_allocator_allocate_is_monotonic() {
+        let alloc = NonceAllocator { next: AtomicU64::new(10), resync_lock: AsyncMutex::new(()) };
+        assert_eq!(alloc.allocate(), 10);
+        assert_eq!(alloc.allocate(), 11);
+        assert_eq!(alloc.allocate(), 12);
+        assert_eq!(alloc.peek(), 13);
+    }
+
+    #[test]
+    fn nonce_allocator_release_of_tail_succeeds() {
+        let alloc = NonceAllocator { next: AtomicU64::new(10), resync_lock: AsyncMutex::new(()) };
+        let n = alloc.allocate();
+        assert_eq!(n, 10);
+        alloc.release(n);
+        assert_eq!(alloc.peek(), 10, "tail release must rewind");
+        assert_eq!(alloc.allocate(), 10);
+    }
+
+    #[test]
+    fn nonce_allocator_release_of_non_tail_leaves_gap() {
+        let alloc = NonceAllocator { next: AtomicU64::new(10), resync_lock: AsyncMutex::new(()) };
+        let n0 = alloc.allocate(); // 10
+        let _n1 = alloc.allocate(); // 11
+        alloc.release(n0);
+        assert_eq!(alloc.peek(), 12, "release of non-tail must not rewind — the gap is accepted");
+    }
 }
