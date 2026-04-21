@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = ["mainnet"]
 sp1 = []
-nitro = ["fluentbase-revm/wasmtime"]
+nitro = []
 wasmtime = ["fluentbase-revm/wasmtime"]
 mainnet = ["fluent-stf-primitives/mainnet"]
 testnet = ["fluent-stf-primitives/testnet"]
