@@ -45,21 +45,22 @@
 //!
 //! | Metric | Type | Description |
 //! |--------|------|-------------|
-//! | `orchestrator_last_block_witness_built` | gauge | Latest L2 block with a witness available (fresh or cold-store reuse). |
-//! | `orchestrator_last_block_executed` | gauge | Latest L2 block executed by the proxy/enclave. |
-//! | `orchestrator_last_block_signed` | gauge | Latest L2 block with a signed `/sign-block-execution` response. |
-//! | `orchestrator_last_batch_signed` | gauge | Index of the most recently signed L1 batch. |
-//! | `orchestrator_last_batch_signed_from_block` | gauge | `from_block` of the most recently signed batch. |
-//! | `orchestrator_last_batch_signed_to_block` | gauge | `to_block` of the most recently signed batch. |
-//! | `orchestrator_last_batch_dispatched` | gauge | Index of the most recently L1-included `preconfirmBatch` (status=1). |
-//! | `orchestrator_last_batch_dispatched_from_block` | gauge | `from_block` of the most recently L1-included batch. |
-//! | `orchestrator_last_batch_dispatched_to_block` | gauge | `to_block` of the most recently L1-included batch. |
-//! | `orchestrator_sign_block_execution_duration_seconds` | histogram | Per-attempt duration of `/sign-block-execution`. |
-//! | `orchestrator_sign_batch_root_duration_seconds` | histogram | Per-attempt duration of `/sign-batch-root`. |
-//! | `orchestrator_sign_failures_total{stage,kind}` | counter | Sign-endpoint failures. `stage=block\|batch`, `kind=enclave_busy\|other`. |
-//! | `orchestrator_l1_dispatch_rejected_total` | counter | `preconfirmBatch` txs mined with status=0 (on-chain revert). |
-//! | `orchestrator_l1_dispatch_cost_eth_total` | counter | Cumulative ETH spent on L1 `preconfirmBatch` gas. |
-//! | `orchestrator_l1_dispatch_cost_eth` | histogram | Per-tx ETH cost (`gas_used × effective_gas_price / 1e18`). |
+//! | `orchestrator_last_block_witness_built` | **gauge** | Latest L2 block number for which a witness is available (built fresh or reused from cold store). |
+//! | `orchestrator_last_block_executed` | **gauge** | Latest L2 block number executed by the proxy/enclave. |
+//! | `orchestrator_last_block_signed` | **gauge** | Latest L2 block number with a signed `/sign-block-execution` response. |
+//! | `orchestrator_last_batch_signed` | **gauge** | Index of the most recently signed L1 batch (`/sign-batch-root`). |
+//! | `orchestrator_last_batch_signed_from_block` | **gauge** | `from_block` of the most recently signed batch. |
+//! | `orchestrator_last_batch_signed_to_block` | **gauge** | `to_block` of the most recently signed batch. |
+//! | `orchestrator_last_batch_dispatched` | **gauge** | Index of the most recently L1-included `preconfirmBatch` (status=1). |
+//! | `orchestrator_last_batch_dispatched_from_block` | **gauge** | `from_block` of the most recently L1-included batch. |
+//! | `orchestrator_last_batch_dispatched_to_block` | **gauge** | `to_block` of the most recently L1-included batch. |
+//! | `orchestrator_sign_block_execution_duration_seconds` | **histogram** | Per-attempt duration of `/sign-block-execution` HTTP call (seconds). |
+//! | `orchestrator_sign_batch_root_duration_seconds` | **histogram** | Per-attempt duration of `/sign-batch-root` HTTP call (seconds). |
+//! | `orchestrator_sign_failures_total` | **counter** | Sign-endpoint failures. Labels: `stage=block|batch`, `kind=enclave_busy|other`. |
+//! | `orchestrator_l1_dispatch_rejected_total` | **counter** | `preconfirmBatch` txs that were mined with status=0 (on-chain revert). |
+//! | `orchestrator_l1_broadcast_failures_total` | **counter** | `preconfirmBatch` broadcast attempts rejected by the L1 RPC before mempool admission. Labels: `kind=nonce_too_low|stuck_at_cap|other`. |
+//! | `orchestrator_l1_dispatch_cost_eth_total` | **counter** | Cumulative ETH spent on L1 `preconfirmBatch` gas. |
+//! | `orchestrator_l1_dispatch_cost_eth` | **histogram** | Per-tx ETH cost of L1 `preconfirmBatch` (`gas_used` × `effective_gas_price` / 1e18). |
 
 mod accumulator;
 mod db;
