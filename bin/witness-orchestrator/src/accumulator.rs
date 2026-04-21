@@ -99,15 +99,6 @@ impl BatchAccumulator {
             guard.load_batches().into_iter().map(|b| (b.batch_index, b)).collect();
         let pending_blobs_accepted: HashSet<u64> =
             guard.load_pending_blobs_accepted().into_iter().collect();
-        let signatures: HashMap<u64, SubmitBatchResponse> = {
-            let mut map = HashMap::new();
-            for batch in batches.values() {
-                if let Some(sig) = guard.get_batch_signature(batch.batch_index) {
-                    map.insert(batch.batch_index, sig);
-                }
-            }
-            map
-        };
         let dispatched: BTreeMap<u64, DispatchedBatch> = guard
             .load_dispatched_batches()
             .into_iter()
@@ -135,14 +126,15 @@ impl BatchAccumulator {
                 ))
             })
             .collect();
-
-        // Startup sanity: drop signature rows that reference neither a pending
-        // nor a dispatched batch.
-        let stale_sigs: Vec<u64> = guard
-            .load_batch_signature_indexes()
-            .into_iter()
-            .filter(|idx| !batches.contains_key(idx) && !dispatched.contains_key(idx))
-            .collect();
+        let mut signatures: HashMap<u64, SubmitBatchResponse> = HashMap::new();
+        let mut stale_sigs: Vec<u64> = Vec::new();
+        for (idx, resp) in guard.load_all_batch_signatures() {
+            if batches.contains_key(&idx) || dispatched.contains_key(&idx) {
+                signatures.insert(idx, resp);
+            } else {
+                stale_sigs.push(idx);
+            }
+        }
         if !stale_sigs.is_empty() {
             warn!(
                 count = stale_sigs.len(),
@@ -159,81 +151,17 @@ impl BatchAccumulator {
     }
 
     /// Register a new batch from a `BatchCommitted` event.
+    ///
+    /// Idempotent: a listener re-emission of the same `BatchCommitted`
+    /// returns early without clobbering accumulated state (especially
+    /// `blobs_accepted`). A range-mismatched re-emission is impossible by
+    /// L1 contract invariant: the contract emits `BatchReverted` before
+    /// any re-commit with a different range, which triggers a full DB
+    /// wipe + restart via `wipe_for_revert`. A fresh process therefore
+    /// never sees a range mismatch for an already-registered batch.
     pub(crate) async fn set_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
-        // Idempotent under listener re-emission: if the batch is already
-        // registered and the range matches, do nothing (re-emission must
-        // NOT clobber accumulated state, especially `blobs_accepted`).
-        // A range mismatch means an L1 reorg re-committed this batch with
-        // different contents; every higher-indexed batch is now stale and
-        // will be re-emitted on the new canonical chain. Purge pending
-        // state for indices > batch_index, plus the stale signature for
-        // batch_index itself, and fall through to re-register with the
-        // new range. Dispatched batches are handled below.
-        //
-        // Dispatched-batch shrink case: if the re-emitted batch is already
-        // dispatched and the new range differs (typically a shrinking reorg
-        // that drops the batch's tail blocks), we must undispatch it and
-        // re-register with the new range so `last_batch_end` is not
-        // prematurely advanced past blocks that are no longer committed.
-        if let Some(existing) = self.dispatched.get(&batch_index) {
-            if existing.from_block == from_block && existing.to_block == to_block {
-                return;
-            }
-            warn!(
-                batch_index,
-                existing_from = existing.from_block,
-                existing_to = existing.to_block,
-                new_from = from_block,
-                new_to = to_block,
-                "set_batch: range mismatch on dispatched batch — undispatching and re-registering"
-            );
-            self.dispatched.remove(&batch_index);
-            self.signatures.remove(&batch_index);
-            self.persist(move |db| {
-                db.undispatch_and_reregister(batch_index, from_block, to_block);
-            })
-            .await;
-            // The DB txn has already persisted the new pending row with
-            // blobs_accepted=1. Seed the in-memory state to match and return.
-            self.batches.insert(
-                batch_index,
-                PendingBatch { batch_index, from_block, to_block, blobs_accepted: true },
-            );
-            // Consume any buffered BatchSubmitted for this batch (rare on a
-            // dispatched-batch path, but possible if a fresh BatchSubmitted
-            // arrived alongside the re-commit).
-            let _ = self.pending_blobs_accepted.remove(&batch_index);
-            self.persist(move |db| db.delete_pending_blobs_accepted(batch_index)).await;
+        if self.dispatched.contains_key(&batch_index) || self.batches.contains_key(&batch_index) {
             return;
-        }
-
-        let existing_range = self.batches.get(&batch_index).map(|b| (b.from_block, b.to_block));
-        if let Some((existing_from, existing_to)) = existing_range {
-            if existing_from == from_block && existing_to == to_block {
-                return;
-            }
-            warn!(
-                batch_index,
-                existing_from,
-                existing_to,
-                new_from = from_block,
-                new_to = to_block,
-                "set_batch: range mismatch on re-registration — purging stale batches >= batch_index"
-            );
-
-            let stale: Vec<u64> =
-                self.batches.range((batch_index + 1)..).map(|(&k, _)| k).collect();
-            for idx in &stale {
-                self.batches.remove(idx);
-                self.signatures.remove(idx);
-            }
-            // Buffered BatchSubmitted events for any index > batch_index are
-            // also stale — they may not be in `batches` yet, so purge by range.
-            self.pending_blobs_accepted.retain(|&idx| idx <= batch_index);
-            // Signature for `batch_index` itself is tied to the old range — drop it.
-            self.signatures.remove(&batch_index);
-
-            self.persist(move |db| db.purge_batches_after(batch_index)).await;
         }
 
         // Consume any buffered BatchSubmitted for this batch
@@ -550,56 +478,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_batch_range_mismatch_purges_higher_batches() {
-        let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
-
-        acc.set_batch(1, 10, 19).await;
-        acc.set_batch(2, 20, 29).await;
-        acc.set_batch(3, 30, 39).await;
-        acc.mark_batch_submitted(1).await;
-        acc.mark_batch_submitted(2).await;
-        acc.mark_batch_submitted(3).await;
-
-        let sig = crate::types::SubmitBatchResponse {
-            batch_root: vec![0u8; 32],
-            versioned_hashes: vec![],
-            signature: vec![0xAA],
-        };
-        acc.cache_signature(1, sig.clone());
-        acc.cache_signature(2, sig.clone());
-        acc.cache_signature(3, sig);
-        // Buffered BatchSubmitted for a not-yet-committed higher batch.
-        acc.mark_batch_submitted(5).await;
-        assert!(acc.pending_blobs_accepted.contains(&5));
-
-        // Re-emission of batch 1 with a different range — L1 reorg.
-        acc.set_batch(1, 10, 24).await;
-
-        // Batch 1 re-registered with new range, blobs_accepted reset, signature dropped.
-        let b1 = acc.batches.get(&1).unwrap();
-        assert_eq!(b1.from_block, 10);
-        assert_eq!(b1.to_block, 24);
-        assert!(!b1.blobs_accepted);
-        assert!(!acc.signatures.contains_key(&1));
-
-        // Batches 2, 3 purged from memory and DB.
-        assert!(!acc.batches.contains_key(&2));
-        assert!(!acc.batches.contains_key(&3));
-        assert!(!acc.signatures.contains_key(&2));
-        assert!(!acc.signatures.contains_key(&3));
-        // Buffered BatchSubmitted for index 5 purged.
-        assert!(!acc.pending_blobs_accepted.contains(&5));
-
-        // Cross-check DB state survives a reload.
-        let reloaded = BatchAccumulator::with_db(Arc::clone(&db));
-        assert!(reloaded.batches.contains_key(&1));
-        assert!(!reloaded.batches.contains_key(&2));
-        assert!(!reloaded.batches.contains_key(&3));
-        assert!(!reloaded.signatures.contains_key(&1));
-    }
-
-    #[tokio::test]
     async fn not_ready_without_blobs_accepted() {
         let mut acc = BatchAccumulator::new();
         acc.set_batch(1, 10, 12).await;
@@ -878,58 +756,6 @@ mod tests {
         assert_eq!(d.l1_block, 80);
         // Pending batch should be gone (moved to dispatched)
         assert!(acc2.get(1).is_none());
-    }
-
-    #[tokio::test]
-    async fn set_batch_shrinking_range_on_dispatched_batch_undispatches() {
-        let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
-
-        // Stand up a batch through dispatch. cache_signature writes only
-        // to the in-memory map, so also write to the DB directly to mirror
-        // what sign_batch_io does via `save_batch_signature` at sign time.
-        acc.set_batch(1, 10, 20).await;
-        for b in 10..=20u64 {
-            acc.insert_response(mock_response(b)).await;
-        }
-        acc.mark_batch_submitted(1).await;
-        let sig = crate::types::SubmitBatchResponse {
-            batch_root: vec![0u8; 32],
-            versioned_hashes: vec![],
-            signature: vec![0xAA],
-        };
-        acc.cache_signature(1, sig.clone());
-        {
-            let guard = db.lock().unwrap();
-            guard.save_batch_signature(1, &sig);
-        }
-        let tx_hash = B256::from([0xCC; 32]);
-        acc.mark_dispatched(1, tx_hash, 50, 0, 0, 0).await;
-        // mark_dispatched clears the in-memory signature cache; the DB row
-        // survives and must be dropped on reorg.
-        assert!(acc.dispatched.contains_key(&1));
-        assert!(db.lock().unwrap().load_batch_signature_indexes().contains(&1));
-
-        // Shrinking-range re-commit: reorg replaced the batch with blocks 10..=15.
-        acc.set_batch(1, 10, 15).await;
-
-        // In-memory: batch moved back to pending with the NEW shorter range.
-        assert!(!acc.dispatched.contains_key(&1), "batch must leave dispatched");
-        let b1 = acc.batches.get(&1).expect("batch back in pending");
-        assert_eq!(b1.from_block, 10);
-        assert_eq!(b1.to_block, 15, "range must be rewritten to the new shorter range");
-        assert!(b1.blobs_accepted, "blob submit event already hit L1 — keep blobs_accepted");
-        assert!(!acc.signatures.contains_key(&1), "in-memory stale signature dropped");
-
-        // DB state survives reload: pending row has the new range, dispatched
-        // gone, batch_signatures row cleared.
-        let reloaded = BatchAccumulator::with_db(Arc::clone(&db));
-        assert!(!reloaded.dispatched.contains_key(&1));
-        let r1 = reloaded.batches.get(&1).expect("pending row on disk");
-        assert_eq!(r1.from_block, 10);
-        assert_eq!(r1.to_block, 15);
-        assert!(!reloaded.signatures.contains_key(&1));
-        assert!(!db.lock().unwrap().load_batch_signature_indexes().contains(&1));
     }
 
     #[tokio::test]

@@ -326,46 +326,6 @@ impl Db {
         }
     }
 
-    /// Atomically purge stale state after a batch is re-emitted with a different
-    /// range (L1 reorg at `threshold`): drops all `pending_batches > threshold`,
-    /// all `batch_signatures >= threshold` (signature for `threshold` itself is
-    /// stale because its range changed), and all `pending_blobs_accepted > threshold`.
-    /// The `threshold` row in `pending_batches` is preserved for the caller's
-    /// subsequent `save_batch` (INSERT OR REPLACE) to overwrite.
-    pub(crate) fn purge_batches_after(&mut self, threshold: u64) {
-        let tx = match self.conn.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                error!(err = %e, threshold, "purge_batches_after: begin tx failed");
-                return;
-            }
-        };
-        let ok = tx
-            .execute("DELETE FROM pending_batches WHERE batch_index > ?1", params![threshold])
-            .and_then(|_| {
-                tx.execute(
-                    "DELETE FROM batch_signatures WHERE batch_index >= ?1",
-                    params![threshold],
-                )
-            })
-            .and_then(|_| {
-                tx.execute(
-                    "DELETE FROM pending_blobs_accepted WHERE batch_index > ?1",
-                    params![threshold],
-                )
-            });
-        match ok {
-            Ok(_) => {
-                if let Err(e) = tx.commit() {
-                    error!(err = %e, threshold, "purge_batches_after: commit failed");
-                }
-            }
-            Err(e) => {
-                error!(err = %e, threshold, "purge_batches_after: delete failed — rolling back");
-            }
-        }
-    }
-
     pub(crate) fn load_batches(&self) -> Vec<PendingBatch> {
         let mut stmt = match self.conn.prepare(
             "SELECT batch_index, from_block, to_block, blobs_accepted FROM pending_batches ORDER BY batch_index",
@@ -450,6 +410,46 @@ impl Db {
             error!(err = %e, "Failed to read batch_signatures rows");
             Vec::new()
         })
+    }
+
+    /// Load every `(batch_index, SubmitBatchResponse)` row from
+    /// `batch_signatures` in a single query. Used at startup to rebuild the
+    /// in-memory signature map.
+    pub(crate) fn load_all_batch_signatures(&self) -> Vec<(u64, SubmitBatchResponse)> {
+        let mut stmt = match self.conn.prepare("SELECT batch_index, response FROM batch_signatures")
+        {
+            Ok(s) => s,
+            Err(e) => {
+                error!(err = %e, "Failed to prepare batch_signatures scan");
+                return Vec::new();
+            }
+        };
+        let iter = match stmt.query_map([], |row| {
+            let idx: u64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((idx, blob))
+        }) {
+            Ok(i) => i,
+            Err(e) => {
+                error!(err = %e, "Failed to query batch_signatures rows");
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for row in iter {
+            match row {
+                Ok((idx, blob)) => match bincode::deserialize::<SubmitBatchResponse>(&blob) {
+                    Ok(resp) => out.push((idx, resp)),
+                    Err(e) => {
+                        error!(err = %e, batch_index = idx, "Failed to deserialize batch signature");
+                    }
+                },
+                Err(e) => {
+                    error!(err = %e, "Failed to read batch_signatures row");
+                }
+            }
+        }
+        out
     }
 
     // ── Pending blobs accepted ───────────────────────────────────────────────
@@ -650,58 +650,6 @@ impl Db {
             }
             Err(e) => {
                 error!(err = %e, batch_index, "Failed to finalize dispatched batch — rolling back");
-            }
-        }
-    }
-
-    /// Move a dispatched batch back to pending AND rewrite its range, and
-    /// clear the stale signature, in one atomic transaction. Used when a
-    /// shrinking-range reorg replaces an already-dispatched batch with a
-    /// smaller one — the old signature no longer matches the new range and
-    /// must be dropped alongside the pending-row rewrite.
-    ///
-    /// `blobs_accepted = 1`: the blob submit event already hit L1 for this
-    /// batch (otherwise it could not have been dispatched); a shrinking reorg
-    /// does not typically remove the `BatchSubmitted` event.
-    pub(crate) fn undispatch_and_reregister(
-        &mut self,
-        batch_index: u64,
-        new_from_block: u64,
-        new_to_block: u64,
-    ) {
-        let tx = match self.conn.transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to begin undispatch_and_reregister tx");
-                return;
-            }
-        };
-        let ok = tx
-            .execute(
-                "DELETE FROM dispatched_batches WHERE batch_index = ?1",
-                params![batch_index],
-            )
-            .and_then(|_| {
-                tx.execute(
-                    "INSERT OR REPLACE INTO pending_batches(batch_index, from_block, to_block, blobs_accepted)
-                     VALUES(?1, ?2, ?3, 1)",
-                    params![batch_index, new_from_block, new_to_block],
-                )
-            })
-            .and_then(|_| {
-                tx.execute(
-                    "DELETE FROM batch_signatures WHERE batch_index = ?1",
-                    params![batch_index],
-                )
-            });
-        match ok {
-            Ok(_) => {
-                if let Err(e) = tx.commit() {
-                    error!(err = %e, batch_index, "Failed to commit undispatch_and_reregister");
-                }
-            }
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed undispatch_and_reregister — rolling back");
             }
         }
     }
