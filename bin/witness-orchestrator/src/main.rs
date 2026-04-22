@@ -86,6 +86,7 @@ use alloy_provider::{ProviderBuilder, RootProvider};
 use alloy_signer_local::PrivateKeySigner;
 use fluent_stf_primitives::fluent_chainspec;
 use reth_chainspec::ChainSpec;
+use reth_provider::BlockNumReader;
 use reth_tasks::Runtime;
 use rsp_host_executor::EthHostExecutor;
 use tokio::runtime::Handle;
@@ -184,6 +185,15 @@ async fn main() -> eyre::Result<()> {
         std::env::var("L1_POLL_INTERVAL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
     let l1_safe_blocks: u64 =
         std::env::var("L1_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+    let l2_safe_blocks: u64 =
+        std::env::var("L2_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+
+    // Optional destructive knob. Hard error on malformed value so a typo does
+    // not silently skip the unwind (operator would then believe it ran).
+    let unwind_to_block: Option<u64> = match std::env::var("UNWIND_TO_BLOCK") {
+        Ok(s) => Some(s.parse().map_err(|e| eyre::eyre!("UNWIND_TO_BLOCK must be a u64: {e}"))?),
+        Err(_) => None,
+    };
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(http_timeout_secs))
@@ -343,6 +353,8 @@ async fn main() -> eyre::Result<()> {
         env_start_batch_id,
         l1_deploy_block,
         witness_from_block,
+        l2_safe_blocks,
+        unwind_to_block,
         "Starting witness orchestrator"
     );
 
@@ -365,7 +377,9 @@ async fn main() -> eyre::Result<()> {
     let mut tasks: tokio::task::JoinSet<(&'static str, eyre::Result<()>)> =
         tokio::task::JoinSet::new();
 
-    // Signal handler
+    // Signal handler. Also watches the shutdown token so an internal cancel
+    // (e.g. BatchReverted handling) lets this task exit cleanly instead of
+    // blocking the final JoinSet drain forever.
     {
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
@@ -374,10 +388,18 @@ async fn main() -> eyre::Result<()> {
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                         .map_err(|e| eyre::eyre!("install SIGTERM: {e}"))?;
                 tokio::select! {
-                    _ = sigterm.recv() => info!("SIGTERM received — graceful shutdown"),
-                    _ = tokio::signal::ctrl_c() => info!("SIGINT received — graceful shutdown"),
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received — graceful shutdown");
+                        shutdown.cancel();
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("SIGINT received — graceful shutdown");
+                        shutdown.cancel();
+                    }
+                    _ = shutdown.cancelled() => {
+                        info!("Internal shutdown observed — exiting signal handler");
+                    }
                 }
-                shutdown.cancel();
                 Ok::<(), eyre::Report>(())
             }
             .await;
@@ -441,6 +463,50 @@ async fn main() -> eyre::Result<()> {
         runtime,
     )
     .expect("failed to open writable ProviderFactory");
+
+    // One-shot unwind, if requested. Must run AFTER heal_static_files_if_needed
+    // (performed inside open_writable_factory) and BEFORE Driver::new, since
+    // Driver::new snapshots `start_tip` once and never re-reads it. SQLite is
+    // NOT reconciled here — operator's responsibility.
+    //
+    // Priority:
+    //   1. Explicit `UNWIND_TO_BLOCK` env — operator override, always wins.
+    //   2. Auto-align to SQLite checkpoint — triggered when `orchestrator_checkpoint < mdbx_tip`,
+    //   so MDBX never retains blocks past the last orchestrator-confirmed watermark. Rolls MDBX
+    //   back to `orchestrator_checkpoint` (reth-CLI semantic: target is `orchestrator_checkpoint
+    //   + 1`, so the checkpoint block itself is kept and everything above is dropped).
+    let unwind_target: Option<u64> = if let Some(t) = unwind_to_block {
+        Some(t)
+    } else if orchestrator_checkpoint > 0 {
+        let mdbx_tip = factory
+            .best_block_number()
+            .map_err(|e| eyre::eyre!("startup best_block_number: {e}"))?;
+        if orchestrator_checkpoint < mdbx_tip {
+            info!(
+                orchestrator_checkpoint,
+                mdbx_tip, "MDBX ahead of SQLite checkpoint — auto-unwind to checkpoint"
+            );
+            Some(orchestrator_checkpoint)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(target) = unwind_target {
+        if target < orchestrator_checkpoint {
+            tracing::warn!(
+                target,
+                orchestrator_checkpoint,
+                "UNWIND_TO_BLOCK below orchestrator SQLite checkpoint — SQLite state is \
+                 NOT reconciled by this unwind; operator must manually reset the \
+                 orchestrator DB if stale batch/response rows matter for recovery"
+            );
+        }
+        driver::unwind_to(factory.clone(), Arc::clone(&hub), target).await?;
+    }
+
     let host_executor = Arc::new(EthHostExecutor::eth(chain_spec.clone(), None));
 
     // TODO: re-enable pruner after adding runtime coupling between MDBX
@@ -467,6 +533,7 @@ async fn main() -> eyre::Result<()> {
             pruner,
             witness_from_block,
             orchestrator_checkpoint,
+            l2_safe_blocks,
         })
         .expect("Driver::new failed"),
     );
@@ -583,19 +650,28 @@ async fn main() -> eyre::Result<()> {
         }
     }
 
-    // Drain any remaining background tasks.
-    while let Some(join) = tasks.join_next().await {
-        match join {
-            Ok((name, Ok(()))) => info!(task = name, "background task exited cleanly"),
-            Ok((name, Err(e))) => {
-                tracing::error!(task = name, err = %e, "background task exited with error");
-                exit_code = 1;
-            }
-            Err(e) => {
-                tracing::error!(err = %e, "background task join failed");
-                exit_code = 1;
+    // Drain any remaining background tasks with a hard ceiling. Axum
+    // `with_graceful_shutdown` will wait for in-flight requests to finish,
+    // and a stuck TCP peer can hold that forever. Cap the drain so the
+    // process exits even if a server hangs.
+    let drain_fut = async {
+        while let Some(join) = tasks.join_next().await {
+            match join {
+                Ok((name, Ok(()))) => info!(task = name, "background task exited cleanly"),
+                Ok((name, Err(e))) => {
+                    tracing::error!(task = name, err = %e, "background task exited with error");
+                    exit_code = 1;
+                }
+                Err(e) => {
+                    tracing::error!(err = %e, "background task join failed");
+                    exit_code = 1;
+                }
             }
         }
+    };
+    if tokio::time::timeout(Duration::from_secs(300), drain_fut).await.is_err() {
+        tracing::error!("Background tasks drain timed out after 15s — forcing shutdown");
+        exit_code = 1;
     }
 
     // Wait for catch-up to observe shutdown and exit. Aborts only if it's still

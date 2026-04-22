@@ -93,7 +93,7 @@ const RECEIPT_MISSING_WINDOW: Duration = Duration::from_secs(600);
 const STUCK_AT_CAP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Number of persistent execution workers sending blocks to the Nitro proxy.
-pub(crate) const EXECUTION_WORKERS: usize = 32;
+pub(crate) const EXECUTION_WORKERS: usize = 8;
 
 /// Bounded wait for workers to finish their in-flight HTTP calls on
 /// shutdown. Longer than a typical request, shorter than a systemd
@@ -117,9 +117,10 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 /// its normal result on a `mpsc::Sender`, a fallback payload is still sent so
 /// the main-loop gate that guards the spawn is never silently latched.
 ///
-/// Because `Drop` cannot `await`, the failure send is scheduled onto the
-/// runtime via `tokio::spawn`. Under runtime shutdown this may no-op, which
-/// is acceptable — shutdown drops the main loop anyway.
+/// `Drop` runs synchronously, so the failure send uses `try_send`. A full or
+/// closed channel is ignored — under shutdown the main loop is being torn
+/// down anyway, and the guard's single signing-at-a-time invariant means the
+/// sign-done channel always has capacity in steady state.
 struct DoneGuard<T: Send + 'static> {
     tx: mpsc::Sender<T>,
     failure: Option<T>,
@@ -137,10 +138,7 @@ impl<T: Send + 'static> DoneGuard<T> {
 impl<T: Send + 'static> Drop for DoneGuard<T> {
     fn drop(&mut self) {
         if let Some(failure) = self.failure.take() {
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(failure).await;
-            });
+            let _ = self.tx.try_send(failure);
         }
     }
 }
@@ -887,7 +885,7 @@ impl OrchestratorState {
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     db.lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .wipe_for_revert(from_batch_index, l1_block);
+                        .wipe_for_revert(from_batch_index, l1_block + 1);
                 })
                 .await
                 {
@@ -955,6 +953,7 @@ impl OrchestratorState {
         let from_block = batch.from_block;
         let to_block = batch.to_block;
         let l2_provider = cfg.l2_provider.clone();
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             let guard = DoneGuard::arm(tx.clone(), (batch_index, SignOutcome::TaskFailed));
@@ -968,6 +967,7 @@ impl OrchestratorState {
                 responses,
                 db,
                 &l2_provider,
+                &shutdown,
             )
             .await;
             if tx.send((batch_index, outcome)).await.is_ok() {
@@ -1572,6 +1572,7 @@ async fn sign_batch_io(
     responses: Vec<EthExecutionResponse>,
     db: Arc<Mutex<Db>>,
     l2_provider: &alloy_provider::RootProvider,
+    shutdown: &CancellationToken,
 ) -> SignOutcome {
     // Check for a cached signature from a previous attempt (survived crash).
     {
@@ -1596,7 +1597,10 @@ async fn sign_batch_io(
                 Ok(blobs) => break blobs,
                 Err(e) => {
                     warn!(batch_index, err = %e, ?backoff, "Blob construction failed — retrying");
-                    tokio::time::sleep(backoff).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = shutdown.cancelled() => return SignOutcome::TaskFailed,
+                    }
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
             }
@@ -1658,7 +1662,10 @@ async fn sign_batch_io(
                 )
                 .increment(1);
                 warn!(batch_index, err = %e, ?backoff, "sign-batch-root failed — retrying");
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = shutdown.cancelled() => return SignOutcome::TaskFailed,
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }

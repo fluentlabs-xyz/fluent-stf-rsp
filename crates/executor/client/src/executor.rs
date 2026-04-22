@@ -64,7 +64,7 @@ where
 
         // Initialize the witnessed database with verified storage proofs.
         let db = profile_report!(INIT_WITNESS_DB, {
-            let trie_db = input.witness_db(&sealed_headers).unwrap();
+            let trie_db = input.witness_db(&sealed_headers)?;
             WrapDatabaseRef(trie_db)
         });
 

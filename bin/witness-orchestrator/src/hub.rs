@@ -21,7 +21,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
 use crate::types::ProveRequest;
-
 const COLD_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("cold_witnesses");
 const META_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("cold_meta");
 const TOTAL_BYTES_KEY: &str = "total_bytes";
@@ -134,6 +133,43 @@ impl WitnessHub {
             std::mem::take(&mut *buf)
         };
         self.commit_entries(entries).await
+    }
+
+    /// Remove every cold entry with key strictly greater than `target`. Returns
+    /// `(removed_count, bytes_freed)`. Expected to be called at boot time
+    /// before any `push` / `push_batched` activity — buffered entries are not
+    /// considered. Updates `total_bytes` in the same redb transaction.
+    pub(crate) async fn unwind_above(&self, target: u64) -> eyre::Result<(u64, u64)> {
+        let db = Arc::clone(&self.db);
+        let join = tokio::task::spawn_blocking(move || -> Result<(u64, u64), redb::Error> {
+            let write_txn = db.begin_write()?;
+            let (count, bytes) = {
+                let mut cold = write_txn.open_table(COLD_TABLE)?;
+                let mut meta = write_txn.open_table(META_TABLE)?;
+                let stale: Vec<(u64, u64)> = cold
+                    .range((target + 1)..)?
+                    .filter_map(|r| r.ok().map(|(k, v)| (k.value(), v.value().len() as u64)))
+                    .collect();
+                let mut total_bytes = read_total_bytes(&meta)?;
+                let mut bytes_freed = 0u64;
+                for (k, size) in &stale {
+                    cold.remove(*k)?;
+                    total_bytes = total_bytes.saturating_sub(*size);
+                    bytes_freed = bytes_freed.saturating_add(*size);
+                }
+                meta.insert(TOTAL_BYTES_KEY, total_bytes)?;
+                (stale.len() as u64, bytes_freed)
+            };
+            write_txn.commit()?;
+            Ok((count, bytes))
+        })
+        .await;
+
+        match join {
+            Ok(Ok(pair)) => Ok(pair),
+            Ok(Err(e)) => Err(eyre::eyre!("cold unwind: {e}")),
+            Err(e) => Err(eyre::eyre!("cold unwind spawn_blocking join: {e}")),
+        }
     }
 
     /// Highest block number currently persisted to cold. Does NOT include
