@@ -2791,8 +2791,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-codec"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "alloy-primitives",
  "byteorder",
@@ -2804,8 +2804,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-codec-derive"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "convert_case 0.6.0",
  "crypto-hashes",
@@ -2817,8 +2817,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-crypto"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -2830,8 +2830,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-evm"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "bincode 2.0.1",
  "bitvec",
@@ -2847,8 +2847,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-revm"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -2864,8 +2864,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-runtime"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -2883,8 +2883,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-sdk"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "alloy-rlp",
  "alloy-sol-types",
@@ -2901,8 +2901,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-sdk-derive"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "alloy-sol-macro-input",
  "crypto-hashes",
@@ -2915,8 +2915,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-sdk-derive-core"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "alloy-sol-macro-input",
  "anyhow",
@@ -2938,8 +2938,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-types"
-version = "1.1.7"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#ee0b351aa766742f75d8f76d0c00931bf607064a"
+version = "1.2.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?branch=devel#7f7bfa9087d46e6f951cb477bc4f61658d140d06"
 dependencies = [
  "alloy-primitives",
  "bincode 2.0.1",
@@ -3434,7 +3434,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -5400,7 +5400,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash 2.1.2",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "socket2",
  "thiserror 2.0.18",
  "tokio",
@@ -5421,7 +5421,7 @@ dependencies = [
  "rand 0.9.4",
  "ring",
  "rustc-hash 2.1.2",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.18",
@@ -5717,7 +5717,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -5755,7 +5755,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
@@ -6548,9 +6548,9 @@ dependencies = [
 
 [[package]]
 name = "ruint"
-version = "1.17.2"
+version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c141e807189ad38a07276942c6623032d3753c8859c146104ac2e4d68865945a"
+checksum = "0298da754d1395046b0afdc2f20ee76d29a8ae310cd30ffa84ed42acba9cb12a"
 dependencies = [
  "alloy-rlp",
  "ark-ff 0.3.0",
@@ -6654,9 +6654,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.38"
+version = "0.23.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
+checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -6700,7 +6700,7 @@ dependencies = [
  "jni",
  "log",
  "once_cell",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
  "rustls-webpki 0.103.13",
@@ -6762,12 +6762,14 @@ version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6192df2a88fb3d2c72840f177f566c98f6deb1cf57cc3ad624b60cc26a37ed98"
 dependencies = [
+ "anyhow",
  "bincode 2.0.1",
  "bitvec",
  "bytes",
  "downcast-rs 2.0.2",
  "hashbrown 0.15.5",
  "libm",
+ "lru 0.16.4",
  "num-derive",
  "num-traits",
  "paste",
@@ -8299,7 +8301,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "tokio",
 ]
 
