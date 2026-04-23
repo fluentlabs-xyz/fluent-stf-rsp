@@ -46,7 +46,17 @@ build-client-docker: download-genesis-cache
 		--target sp1-client-elf-export \
 		--build-arg NETWORK=$(NETWORK) \
 		--output type=local,dest=. \
+		--no-cache \
 		-f Dockerfile .
+	@if [ -f nitro-validator-$(NETWORK).vkey ]; then \
+		python3 scripts/update_readme_vkeys.py \
+			rsp-client-$(NETWORK).vkey \
+			nitro-validator-$(NETWORK).vkey \
+			README.md \
+			$(NETWORK); \
+	else \
+		echo "note: nitro-validator-$(NETWORK).vkey missing — skipping README vkey update (run build-nitro-validator-docker to populate)"; \
+	fi
 
 # ─── Nitro validator ELF (attestation proving) ───────────────────────────────
 
@@ -58,7 +68,17 @@ build-nitro-validator-docker:
 		--target nitro-validator-elf-export \
 		--build-arg NETWORK=$(NETWORK) \
 		--output type=local,dest=. \
+		--no-cache \
 		-f Dockerfile .
+	@if [ -f rsp-client-$(NETWORK).vkey ]; then \
+		python3 scripts/update_readme_vkeys.py \
+			rsp-client-$(NETWORK).vkey \
+			nitro-validator-$(NETWORK).vkey \
+			README.md \
+			$(NETWORK); \
+	else \
+		echo "note: rsp-client-$(NETWORK).vkey missing — skipping README vkey update (run build-client-docker to populate)"; \
+	fi
 
 # ─── Nitro enclave ────────────────────────────────────────────────────────────
 
@@ -79,7 +99,8 @@ build-enclave:
 	python3 scripts/update_expected_pcr0.py \
 		$(EIF).pcrs.json \
 		bin/aws-nitro-validator/src/lib.rs \
-		$(NETWORK)
+		$(NETWORK) \
+		--readme README.md
 
 ## Build .eif inside a docker container running nixos/nix, so the host
 ## machine doesn't need Nix installed. PCR0 is identical to host-built
@@ -104,15 +125,16 @@ build-enclave-docker:
 	python3 scripts/update_expected_pcr0.py \
 		$(EIF).pcrs.json \
 		bin/aws-nitro-validator/src/lib.rs \
-		$(NETWORK)
+		$(NETWORK) \
+		--readme README.md
 
 ## Run enclave locally (debug)
 run-enclave:
 	nitro-cli run-enclave \
 		--eif-path $(EIF_PATH) \
-		--cpu-count 4 \
+		--cpu-count 6 \
 		--memory 4096 \
-		--enclave-cid 10 \
+		--enclave-cid 10
 
 # ─── Proxy ────────────────────────────────────────────────────────────────────
 

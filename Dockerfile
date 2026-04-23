@@ -228,8 +228,8 @@ COPY --from=busybox:1.37.0-musl /bin/busybox /busybox
 COPY --from=rsp-proxy-prep --chown=65532:65532 /out/var/lib/proxy /var/lib/proxy
 COPY --from=rsp-proxy-prep /out/opt/elfs /opt/elfs
 
-COPY --from=sp1-client-elf-builder      /out/sp1-client.elf       /opt/elfs/sp1-client.elf
-COPY --from=nitro-validator-elf-builder /out/nitro-validator.elf  /opt/elfs/nitro-validator.elf
+COPY rsp-client-${NETWORK}.elf       /opt/elfs/sp1-client.elf
+COPY nitro-validator-${NETWORK}.elf  /opt/elfs/nitro-validator.elf
 
 COPY --from=builder /app/proxy /usr/local/bin/proxy
 
@@ -258,6 +258,8 @@ RUN mkdir -p /out/var/lib/witness && \
 #                                                                             #
 ###############################################################################
 FROM gcr.io/distroless/cc-debian12:nonroot AS rsp-witness-orchestrator
+
+COPY --from=busybox:1.37.0-musl /bin/busybox /busybox
 
 COPY --from=rsp-witness-orchestrator-prep --chown=65532:65532 /out/var/lib/witness /var/lib/witness
 

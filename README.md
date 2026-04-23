@@ -1,92 +1,159 @@
-# Reth Succinct Processor (RSP)
+# Fluent RSP: Technical Architecture and Security Model
 
-A minimal implementation of generating zero-knowledge proofs of EVM block execution
-using [Reth](https://github.com/paradigmxyz/reth). Supports both Ethereum and OP Stack.
+## 1. Introduction: A Hybrid Optimistic Rollup
 
-> [!CAUTION]
->
-> This repository is still an active work-in-progress and is not audited or meant for production usage.
+Blockchain scaling (L2 rollups) has long been constrained by a trilemma: **throughput**, **L1 verification cost**, and **security (trustlessness)**.
+* *Pure ZK-Rollups* are mathematically rigorous, but generating a ZK proof for every transaction is computationally prohibitive and expensive.
+* *Pure TEE-Rollups* (built on enclaves) deliver extraordinary throughput, but on-chain certificate verification is too gas-heavy to be practical.
 
-## Build & Test
+**Fluent RSP (Remote State Processor)** introduces a hybrid architecture — an **optimistic rollup with TEE preconfirmations and ZK dispute resolution**.
+Hardware enclaves (AWS Nitro Enclaves) execute the State Transition Function (STF) at near-native speed, while ZK technology (SP1 zkVM) serves exclusively as the *supreme cryptographic arbiter* when disputes arise (Fault Proofs).
 
-- `cargo build --all --all-targets` — build all workspace crates
-- `cargo test --all -- --skip test_in_zkvm --nocapture` — run tests (skips zkVM tests requiring the SP1 toolchain)
-- `cargo clippy --all --all-targets -- -D warnings` — lint
-- `cargo fmt --all` — format (use `--check` to verify)
-- `make build-client` — build SP1 client ELF (dev, requires `sp1up`)
-- `make build-client-docker` — reproducible SP1 ELF build via Docker (prod)
-- `make build-enclave` — build AWS Nitro `.eif` image (requires Nix on host)
-- `make build-enclave-docker` — build AWS Nitro `.eif` via `nixos/nix` docker image (no host Nix)
-- `make build-proxy` — build the proxy binary
+---
 
-## Production Docker Compose
+## 2. Batch Lifecycle (State Machine)
 
-The [`docker-compose.yml`](docker-compose.yml) at the repo root runs the `proxy`
-and `witness-orchestrator` as two containers on a single EC2 host. The AWS Nitro
-Enclave itself runs **outside** Docker — the proxy talks to it over VSOCK via
-the host's `/dev/vsock` device.
+Every transaction batch in the L1 smart contract progresses through a strict sequence of states. Security is enforced by strict adherence to timing at each step:
 
-### Prerequisites
+1. **`Committed`**: The sequencer publishes the state commitment (the batch root).
+2. **`Submitted`**: The sequencer publishes the EIP-4844 blob-hash array, anchoring the batch's transaction data on L1.
+3. **`Preconfirmed`**: The attested enclave verifies the state and produces an ECDSA signature. The batch is considered preconfirmed.
+4. **`Challenged` (optional)**: Any participant may dispute a specific block. The batch is frozen until the dispute is mathematically resolved via SP1.
+5. **`Finalized`**: The batch becomes irreversible once the finality window elapses.
 
-- AWS EC2 instance with Nitro Enclave support, `nitro-cli` installed (any
-  version, only needed to *run* the enclave), and the allocator service
-  running.
-- Host-side Fluent node exposing its gRPC witness server on `127.0.0.1:10000`.
-- L2 RPC available (set via `RPC_URL`).
-- Build-time: `cargo-prove` (SP1 toolchain) for the SP1 ELF, and
-  [Nix](https://determinate.systems/nix/) for the enclave (the flake
-  pins every PCR0-relevant input: nixpkgs, rust toolchain, kernel/init/nsm
-  blobs via monzo/aws-nitro-util, source tree). Install Nix with:
-  `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`.
+---
 
-### One-shot build and run
+## 3. Root of Trust: PCR0 and Key Isolation
 
-```bash
-cp .env.example .env
-chmod 600 .env
-# edit .env — fill in API_KEY, L1_SUBMITTER_KEY, RPC_URL, L1_RPC_URL,
-# L1_ROLLUP_ADDR, NITRO_VERIFIER_ADDR, etc.
+In TEE-based systems, the smart contract does not trust the server operator. Trust is rooted in the inaccessibility of the private key and in **PCR0** — the cryptographic fingerprint of the code running inside the enclave.
 
-# Build reproducible ELFs + both docker images
-make compose-build NETWORK=mainnet
+### 3.1 Hardware Key Isolation and HKDF Domain Separation
 
-# Start the enclave (outside docker) — the proxy expects CID 10
-nitro-cli run-enclave --eif-path rsp-client-enclave-mainnet.eif \
-    --cpu-count 2 --memory 512 --enclave-cid 10
+The sequencer's ECDSA private key **never exists on disk**. It is deterministically derived inside the enclave's RAM from two independent entropy sources, combined through HKDF:
 
-# Start proxy + witness-orchestrator
-make compose-up
-
-# Tail logs
-make compose-logs
+```
+seed          = NSM_entropy || KMS_decrypted_material
+private_key   = HKDF-SHA256(seed, info = "fluent-rsp-signing-key-v1")
 ```
 
-### Operational notes
+- **NSM_entropy** — a unique binding to the specific AWS Nitro instance (source: `/dev/nsm`).
+- **KMS_decrypted_material** — an AWS-KMS-encrypted blob accessible to the enclave only through a role-bound KMS decrypt scoped to the AttestationDoc.
 
-- **Secrets**: `.env` holds `API_KEY` and `L1_SUBMITTER_KEY` in plaintext. It is
-  gitignored; `chmod 600` so only root/owner can read it. The values are visible
-  via `docker inspect fluent-proxy` to anyone with docker socket access — run
-  compose as root on a dedicated host.
-- **State persistence**: proxy's attestation cache and orchestrator's SQLite DB
-  live in named docker volumes (`fluent_proxy_state`, `fluent_witness_state`).
-  `compose down` preserves them; use `compose down -v` to wipe.
-- **Healthcheck is TCP-only**: the proxy container is considered "healthy"
-  when it binds port 8080. This does not verify enclave handshake success.
-  Check `docker compose logs proxy` after boot to confirm the vsock handshake.
-- **Reproducibility matters**: always use `make compose-build` (chains
-  `build-client-docker` + `build-nitro-validator-docker`), never
-  `build-client` directly — non-reproducible ELFs change PCR0 and break
-  enclave attestation. The enclave PCR0 is pinned entirely by
-  [flake.nix](flake.nix) (nixpkgs rev, rust toolchain, kernel/init blobs
-  from monzo/aws-nitro-util, source tree) — any machine with Nix produces
-  the same PCR0.
-- **Updating**: edit `.env` → `make compose-up` (compose recreates changed
-  services). For image updates, `make compose-build && make compose-up`.
-- **Gotchas**:
-  - Hardcoded enclave CID is 10 (proxy side) and 5005 is the VSOCK port;
-    `/dev/vsock` is passed through as a device.
-  - Docker < 20.10.10 seccomp profile blocks `AF_VSOCK` — host must run a
-    recent Docker daemon.
-  - `RUSTFLAGS="-C target-cpu=native"` in [Makefile](Makefile) makes the
-    `build-proxy` dev target non-portable across CPU generations — the
-    compose build uses `build-client-docker` instead, which is reproducible.
+The AWS Nitro architecture physically blocks any access to enclave RAM from the outside (including from the host's root user), so extracting the private key is impossible. The corresponding public key is embedded in the AttestationDoc, which is signed by the AWS Nitro root key. On L1, the `NitroVerifier` contract maintains a whitelist of public keys admitted through a ZK attestation proof.
+
+The logical security chain:
+1. The smart contract accepts the public key because an SP1 ZK proof attested that PCR0 matches.
+2. PCR0 guarantees that a strictly defined, immutable body of STF code is running inside the enclave.
+3. That code is programmed to produce signatures **only** over correctly computed state roots (`batchRoot`).
+4. Because the private key cannot be extracted or copied, **a valid signature from this key is an absolute guarantee that the STF was executed honestly and deterministically**.
+
+### 3.2 Code–Hardware Identity
+
+The fundamental axiom of the architecture: **Source code = PCR0**.
+Bit-for-bit reproducibility is achieved through a hermetic build pipeline based on Nix Flakes and static linking. The pipeline mathematically guarantees that unchanged source always compiles to the same PCR0 hash, regardless of the developer's machine.
+
+### 3.3 Per-Network Identities
+
+Each network has its own set of cryptographic trust anchors. The values below are updated automatically by `scripts/update_expected_pcr0.py` (for PCR0) and `scripts/update_readme_vkeys.py` (for vkeys + commit) after the corresponding make targets (`build-enclave`, `build-client-docker`, `build-nitro-validator-docker`).
+
+**mainnet**
+
+| Anchor | Value |
+|--------|-------|
+| PCR0 enclave | <!-- pcr0:mainnet:begin -->`aa60d8f3e82ff2f5bcd1b73f2766c22e72945a3c69b64663dd25d228273821d846af8e014f9a5d8c2b6d34109cb1ff42`<!-- pcr0:mainnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x0085924e73e2b0d0e2626c592825fe092d3cfb63b108757965b2a6c06c8c311b`<!-- nv-vkey:mainnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x00860c0487f78ac293a80f9655bc234cc3e73868a29d35d82b819ebe590ef4db`<!-- rsp-vkey:mainnet:end --> |
+
+**testnet**
+
+| Anchor | Value |
+|--------|-------|
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`9c4c1c41aaaabb15fd65712d1ab75ab859ef1d6b67d998f49e24818464ad13fd29274cc10ed2517991c8829f545897cf`<!-- pcr0:testnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x008059ac42a6cdda819cbc5f04f6028ea9c7fe39a092bfa3a6671d53c3707b1e`<!-- nv-vkey:testnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x001542cb5a66b9e20271941ad56b07f490701be789a6cbd61637a66e67f9eea7`<!-- rsp-vkey:testnet:end --> |
+
+**devnet**
+
+| Anchor | Value |
+|--------|-------|
+| PCR0 enclave | <!-- pcr0:devnet:begin -->`2117af8b88016a29fc3a6b7905b0a371f25c56f378ef3322b749e69ac06733a69d8602804dd244b66eebf56f605c9fcc`<!-- pcr0:devnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:devnet:begin -->`0x00709c3887953c3f1d2a14272c52d81258038e946a285b8307359fddb1d2d58d`<!-- nv-vkey:devnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:devnet:begin -->`0x0014f00929b2945b9e7716490a2a694d9b8e74ee8ada9bb35d0a036955370749`<!-- rsp-vkey:devnet:end --> |
+
+Values built from commit <!-- commit:begin -->`955c591`<!-- commit:end -->. For independent verification, run `git checkout <commit>` and follow the commands in §5.
+
+### 3.4 Identity Injection into the ZK Circuit
+
+The root of trust closes the loop at the moment of automated identity injection:
+1. The build pipeline compiles the enclave and computes its PCR0.
+2. This PCR0 is automatically injected (`scripts/update_expected_pcr0.py`) into the ZK validator source at `bin/aws-nitro-validator/src/lib.rs`, into the matching feature-gated block `#[cfg(feature = "<network>")] pub const EXPECTED_PCR0`.
+3. SP1 compiles the ZK circuit, fixing a unique verification key (`vkey`) for the `nitro-validator` guest program.
+4. The L1 `NitroVerifier` contract keeps this vkey pinned — swapping out the guest program (for example, removing the PCR0 check) would yield a different vkey and be rejected by the contract.
+
+The consequence: the ZK attestation proof is cryptographically bound to a specific audited version of the code.
+
+---
+
+## 4. Symmetric Data Availability Verification
+
+A critical property of the architecture: **blobs are verified inside Nitro exactly the same way as inside SP1**, modulo environment specifics. This guarantees an unbreakable link between STF execution and the real data on L1 (EIP-4844).
+
+### 4.1 Blob Verification Inside Nitro and On-Chain Protection
+
+The enclave is physically isolated from the external network and **does not know** which blobs the host actually published on Ethereum. It operates solely on the data the host passed over VSOCK (length-prefixed bincode: a 4-byte big-endian length prefix followed by the payload).
+
+1. **Decompression and check**: the enclave decodes the raw canonical blob data, decompresses it (Brotli), and strictly checks block hashes against the results of STF execution.
+2. **KZG commitment computation**: if the data is valid, the enclave *itself* computes KZG commitments for the blobs via `c-kzg` (C-FFI to the official Ethereum library) and derives the `versioned_hashes` from them.
+3. **Signature generation**: the enclave signs the batch, embedding the computed `versioned_hashes` into the cryptographic payload. The signed digest has the shape `ecrecover(keccak256(abi.encode(L1_CHAIN_ID, NITRO_VERIFIER_ADDRESS, batchRoot, versionedHashes)))`.
+
+**Where does the protection come from?** If a malicious host feeds the enclave correct data (and the enclave honestly produces a signature) but publishes *modified* blobs on Ethereum L1, the attack fails at the contract level. The smart contract uses the real on-chain blob hashes for the `ecrecover` call. Since the on-chain hashes will not match the ones bound inside the enclave's signature, `ecrecover` returns a random address and the contract rejects the batch.
+
+### 4.2 Zero-Knowledge Data Availability (ZK-DA) Inside SP1
+
+In a dispute, the off-chain prover (SP1) performs data-availability verification inside the ZK circuit.
+The architecture proves the following fundamental properties:
+
+1. **Deterministic state transition**: the prover mathematically proves that the State Transition Function executed flawlessly, step by step producing the claimed target block hash.
+2. **State-to-data binding**: the program proves that the target block produced by execution is physically present in the supplied data.
+3. **Cryptographic integrity (KZG)**: the prover mathematically confirms that the provided data strictly corresponds to the cryptographic commitments. Substitution or truncation of the transaction batch is impossible.
+4. **Link to L1 consensus (Public Values)**: the ZK circuit publishes the EIP-4844 blob hashes derived from the proven commitments. The contract strictly verifies these values against the real hashes permanently recorded on-chain.
+
+The SP1 guest `rsp-client` commits a flat public-values buffer:
+
+```
+parent_hash || block_hash || withdrawal_hash || deposit_hash || versioned_hashes[N]
+```
+
+(32-byte words, no ABI wrapping). The smart contract parses and checks.
+
+
+---
+
+## 5. Build Reproduction
+
+All commands below run from the repository root. To independently verify that the values in the §3.3 tables are correct, run `git checkout <commit>` and execute:
+
+```sh
+# Prerequisites: docker, python3, git, jq.
+
+# 1. SP1 ELFs for the selected network. NETWORK ∈ {mainnet, testnet, devnet}.
+make build-client-docker NETWORK=mainnet
+make build-nitro-validator-docker NETWORK=mainnet
+
+# 2. Nitro EIF.
+make build-enclave-docker NETWORK=mainnet   # runs nixos/nix inside Docker
+
+# 3. Verification.
+jq -r .PCR0 rsp-client-enclave-mainnet.eif.pcrs.json    # must match §3.3
+cat rsp-client-mainnet.vkey                             # must match §3.3
+cat nitro-validator-mainnet.vkey                        # must match §3.3
+```
+
+### 5.1 Running the Stack
+
+Docker Compose is provided for running the full stack (proxy + witness-orchestrator):
+
+```sh
+make compose-build NETWORK=mainnet   # build ELFs + docker images
+make compose-up    NETWORK=mainnet   # start in the background
+```
