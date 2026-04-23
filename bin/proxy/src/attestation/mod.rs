@@ -14,7 +14,7 @@ mod tests {
     use super::*;
 
     const ATTESTATION_BYTES: &[u8] = include_bytes!("../../testdata/attestation.bin");
-    const PUBLIC_KEY_HEX: &str = include_str!("../../testdata/public_key.hex");
+    // const PUBLIC_KEY_HEX: &str = include_str!("../../testdata/public_key.hex");
 
     #[test]
     fn test_prepare_guest_input() {
