@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rewrite the per-network vkey cells and the global `commit` cell in
+"""Rewrite the per-network vkey cells and the global `version` cell in
 the identity table of a README, from the SP1-verifier keys emitted by
 `cargo prove vkey` during `build-client-docker` /
 `build-nitro-validator-docker`.
@@ -10,21 +10,22 @@ Usage:
 Patches three sentinel blocks:
     <!-- rsp-vkey:<network>:begin -->`0x…`<!-- rsp-vkey:<network>:end -->
     <!-- nv-vkey:<network>:begin -->`0x…`<!-- nv-vkey:<network>:end -->
-    <!-- commit:begin -->`<short-sha>[-dirty]`<!-- commit:end -->
+    <!-- version:begin -->`v<release>`<!-- version:end -->
 
-Commit SHA is `git rev-parse --short HEAD`. Dirty marker is appended
-if `git status --porcelain` reports any change inside the flake source
-allowlist (bin/client, crates/, Cargo.toml, Cargo.lock) — the README
-itself and auto-patched lib.rs are intentionally excluded so that a
-previous run's rewrite does not make the next invocation look dirty.
+The release version is read from `bin/client/Cargo.toml` and validated
+against `bin/aws-nitro-validator/Cargo.toml` — they must match, since
+the two artifacts are released together and their version is what the
+README tags as the verifiable release.
 """
 import pathlib
 import re
-import subprocess
 import sys
 
 NETWORKS = ("mainnet", "testnet", "devnet")
-FLAKE_SOURCE_PATHS = ("bin/client", "crates", "Cargo.toml", "Cargo.lock")
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+CLIENT_CARGO_TOML = REPO_ROOT / "bin" / "client" / "Cargo.toml"
+NV_CARGO_TOML = REPO_ROOT / "bin" / "aws-nitro-validator" / "Cargo.toml"
 
 
 def read_vkey(path: pathlib.Path) -> str:
@@ -34,14 +35,28 @@ def read_vkey(path: pathlib.Path) -> str:
     return line.lower()
 
 
-def git_commit() -> str:
-    sha = subprocess.check_output(
-        ["git", "rev-parse", "--short", "HEAD"]
-    ).decode().strip()
-    dirty_output = subprocess.check_output(
-        ["git", "status", "--porcelain", "--"] + list(FLAKE_SOURCE_PATHS)
-    ).decode().strip()
-    return sha + ("-dirty" if dirty_output else "")
+def read_package_version(cargo_toml: pathlib.Path) -> str:
+    """Extract `version = "X.Y.Z"` from the first [package] section."""
+    src = cargo_toml.read_text()
+    match = re.search(
+        r"^\[package\][^\[]*?^\s*version\s*=\s*\"([^\"]+)\"",
+        src,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        sys.exit(f"could not find [package].version in {cargo_toml}")
+    return match.group(1)
+
+
+def read_release_version() -> str:
+    client_ver = read_package_version(CLIENT_CARGO_TOML)
+    nv_ver = read_package_version(NV_CARGO_TOML)
+    if client_ver != nv_ver:
+        sys.exit(
+            f"version mismatch: {CLIENT_CARGO_TOML} has {client_ver!r}, "
+            f"{NV_CARGO_TOML} has {nv_ver!r} — bump both before running"
+        )
+    return client_ver
 
 
 def patch_sentinel(src: str, tag: str, value: str) -> str:
@@ -73,14 +88,14 @@ def main() -> None:
 
     rsp_vkey = read_vkey(rsp_vkey_path)
     nv_vkey = read_vkey(nv_vkey_path)
-    commit = git_commit()
+    version = f"v{read_release_version()}"
 
     src = readme.read_text()
     src = patch_sentinel(src, f"rsp-vkey:{network}", rsp_vkey)
     src = patch_sentinel(src, f"nv-vkey:{network}", nv_vkey)
-    src = patch_sentinel(src, "commit", commit)
+    src = patch_sentinel(src, "version", version)
     readme.write_text(src)
-    print(f"Updated vkeys[{network}] + commit in {readme}")
+    print(f"Updated vkeys[{network}] + version ({version}) in {readme}")
 
 
 if __name__ == "__main__":

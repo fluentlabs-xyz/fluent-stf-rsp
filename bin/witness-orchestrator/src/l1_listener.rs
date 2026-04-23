@@ -1,8 +1,9 @@
 //! L1 event listener for batch lifecycle events.
 //!
 //! Polls the rollup contract on L1 for:
-//! - `BatchCommitted(batchIndex, batchRoot, fromBlockHash, toBlockHash, numberOfBlocks, expectedBlobs)` — new batch declared
-//!   (pre-upgrade variant `v0::BatchCommitted` with a single `lastBlockHash` is also matched for historical logs)
+//! - `BatchCommitted(batchIndex, batchRoot, fromBlockHash, toBlockHash, numberOfBlocks,
+//!   expectedBlobs)` — new batch declared (pre-upgrade variant `v0::BatchCommitted` with a single
+//!   `lastBlockHash` is also matched for historical logs)
 //! - `BatchSubmitted(batchIndex)` — all blobs submitted for the batch
 //! - `BatchPreconfirmed(batchIndex, verifierContract, verifier)` — preconfirmation accepted
 //!
@@ -57,13 +58,13 @@ const INITIAL_PAGE: u64 = 2_000;
 
 fn is_too_many_results(err_msg: &str) -> bool {
     let s = err_msg.to_lowercase();
-    s.contains("-32005")
-        || s.contains("limit exceeded")
-        || s.contains("too many results")
-        || s.contains("log response size exceeded")
-        || s.contains("query returned more than")
-        || s.contains("please limit your query")
-        || s.contains("range is too large")
+    s.contains("-32005") ||
+        s.contains("limit exceeded") ||
+        s.contains("too many results") ||
+        s.contains("log response size exceeded") ||
+        s.contains("query returned more than") ||
+        s.contains("please limit your query") ||
+        s.contains("range is too large")
 }
 
 /// Number of blocks to lag behind `latest` to avoid L1 reorgs.

@@ -175,7 +175,7 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
                         None
                     }
                 }
-                // TODO: remove this dirty fix  
+                // TODO: remove this dirty fix
                 else if topic == &LEGACY_BRIDGE_WITHDRAWAL_TOPIC {
                     const SEND_EVENT_MESSAGE_HASH_OFFSET: usize = 128;
                     if log.data.data.len() >= SEND_EVENT_MESSAGE_HASH_OFFSET + 32 {
@@ -189,8 +189,8 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
                     }
                 } else if topic == rollback_topic {
                     if log.data.data.len() >= ROLLBACK_EVENT_MESSAGE_HASH_OFFSET + 32 {
-                        let hash: [u8; 32] = log.data.data[ROLLBACK_EVENT_MESSAGE_HASH_OFFSET
-                            ..ROLLBACK_EVENT_MESSAGE_HASH_OFFSET + 32]
+                        let hash: [u8; 32] = log.data.data[ROLLBACK_EVENT_MESSAGE_HASH_OFFSET..
+                            ROLLBACK_EVENT_MESSAGE_HASH_OFFSET + 32]
                             .try_into()
                             .unwrap();
                         Some(B256::from(hash))
@@ -211,8 +211,8 @@ impl<T: TxReceipt<Log = alloy_primitives::Log>> CalculateEventsHash for Executio
             .iter()
             .flat_map(|receipt| receipt.iter().filter(TxReceipt::status).flat_map(TxReceipt::logs))
             .filter(|log| {
-                &log.address == bridge_address
-                    && log.data.topics().first().map(|topic| topic == send_topic).unwrap_or(false)
+                &log.address == bridge_address &&
+                    log.data.topics().first().map(|topic| topic == send_topic).unwrap_or(false)
             })
             .map(|log| &log.data)
             .collect::<Vec<_>>()

@@ -9,14 +9,18 @@
 //! produced in realtime and responses typically arrive before `commitBatch`
 //! is called on L1, so there is no "matching batch" yet at insertion time.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
 
 use alloy_primitives::B256;
 use tracing::{error, info, warn};
 
-use crate::db::Db;
-use crate::types::{EthExecutionResponse, SubmitBatchResponse};
+use crate::{
+    db::Db,
+    types::{EthExecutionResponse, SubmitBatchResponse},
+};
 
 #[derive(Debug)]
 pub(crate) struct PendingBatch {
@@ -213,8 +217,8 @@ impl BatchAccumulator {
     }
 
     fn is_batch_ready(&self, batch: &PendingBatch) -> bool {
-        batch.blobs_accepted
-            && (batch.from_block..=batch.to_block).all(|b| self.responses.contains_key(&b))
+        batch.blobs_accepted &&
+            (batch.from_block..=batch.to_block).all(|b| self.responses.contains_key(&b))
     }
 
     /// True iff `block` falls inside the range of some pending (non-dispatched)
@@ -266,8 +270,8 @@ impl BatchAccumulator {
         self.batches.get(&batch_index)
     }
 
-    /// Returns the highest `to_block` across all pending and dispatched batches, or `None` if empty.
-    /// Used on restart to recover `next_batch_from_block` without reading a DB key.
+    /// Returns the highest `to_block` across all pending and dispatched batches, or `None` if
+    /// empty. Used on restart to recover `next_batch_from_block` without reading a DB key.
     pub(crate) fn max_to_block(&self) -> Option<u64> {
         let pending_max = self.batches.values().map(|b| b.to_block).max();
         let dispatched_max = self.dispatched.values().map(|d| d.to_block).max();

@@ -5,18 +5,16 @@
 //! restarts. Zstd-compressed, byte-capped, block-window retention.
 //!
 //! Writes come in two flavours:
-//! - `push` — immediate single-block commit (re-witness path, witness-server
-//!   miss path). Returns after `redb` fsync.
-//! - `push_batched` — buffered commit for the tip-following path. Payloads are
-//!   zstd-compressed into an in-memory buffer; once the buffer reaches
-//!   `batch_size`, a single `redb` write txn persists the whole batch with one
-//!   fsync. A crash before flush loses the buffered block numbers, which the
-//!   driver rebuilds on restart via its re-witness fallback.
+//! - `push` — immediate single-block commit (re-witness path, witness-server miss path). Returns
+//!   after `redb` fsync.
+//! - `push_batched` — buffered commit for the tip-following path. Payloads are zstd-compressed into
+//!   an in-memory buffer; once the buffer reaches `batch_size`, a single `redb` write txn persists
+//!   the whole batch with one fsync. A crash before flush loses the buffered block numbers, which
+//!   the driver rebuilds on restart via its re-witness fallback.
 
 #![allow(clippy::result_large_err)]
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use redb::{Database, ReadableTable, TableDefinition};
 use tokio::sync::Mutex as AsyncMutex;
@@ -31,9 +29,9 @@ const TOTAL_BYTES_KEY: &str = "total_bytes";
 /// Default batch size for tip-following cold writes. 128 blocks amortizes one
 /// `redb` fsync across ~2 minutes of L2 production at 1 s/block, which on the
 /// observed hardware removes redb from the per-block critical path.
-pub const DEFAULT_COLD_BATCH_SIZE: usize = 128;
+pub(crate) const DEFAULT_COLD_BATCH_SIZE: usize = 128;
 
-pub struct WitnessHub {
+pub(crate) struct WitnessHub {
     db: Arc<Database>,
     max_cold_bytes: u64,
     retention_blocks: u64,
@@ -61,7 +59,7 @@ impl WitnessHub {
     /// `batch_size` controls the tip-following buffered write path:
     /// `push_batched` flushes when the buffer reaches this length. Values `< 1`
     /// are clamped to `1` (degenerate but safe: every push flushes immediately).
-    pub fn new(
+    pub(crate) fn new(
         cold_file: PathBuf,
         max_cold_bytes: u64,
         retention_blocks: u64,
@@ -96,7 +94,7 @@ impl WitnessHub {
     /// Persist a single witness payload immediately. Returns after the redb
     /// commit (fsync). Used by the re-witness path and witness-server cold-miss
     /// rebuild, where batching would delay durability without benefit.
-    pub async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
+    pub(crate) async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
         let compressed = compress_payload(payload).await?;
         let entries = vec![(block_number, compressed)];
         self.commit_entries(entries).await
@@ -107,7 +105,7 @@ impl WitnessHub {
     /// the buffer reaches `batch_size`. On crash before flush the buffered
     /// blocks are lost from cold; the driver's re-witness fallback rebuilds them
     /// from MDBX on restart.
-    pub async fn push_batched(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
+    pub(crate) async fn push_batched(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
         let compressed = compress_payload(payload).await?;
         let to_flush = {
             let mut buf = self.buffer.lock().await;
@@ -126,7 +124,7 @@ impl WitnessHub {
 
     /// Drain and commit any pending buffered entries. Safe to call on shutdown
     /// or at phase boundaries; no-op if the buffer is empty.
-    pub async fn flush_pending(&self) -> eyre::Result<()> {
+    pub(crate) async fn flush_pending(&self) -> eyre::Result<()> {
         let entries = {
             let mut buf = self.buffer.lock().await;
             if buf.is_empty() {
@@ -143,7 +141,7 @@ impl WitnessHub {
     ///
     /// Under window retention the newest row is never evicted, so
     /// `table.last()` is the resume point.
-    pub fn last_committed_block(&self) -> eyre::Result<Option<u64>> {
+    pub(crate) fn last_committed_block(&self) -> eyre::Result<Option<u64>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(COLD_TABLE)?;
         let last = table.last()?.map(|(k, _)| k.value());
@@ -153,7 +151,7 @@ impl WitnessHub {
     /// Look up a single witness by block number. Returns `None` if missing
     /// or on decode failure. Checks the in-memory buffer first so tip-following
     /// callers can read back their own recent writes before the batch flushes.
-    pub async fn get_witness(&self, block_number: u64) -> Option<ProveRequest> {
+    pub(crate) async fn get_witness(&self, block_number: u64) -> Option<ProveRequest> {
         {
             let buf = self.buffer.lock().await;
             if let Some(compressed) =

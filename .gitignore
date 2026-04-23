@@ -61,3 +61,10 @@ attestation.bin
 # Nix build output symlink
 result
 result-*
+
+*.json
+*.vkey
+
+# Python bytecode
+__pycache__/
+*.pyc

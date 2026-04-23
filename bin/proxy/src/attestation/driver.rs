@@ -1,7 +1,6 @@
 //! Attestation driver: serialized handshake + per-key background prove tasks.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};

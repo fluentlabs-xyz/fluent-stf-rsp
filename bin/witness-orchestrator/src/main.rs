@@ -45,9 +45,7 @@ mod orchestrator;
 mod types;
 mod witness_server;
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::hub::{WitnessHub, DEFAULT_COLD_BATCH_SIZE};
 use alloy_network::{Ethereum, EthereumWallet};

@@ -2,7 +2,7 @@
 
 // Shared enclave response types live in the `nitro-types` workspace crate
 // so the orchestrator, proxy, and enclave cannot drift out of sync.
-pub use nitro_types::{
+pub(crate) use nitro_types::{
     EthExecutionResponse, InvalidSignaturesResponse, SignBatchRootRequest, SubmitBatchResponse,
 };
 
@@ -11,7 +11,7 @@ pub use nitro_types::{
 /// `payload` contains a bincode-serialized `ClientExecutorInput<FluentPrimitives>`.
 /// The orchestrator forwards it as-is — no deserialization needed on the transport layer.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProveRequest {
+pub(crate) struct ProveRequest {
     /// L2 block number this witness corresponds to.
     pub block_number: u64,
     /// Bincode-serialized witness data.

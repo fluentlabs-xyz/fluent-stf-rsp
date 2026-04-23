@@ -114,8 +114,8 @@ impl EthereumState {
                             if let Ok(Some(existing_acc)) =
                                 self.state_trie.get_rlp::<TrieAccount>(hashed_address.as_slice())
                             {
-                                if existing_acc.storage_root != EMPTY_ROOT
-                                    && existing_acc.storage_root != B256::ZERO
+                                if existing_acc.storage_root != EMPTY_ROOT &&
+                                    existing_acc.storage_root != B256::ZERO
                                 {
                                     *storage_trie =
                                         MptNodeData::Digest(existing_acc.storage_root).into();

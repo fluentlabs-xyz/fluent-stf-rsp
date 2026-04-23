@@ -17,8 +17,10 @@ use std::path::Path;
 use rusqlite::{params, Connection, Result};
 use tracing::error;
 
-use crate::accumulator::PendingBatch;
-use crate::types::{EthExecutionResponse, SubmitBatchResponse};
+use crate::{
+    accumulator::PendingBatch,
+    types::{EthExecutionResponse, SubmitBatchResponse},
+};
 
 pub(crate) struct Db {
     conn: Connection,
@@ -94,8 +96,9 @@ impl Db {
     // ── L1 checkpoint ────────────────────────────────────────────────────────────
 
     /// Last L1 block successfully polled by the L1 listener.
-    /// On restart, the listener resumes from `get_l1_checkpoint().map(|b| b + 1).unwrap_or(l1_start_block)`.
-    /// Returns `None` if never set — distinguishes "not persisted" from "persisted block 0".
+    /// On restart, the listener resumes from `get_l1_checkpoint().map(|b| b +
+    /// 1).unwrap_or(l1_start_block)`. Returns `None` if never set — distinguishes "not
+    /// persisted" from "persisted block 0".
     pub(crate) fn get_l1_checkpoint(&self) -> Option<u64> {
         self.conn
             .query_row("SELECT value FROM meta WHERE key = 'l1_checkpoint'", [], |row| {

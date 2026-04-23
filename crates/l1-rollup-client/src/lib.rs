@@ -5,8 +5,8 @@
 //! Targets the `release/v1.0.0` deployment of `Rollup.sol`.
 //!
 //! What lives here:
-//! - sol! ABI: all on-chain events (lifecycle, challenge, rewards) and the
-//!   `preconfirmBatch` function.
+//! - sol! ABI: all on-chain events (lifecycle, challenge, rewards) and the `preconfirmBatch`
+//!   function.
 //! - Read helpers: `resolve_l2_start_checkpoint`, `fetch_batch_range`.
 //! - Write helpers: `submit_preconfirmation`.
 //!
@@ -303,9 +303,7 @@ pub async fn resolve_l2_start_checkpoint(
                 .header
                 .number;
             if num_blocks == 0 {
-                return Err(eyre!(
-                    "v0::BatchCommitted for batch {batch_id} has num_blocks=0"
-                ));
+                return Err(eyre!("v0::BatchCommitted for batch {batch_id} has num_blocks=0"));
             }
             (h, last_n.saturating_sub(num_blocks - 1))
         }

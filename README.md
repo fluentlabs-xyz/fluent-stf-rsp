@@ -54,33 +54,35 @@ Bit-for-bit reproducibility is achieved through a hermetic build pipeline based 
 
 ### 3.3 Per-Network Identities
 
-Each network has its own set of cryptographic trust anchors. The values below are updated automatically by `scripts/update_expected_pcr0.py` (for PCR0) and `scripts/update_readme_vkeys.py` (for vkeys + commit) after the corresponding make targets (`build-enclave`, `build-client-docker`, `build-nitro-validator-docker`).
+Each network has its own set of cryptographic trust anchors. The values below are updated automatically by `scripts/update_expected_pcr0.py` (for PCR0) and `scripts/update_readme_vkeys.py` (for vkeys + release version) — both are invoked from the single `make build-release` target that builds the enclave, SP1 client, and nitro-validator ELFs for every network in sequence. The release version is read from `bin/client/Cargo.toml` and must match `bin/aws-nitro-validator/Cargo.toml`.
+
+**Versioning rule.** Any change to a PCR0 or a vkey (relative to the previous release committed at `HEAD`) is a backwards-incompatible redeploy — it invalidates the L1 `NitroVerifier` whitelist and every operator / contract pinning the old identity. The release version therefore follows SemVer with a load-bearing rule: **a change to any value in this table requires a MAJOR bump** in all three `Cargo.toml` files. `make build-release` runs `scripts/check_version_bump.py` as its final step to enforce this; it fails the build if identity anchors moved but the MAJOR did not.
 
 **mainnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:mainnet:begin -->`aa60d8f3e82ff2f5bcd1b73f2766c22e72945a3c69b64663dd25d228273821d846af8e014f9a5d8c2b6d34109cb1ff42`<!-- pcr0:mainnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x0085924e73e2b0d0e2626c592825fe092d3cfb63b108757965b2a6c06c8c311b`<!-- nv-vkey:mainnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x00860c0487f78ac293a80f9655bc234cc3e73868a29d35d82b819ebe590ef4db`<!-- rsp-vkey:mainnet:end --> |
+| PCR0 enclave | <!-- pcr0:mainnet:begin -->`97d86bddf2793eb8ce74d08a489a310e5b19e8e0de41763efbee86e94be46d9d9e4cd2f23fc26c92b2d7763dcc96d666`<!-- pcr0:mainnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x000de7e7beff0d2c498c813a4d4590344a1ada714bdec7a47562a584133ba790`<!-- nv-vkey:mainnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x00e405aa42595effb47403b48622f0c3cf6715e3548bc8e441b0ce32834bea4a`<!-- rsp-vkey:mainnet:end --> |
 
 **testnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:testnet:begin -->`9c4c1c41aaaabb15fd65712d1ab75ab859ef1d6b67d998f49e24818464ad13fd29274cc10ed2517991c8829f545897cf`<!-- pcr0:testnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x008059ac42a6cdda819cbc5f04f6028ea9c7fe39a092bfa3a6671d53c3707b1e`<!-- nv-vkey:testnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x001542cb5a66b9e20271941ad56b07f490701be789a6cbd61637a66e67f9eea7`<!-- rsp-vkey:testnet:end --> |
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`0c78f91ee56ed1f96b76a4974ed3737f6867d76f99475fed68b24ce60920e1117e4782752b95665a5c868b8e3bc2e86a`<!-- pcr0:testnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x00fc46e75f7d475ed8159e85822ff1a80f26348b011b7525257def725d97e52f`<!-- nv-vkey:testnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x002f42d86f15390628dcb5e0d3d698bd639ab8dcf3b1e3027717a2cd4b6e022d`<!-- rsp-vkey:testnet:end --> |
 
 **devnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:devnet:begin -->`2117af8b88016a29fc3a6b7905b0a371f25c56f378ef3322b749e69ac06733a69d8602804dd244b66eebf56f605c9fcc`<!-- pcr0:devnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:devnet:begin -->`0x00709c3887953c3f1d2a14272c52d81258038e946a285b8307359fddb1d2d58d`<!-- nv-vkey:devnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:devnet:begin -->`0x0014f00929b2945b9e7716490a2a694d9b8e74ee8ada9bb35d0a036955370749`<!-- rsp-vkey:devnet:end --> |
+| PCR0 enclave | <!-- pcr0:devnet:begin -->`3850bd62057a96faccc53bd452b3dae785f2429d56ed2edcde47bbfaf4df7919db1a281562d43e3fbd16b431ea5894b5`<!-- pcr0:devnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:devnet:begin -->`0x00260116370cce6ac4789aefcc1d540abaf2fdd1bb49b5b39a3d0935b3af57b1`<!-- nv-vkey:devnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:devnet:begin -->`0x006bafeee4793b0f76b197f903d7075fec3b9a0b69a8d7919c1e1c05f482f68f`<!-- rsp-vkey:devnet:end --> |
 
-Values built from commit <!-- commit:begin -->`955c591`<!-- commit:end -->. For independent verification, run `git checkout <commit>` and follow the commands in §5.
+Values built from release <!-- version:begin -->`v0.1.0`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.0`) and follow the commands in §5.
 
 ### 3.4 Identity Injection into the ZK Circuit
 
@@ -131,22 +133,28 @@ parent_hash || block_hash || withdrawal_hash || deposit_hash || versioned_hashes
 
 ## 5. Build Reproduction
 
-All commands below run from the repository root. To independently verify that the values in the §3.3 tables are correct, run `git checkout <commit>` and execute:
+All commands below run from the repository root. To independently verify that the values in the §3.3 tables are correct, check out the release tag shown in §3.3 (e.g. `git checkout v1.0.0`) and execute:
 
 ```sh
 # Prerequisites: docker, python3, git, jq.
 
-# 1. SP1 ELFs for the selected network. NETWORK ∈ {mainnet, testnet, devnet}.
-make build-client-docker NETWORK=mainnet
+# Option A — reproduce a single network (inspect raw artifacts manually).
+#
+# NETWORK ∈ {mainnet, testnet, devnet}.
+make build-client-docker          NETWORK=mainnet
 make build-nitro-validator-docker NETWORK=mainnet
+make build-enclave-docker         NETWORK=mainnet   # runs nixos/nix inside Docker
 
-# 2. Nitro EIF.
-make build-enclave-docker NETWORK=mainnet   # runs nixos/nix inside Docker
-
-# 3. Verification.
 jq -r .PCR0 rsp-client-enclave-mainnet.eif.pcrs.json    # must match §3.3
 cat rsp-client-mainnet.vkey                             # must match §3.3
 cat nitro-validator-mainnet.vkey                        # must match §3.3
+
+# Option B — reproduce the full release (all three networks) and
+# rewrite PCR0 / vkey / version cells in lib.rs + README in place, so
+# `git diff` against the tagged commit must be empty if the build was
+# reproducible.
+make build-release
+git diff --exit-code README.md bin/aws-nitro-validator/src/lib.rs
 ```
 
 ### 5.1 Running the Stack

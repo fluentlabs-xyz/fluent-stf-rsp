@@ -1,5 +1,7 @@
-use std::io::{Read, Write};
-use std::sync::Arc;
+use std::{
+    io::{Read, Write},
+    sync::Arc,
+};
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::ProvideCredentials;
@@ -12,8 +14,7 @@ use vsock::{VsockAddr, VsockStream};
 use nitro_types::{AwsCredentials, EnclaveIncoming, EnclaveResponse, EthExecutionResponse};
 use rsp_client_executor::io::EthClientExecutorInput;
 
-use crate::attestation::AttestationConfig;
-use crate::types::NitroConfig;
+use crate::{attestation::AttestationConfig, types::NitroConfig};
 
 // ---------------------------------------------------------------------------
 // Constants

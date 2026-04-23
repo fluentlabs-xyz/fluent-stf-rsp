@@ -19,33 +19,37 @@
 //! falls through to an MDBX-backed rebuild — and pushed onto the high-priority
 //! queue independent of the feeder.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
 
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use bytes::Bytes;
-use tokio::sync::mpsc;
-use tokio::task::JoinSet;
-use tokio::time::MissedTickBehavior;
+use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::accumulator::BatchAccumulator;
-use crate::db::Db;
-use crate::driver::Driver;
-use crate::l1_listener::L1Event;
-use crate::types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse};
+use crate::{
+    accumulator::BatchAccumulator,
+    db::Db,
+    driver::Driver,
+    l1_listener::L1Event,
+    types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse},
+};
 use l1_rollup_client::{nitro_verifier::is_key_registered, submit_preconfirmation};
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::{Ethereum, EthereumWallet};
 use alloy_primitives::{Address, B256};
-use alloy_provider::fillers::{
-    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+use alloy_provider::{
+    fillers::{
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+    },
+    Identity, Provider, RootProvider,
 };
-use alloy_provider::{Identity, Provider, RootProvider};
 
 /// Shared set of block numbers whose execution response is already present in
 /// the accumulator. Read by the feeder (to skip blocks with a response),
@@ -1150,9 +1154,7 @@ async fn call_sign_batch_root(
 
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(SignBatchError::Other(eyre::eyre!(
-            "sign-batch-root returned {status}: {text}"
-        )));
+        return Err(SignBatchError::Other(eyre::eyre!("sign-batch-root returned {status}: {text}")));
     }
 
     resp.json::<SubmitBatchResponse>()
@@ -1198,11 +1200,14 @@ async fn send_block_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accumulator::BatchAccumulator;
-    use crate::db::Db;
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex as StdMutex;
+    use crate::{accumulator::BatchAccumulator, db::Db};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Mutex as StdMutex,
+        },
+    };
 
     fn temp_db() -> Arc<StdMutex<Db>> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

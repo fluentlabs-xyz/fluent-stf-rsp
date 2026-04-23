@@ -26,10 +26,9 @@ use crate::driver::Driver;
 /// Run the witness HTTP server until `shutdown` is cancelled.
 ///
 /// Endpoints:
-/// - `GET /witness/{block_number}` → 200 with raw bincode-serialized
-///   `EthClientExecutorInput` bytes (served from cold storage or rebuilt from
-///   MDBX on cold miss), 404 if the block is beyond the MDBX tip, or 500 on
-///   a rebuild failure.
+/// - `GET /witness/{block_number}` → 200 with raw bincode-serialized `EthClientExecutorInput` bytes
+///   (served from cold storage or rebuilt from MDBX on cold miss), 404 if the block is beyond the
+///   MDBX tip, or 500 on a rebuild failure.
 pub(crate) async fn run(
     listen_addr: String,
     driver: Arc<Driver>,

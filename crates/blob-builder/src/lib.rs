@@ -131,8 +131,8 @@ fn encode_batch_payload(blocks: &[FetchedBlock]) -> Vec<u8> {
         let txs_list_len =
             RlpHeader { list: true, payload_length: txs_payload_len }.length() + txs_payload_len;
         let block_payload_len = block.header_rlp.len() + txs_list_len;
-        let block_total_len = RlpHeader { list: true, payload_length: block_payload_len }.length()
-            + block_payload_len;
+        let block_total_len = RlpHeader { list: true, payload_length: block_payload_len }.length() +
+            block_payload_len;
         outer_payload_len += block_total_len;
     }
 

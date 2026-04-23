@@ -1,6 +1,4 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use alloy_network::EthereumWallet;
 use alloy_primitives::Address;
@@ -153,10 +151,10 @@ pub(crate) async fn prove_and_submit_for_key(
                 let is_retriable = e.downcast_ref::<Sp1NetworkError>().is_some_and(|ne| {
                     matches!(
                         ne,
-                        Sp1NetworkError::RequestUnfulfillable { .. }
-                            | Sp1NetworkError::RequestUnexecutable { .. }
-                            | Sp1NetworkError::RequestTimedOut { .. }
-                            | Sp1NetworkError::RequestAuctionTimedOut { .. }
+                        Sp1NetworkError::RequestUnfulfillable { .. } |
+                            Sp1NetworkError::RequestUnexecutable { .. } |
+                            Sp1NetworkError::RequestTimedOut { .. } |
+                            Sp1NetworkError::RequestAuctionTimedOut { .. }
                     )
                 });
 

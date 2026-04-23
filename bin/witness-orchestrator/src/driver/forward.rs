@@ -5,10 +5,14 @@
 //! whenever they want the next witness. Back-pressure is natural — callers
 //! block on their own channel's `send` while the driver idles.
 
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::Ethereum;
@@ -18,17 +22,17 @@ use eyre::eyre;
 use futures::stream::StreamExt;
 use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_chainspec::ChainSpec;
-use reth_db::mdbx::DatabaseArguments;
-use reth_db::{init_db, ClientVersion, DatabaseEnv};
+use reth_db::{init_db, mdbx::DatabaseArguments, ClientVersion, DatabaseEnv};
 use reth_db_common::init::init_genesis;
 use reth_evm::execute::{BasicBlockExecutor, BlockExecutionOutput, Executor};
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_primitives_traits::Block as _;
-use reth_provider::providers::{
-    BlockchainProvider, NodeTypesForProvider, ProviderFactory, RocksDBProvider, StaticFileProvider,
-};
-use reth_provider::static_file::StaticFileSegment;
 use reth_provider::{
+    providers::{
+        BlockchainProvider, NodeTypesForProvider, ProviderFactory, RocksDBProvider,
+        StaticFileProvider,
+    },
+    static_file::StaticFileSegment,
     BlockBodyIndicesProvider, BlockNumReader, DatabaseProviderFactory, HeaderProvider,
     SaveBlocksMode, StaticFileProviderFactory, StaticFileWriter,
 };
@@ -36,15 +40,13 @@ use reth_prune::Pruner;
 use reth_prune_types::MINIMUM_UNWIND_SAFE_DISTANCE;
 use reth_revm::database::StateProviderDatabase;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
-use rsp_client_executor::evm::FluentEvmConfig;
-use rsp_client_executor::IntoPrimitives;
+use rsp_client_executor::{evm::FluentEvmConfig, IntoPrimitives};
 use rsp_host_executor::EthHostExecutor;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::hub::WitnessHub;
-use crate::types::ProveRequest;
+use crate::{hub::WitnessHub, types::ProveRequest};
 
 use super::node_types::FluentMdbxNode;
 
@@ -342,9 +344,9 @@ impl Driver {
         // Startup safety: if PRUNE_FULL is on and the tip is far past
         // witness_from_block, the history needed to re-witness blocks
         // [witness_from_block..start_tip] may already have been pruned.
-        if cfg.pruner.is_some()
-            && witness_from_block <= start_tip
-            && start_tip - witness_from_block > MINIMUM_UNWIND_SAFE_DISTANCE
+        if cfg.pruner.is_some() &&
+            witness_from_block <= start_tip &&
+            start_tip - witness_from_block > MINIMUM_UNWIND_SAFE_DISTANCE
         {
             return Err(eyre!(
                 "PRUNE_FULL=true but mdbx_tip ({start_tip}) is {} blocks past \
@@ -582,11 +584,10 @@ impl Driver {
 
     /// Pull one witness. Returns:
     /// - `Ok(Some(req))` — a witness is ready to dispatch; `state.next` is advanced.
-    /// - `Ok(None)` — driver not yet ready (catch-up still running), tip is
-    ///   caught up, or a transient RPC/fetch error was absorbed. Caller should
-    ///   sleep and retry.
-    /// - `Err(_)` — fatal (MDBX commit / witness build / hub push failed).
-    ///   Caller should cancel the root shutdown token and exit.
+    /// - `Ok(None)` — driver not yet ready (catch-up still running), tip is caught up, or a
+    ///   transient RPC/fetch error was absorbed. Caller should sleep and retry.
+    /// - `Err(_)` — fatal (MDBX commit / witness build / hub push failed). Caller should cancel the
+    ///   root shutdown token and exit.
     pub(crate) async fn try_take_new_block(
         &self,
         shutdown: &CancellationToken,

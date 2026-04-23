@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use alloy_primitives::Address;
 use revm_primitives::{hex, B256};
@@ -111,9 +110,9 @@ pub(crate) async fn run_challenge_proof(
                 let is_retriable = e.downcast_ref::<Sp1NetworkError>().is_some_and(|ne| {
                     matches!(
                         ne,
-                        Sp1NetworkError::RequestUnfulfillable { .. }
-                            | Sp1NetworkError::RequestTimedOut { .. }
-                            | Sp1NetworkError::RequestAuctionTimedOut { .. }
+                        Sp1NetworkError::RequestUnfulfillable { .. } |
+                            Sp1NetworkError::RequestTimedOut { .. } |
+                            Sp1NetworkError::RequestAuctionTimedOut { .. }
                     )
                 });
 
