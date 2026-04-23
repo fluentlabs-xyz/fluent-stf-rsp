@@ -50,8 +50,6 @@ bin/client/elf/
 *.eif
 *.elf
 
-attestation.bin
-
 # Claude Code
 .claude/
 
