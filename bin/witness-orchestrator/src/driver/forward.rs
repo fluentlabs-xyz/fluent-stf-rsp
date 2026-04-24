@@ -1,9 +1,12 @@
 //! Writable `ProviderFactory` open path and the embedded forward-sync driver.
 //!
-//! The driver is pull-shaped: consumers build an `Arc<Driver>` and call
-//! `advance_to_witness_from_block` once at startup, then `try_take_new_block`
-//! whenever they want the next witness. Back-pressure is natural — callers
-//! block on their own channel's `send` while the driver idles.
+//! The driver runs as an autonomous background actor: consumers build an
+//! `Arc<Driver>`, call `advance_to_witness_from_block` once at startup, then
+//! spawn `run_background_loop` which pulls blocks from L2 RPC, commits them
+//! to MDBX, produces witnesses, and pushes them into the `WitnessHub` at a
+//! rate bounded by the orchestrator-supplied `Arc<AtomicU64>` lookahead
+//! watermark. Witness consumers (feeder, witness-server) read from the hub
+//! directly.
 
 use std::{
     path::Path,
@@ -48,7 +51,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::{hub::WitnessHub, types::ProveRequest};
+use crate::hub::WitnessHub;
 
 use super::node_types::FluentMdbxNode;
 
@@ -260,9 +263,14 @@ pub(crate) struct DriverConfig {
     /// The driver's resume cursor is `max(orchestrator_checkpoint + 1, witness_from_block)`.
     pub orchestrator_checkpoint: u64,
     /// Safety lag behind the remote L2 tip (reorg protection). Applied in
-    /// `advance_to_witness_from_block` and `try_take_new_block` as
+    /// `advance_to_witness_from_block` and the background loop as
     /// `remote_tip.saturating_sub(l2_safe_blocks)`.
     pub l2_safe_blocks: u64,
+    /// Maximum number of blocks the background loop may run ahead of the
+    /// orchestrator's shared watermark. When `state.next - orchestrator_tip`
+    /// exceeds `max_lookahead_blocks`, the loop sleeps until the orchestrator
+    /// catches up — keeps cold-store retention and memory pressure bounded.
+    pub max_lookahead_blocks: u64,
 }
 
 /// A block fetched from RPC together with the time it took to pull.
@@ -299,12 +307,13 @@ pub(crate) struct Driver {
     /// `[orchestrator_checkpoint+1 ..= start_tip]` (stable for process lifetime).
     start_tip: u64,
     /// Flipped to `true` by `advance_to_witness_from_block` on completion.
-    /// `try_take_new_block` checks it first and returns `None` while false.
+    /// `run_background_loop` waits for this before producing witnesses.
     ready: AtomicBool,
     /// Mutable cursor + pruner. Held only during actual work; callers wait
     /// here while another call is in flight (MDBX writable txn is single-writer).
     state: AsyncMutex<DriverState>,
     l2_safe_blocks: u64,
+    max_lookahead_blocks: u64,
 }
 
 struct DriverState {
@@ -396,6 +405,7 @@ impl Driver {
             ready: AtomicBool::new(false),
             state: AsyncMutex::new(DriverState { next, pruner: cfg.pruner }),
             l2_safe_blocks: cfg.l2_safe_blocks,
+            max_lookahead_blocks: cfg.max_lookahead_blocks,
         })
     }
 
@@ -596,39 +606,95 @@ impl Driver {
         Ok(Some(payload))
     }
 
-    /// Pull one witness. Returns:
-    /// - `Ok(Some(req))` — a witness is ready to dispatch; `state.next` is advanced.
-    /// - `Ok(None)` — driver not yet ready (catch-up still running), tip is caught up, or a
-    ///   transient RPC/fetch error was absorbed. Caller should sleep and retry.
-    /// - `Err(_)` — fatal (MDBX commit / witness build / hub push failed). Caller should cancel the
-    ///   root shutdown token and exit.
-    pub(crate) async fn try_take_new_block(
-        &self,
-        shutdown: &CancellationToken,
-    ) -> eyre::Result<Option<ProveRequest>> {
-        if !self.ready.load(Ordering::Acquire) {
-            return Ok(None);
+    /// Run the autonomous forward-sync loop until `shutdown` fires. Waits for
+    /// `advance_to_witness_from_block` to flip `ready`, then repeatedly:
+    /// (a) checks the shared `orchestrator_tip` lookahead gate, sleeping when
+    /// too far ahead; (b) produces the next witness (re-witness branch for
+    /// `state.next <= start_tip`, tip-following branch above); (c) pushes the
+    /// payload into `WitnessHub`. Consumers read from the hub directly.
+    ///
+    /// Returns `Err(_)` only on an unrecoverable MDBX / witness-build / hub
+    /// push failure — the caller should cancel the root shutdown token on
+    /// that signal.
+    pub(crate) async fn run_background_loop(
+        self: Arc<Self>,
+        orchestrator_tip: Arc<std::sync::atomic::AtomicU64>,
+        shutdown: CancellationToken,
+    ) -> eyre::Result<()> {
+        // Wait for one-shot catch-up to flip `ready`. Short poll interval so
+        // the loop is responsive to shutdown during catch-up.
+        while !self.ready.load(Ordering::Acquire) {
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
         }
 
+        loop {
+            if shutdown.is_cancelled() {
+                info!("Driver loop: shutdown — exiting");
+                return Ok(());
+            }
+
+            // Lookahead gate: don't run more than `max_lookahead_blocks`
+            // ahead of the orchestrator's published watermark. `state.next`
+            // is the block we're about to produce, so the comparison
+            // quantifies "blocks already produced above the watermark".
+            let (next_snapshot, ahead) = {
+                let s = self.state.lock().await;
+                let tip = orchestrator_tip.load(Ordering::Relaxed);
+                (s.next, s.next.saturating_sub(tip).saturating_sub(1))
+            };
+            if ahead > self.max_lookahead_blocks {
+                tracing::debug!(
+                    next = next_snapshot,
+                    orchestrator_tip = orchestrator_tip.load(Ordering::Relaxed),
+                    max_lookahead_blocks = self.max_lookahead_blocks,
+                    "Driver loop: at lookahead cap — sleeping"
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => continue,
+                }
+            }
+
+            match self.produce_next_witness(&shutdown).await? {
+                Produced::Pushed => {
+                    // Continue immediately — next iteration will check gate.
+                }
+                Produced::Idle => {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(IDLE_POLL_INTERVAL) => continue,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Produce the next witness: fetch/commit/witness for a fresh block or
+    /// re-witness an already-MDBX-committed one, then push the payload into
+    /// `WitnessHub`. Advances `state.next` on success. Returns `Produced::Idle`
+    /// when the remote tip is caught up or a transient error was absorbed.
+    async fn produce_next_witness(&self, shutdown: &CancellationToken) -> eyre::Result<Produced> {
         let mut state = self.state.lock().await;
         let block_number = state.next;
 
         // ── Re-witness path (block already MDBX-committed) ────────────────
-        // Range is bounded locally; no RPC tip check needed.
         if block_number <= self.start_tip {
-            // Cold-store hit short-circuit: skip RPC fetch, rebuild, and
-            // re-push (all three produce bit-identical bytes, so round-tripping
-            // through redb is pure waste — and on a large cold.redb the write
-            // txn + retention scan dominate catch-up throughput).
-            if let Some(cached) = self.hub.get_witness(block_number).await {
+            // Cold-store hit short-circuit: payload already persisted; feeder
+            // reads it from the hub. No need to rebuild or re-push.
+            if self.hub.get_witness(block_number).await.is_some() {
                 info!(
                     block_number,
-                    payload_bytes = cached.payload.len() as u64,
                     "Re-witness served from cold store (skipped rebuild + re-push)"
                 );
                 metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
                 state.next = block_number + 1;
-                return Ok(Some(ProveRequest { block_number, payload: cached.payload }));
+                return Ok(Produced::Pushed);
             }
 
             let fetched = match fetch_block(&self.rpc, block_number).await {
@@ -640,10 +706,10 @@ impl Driver {
                         "fetch_block failed during re-witness — will retry"
                     );
                     tokio::select! {
-                        _ = shutdown.cancelled() => return Ok(None),
+                        _ = shutdown.cancelled() => return Ok(Produced::Idle),
                         _ = tokio::time::sleep(RPC_ERROR_BACKOFF) => {}
                     }
-                    return Ok(None);
+                    return Ok(Produced::Idle);
                 }
             };
 
@@ -656,13 +722,11 @@ impl Driver {
             .await?;
 
             // Pruner is skipped here — nothing was committed, so there is
-            // nothing new to prune. Re-running pruner on old tips would just
-            // churn without purpose.
-
+            // nothing new to prune.
             self.hub.push(block_number, &payload).await?;
             metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
             state.next = block_number + 1;
-            return Ok(Some(ProveRequest { block_number, payload }));
+            return Ok(Produced::Pushed);
         }
 
         // ── Fresh tip-following path (block_number > start_tip) ───────────
@@ -671,14 +735,14 @@ impl Driver {
             Err(e) => {
                 warn!(err = %e, "rpc get_block_number failed — backing off");
                 tokio::select! {
-                    _ = shutdown.cancelled() => return Ok(None),
+                    _ = shutdown.cancelled() => return Ok(Produced::Idle),
                     _ = tokio::time::sleep(RPC_ERROR_BACKOFF) => {}
                 }
-                return Ok(None);
+                return Ok(Produced::Idle);
             }
         };
         if block_number > remote_tip.saturating_sub(self.l2_safe_blocks) {
-            return Ok(None);
+            return Ok(Produced::Idle);
         }
 
         let fetched = match fetch_block(&self.rpc, block_number).await {
@@ -686,15 +750,15 @@ impl Driver {
             Err(e) => {
                 warn!(block_number, err = %e, "fetch_block failed — will retry");
                 tokio::select! {
-                    _ = shutdown.cancelled() => return Ok(None),
+                    _ = shutdown.cancelled() => return Ok(Produced::Idle),
                     _ = tokio::time::sleep(RPC_ERROR_BACKOFF) => {}
                 }
-                return Ok(None);
+                return Ok(Produced::Idle);
             }
         };
 
-        // Wrap commit_phase in spawn_blocking — it does heavy sync MDBX +
-        // static_files work that must not stall the async runtime.
+        // Wrap commit_phase in spawn_blocking — heavy sync MDBX + static_files
+        // work that must not stall the async runtime.
         let factory_clone = self.factory.clone();
         let chain_spec_clone = Arc::clone(&self.chain_spec);
         let job = tokio::task::spawn_blocking(move || {
@@ -715,8 +779,16 @@ impl Driver {
         run_pruner_if_needed(&mut state.pruner, block_number).await;
 
         state.next = block_number + 1;
-        Ok(Some(ProveRequest { block_number, payload }))
+        Ok(Produced::Pushed)
     }
+}
+
+enum Produced {
+    /// Produced a witness and pushed it to the hub; caller should continue.
+    Pushed,
+    /// No work this iteration (remote tip caught up, transient RPC error
+    /// absorbed, etc.). Caller should sleep before retrying.
+    Idle,
 }
 
 /// Run the pruner on `block_number` if it is due. Ownership hops via

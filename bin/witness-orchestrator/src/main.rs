@@ -73,7 +73,7 @@ mod witness_server;
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{atomic::AtomicU64, Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -185,6 +185,8 @@ async fn main() -> eyre::Result<()> {
         std::env::var("L1_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
     let l2_safe_blocks: u64 =
         std::env::var("L2_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let max_lookahead_blocks: u64 =
+        std::env::var("MAX_LOOKAHEAD_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
 
     // Optional destructive knob. Hard error on malformed value so a typo does
     // not silently skip the unwind (operator would then believe it ran).
@@ -374,6 +376,31 @@ async fn main() -> eyre::Result<()> {
     let mut tasks: tokio::task::JoinSet<(&'static str, eyre::Result<()>)> =
         tokio::task::JoinSet::new();
 
+    // ── Orchestrator SQLite DB + writer actor ──────────────────────────────────
+    //
+    // Every mutating SQL operation in the orchestrator routes through `db_tx`
+    // into the `run_db_writer` actor. Per-row commands coalesce into one
+    // transaction per flush (size threshold or 100 ms timer); atomic multi-
+    // statement commands run as their own transaction. Readers still hold the
+    // `Arc<Mutex<Db>>` directly — reads are rare and serialize cheaply against
+    // the writer actor's own Mutex scope.
+    let db = Arc::new(Mutex::new(
+        crate::db::Db::open(&db_path).expect("Failed to open orchestrator DB"),
+    ));
+    let (db_tx, db_rx) = tokio::sync::mpsc::channel::<crate::db::DbCommand>(10_000);
+    {
+        let db = Arc::clone(&db);
+        tasks.spawn(async move {
+            crate::db::run_db_writer(db_rx, db).await;
+            ("db_writer", Ok::<(), eyre::Report>(()))
+        });
+    }
+
+    // Shared watermark consumed by the driver's lookahead gate. Seeded from
+    // the SQLite checkpoint resolved above; advanced by the orchestrator on
+    // every block-result and finalization event.
+    let orchestrator_tip = Arc::new(AtomicU64::new(orchestrator_checkpoint));
+
     // Signal handler. Also watches the shutdown token so an internal cancel
     // (e.g. BatchReverted handling) lets this task exit cleanly instead of
     // blocking the final JoinSet drain forever.
@@ -520,6 +547,7 @@ async fn main() -> eyre::Result<()> {
     let pruner: Option<driver::DriverPruner> = None;
 
     let hub_for_shutdown = Arc::clone(&hub);
+    let hub_for_feeder = Arc::clone(&hub);
     let driver = Arc::new(
         Driver::new(DriverConfig {
             factory,
@@ -531,6 +559,7 @@ async fn main() -> eyre::Result<()> {
             witness_from_block,
             orchestrator_checkpoint,
             l2_safe_blocks,
+            max_lookahead_blocks,
         })
         .expect("Driver::new failed"),
     );
@@ -575,7 +604,6 @@ async fn main() -> eyre::Result<()> {
 
     let config = OrchestratorConfig {
         proxy_url,
-        db_path,
         http_client,
         l1_rollup_addr,
         nitro_verifier_addr,
@@ -596,16 +624,39 @@ async fn main() -> eyre::Result<()> {
         async_channel::bounded::<orchestrator::ExecutionTask>(orchestrator::EXECUTION_WORKERS * 2);
     let known_responses: orchestrator::KnownResponses = Arc::new(RwLock::new(HashSet::new()));
 
-    // Spawn the feeder into the top-level JoinSet so a feeder crash (driver
-    // fatal, panic) cancels the root token via the `tasks.join_next()` race
-    // below and shuts down the whole process cleanly.
+    // Spawn the driver's autonomous background loop into the top-level JoinSet.
+    // It produces witnesses into `WitnessHub` up to the `max_lookahead_blocks`
+    // cap beyond the shared `orchestrator_tip` — decoupled from the feeder so
+    // proxy back-pressure never idles MDBX.
     {
         let driver = Arc::clone(&driver);
+        let tip = Arc::clone(&orchestrator_tip);
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            let r = driver.run_background_loop(tip, shutdown).await;
+            ("driver_loop", r)
+        });
+    }
+
+    // Spawn the feeder into the top-level JoinSet. It consumes ready witnesses
+    // from the cold witness store and forwards them to the worker pool. Feeder
+    // exit (clean or error) cancels the root token via the `tasks.join_next()`
+    // race below.
+    let feeder_starting_block = orchestrator_checkpoint + 1;
+    {
+        let hub = hub_for_feeder;
         let normal_tx = normal_tx.clone();
         let known_responses = Arc::clone(&known_responses);
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
-            let r = orchestrator::feeder_loop(driver, normal_tx, known_responses, shutdown).await;
+            let r = orchestrator::feeder_loop(
+                hub,
+                normal_tx,
+                known_responses,
+                feeder_starting_block,
+                shutdown,
+            )
+            .await;
             ("feeder", r)
         });
     }
@@ -618,13 +669,21 @@ async fn main() -> eyre::Result<()> {
     let mut exit_code = 0;
     let mut orchestrator_fut = std::pin::pin!(orchestrator::run(
         config,
+        Arc::clone(&db),
+        db_tx.clone(),
         driver,
+        Arc::clone(&orchestrator_tip),
         l1_rx,
         shutdown.clone(),
         normal_rx,
         Arc::clone(&known_responses),
     ));
+    // Drop the outer senders so once the orchestrator exits and drops its
+    // internal clones, the worker pool and DB writer actor observe the close
+    // and drain cleanly. Sign spawns hold their own db_tx clones transiently
+    // — those drop when their tasks finish.
     drop(normal_tx);
+    drop(db_tx);
 
     tokio::select! {
         () = orchestrator_fut.as_mut() => {

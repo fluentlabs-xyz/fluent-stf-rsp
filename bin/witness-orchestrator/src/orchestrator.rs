@@ -21,8 +21,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
     time::Duration,
 };
 
@@ -34,7 +36,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     accumulator::{BatchAccumulator, DispatchedBatch},
-    db::Db,
+    db::{Db, DbCommand},
     driver::Driver,
     l1_listener::L1Event,
     types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse},
@@ -147,7 +149,6 @@ impl<T: Send + 'static> Drop for DoneGuard<T> {
 #[derive(Clone)]
 pub(crate) struct OrchestratorConfig {
     pub proxy_url: String,
-    pub db_path: PathBuf,
     pub http_client: reqwest::Client,
     pub l1_rollup_addr: Address,
     pub nitro_verifier_addr: Address,
@@ -403,58 +404,56 @@ async fn execution_worker(
 // Feeder
 // ============================================================================
 
-/// Pulls witnesses from the embedded forward driver one at a time and
-/// forwards them to the execution worker pool via `normal_tx`.
+/// Consume ready witnesses from the cold witness store in strict block
+/// order and forward them to the execution worker pool via `normal_tx`.
 ///
 /// **Invariant.** This is the ONLY producer for `normal_tx`; the key-rotation
 /// replay path writes directly to the high-priority channel owned inside
 /// `run`. Back-pressure propagates naturally: when workers saturate,
-/// `normal_tx.send().await` blocks the feeder, which stops calling
-/// `try_take_new_block`, which idles the driver.
+/// `normal_tx.send().await` blocks the feeder — the driver's background
+/// loop continues filling the hub up to the orchestrator_tip lookahead cap.
 ///
 /// Spawned by `main.rs` into the top-level `JoinSet`; feeder exit (clean or
 /// error) is observed by the main-loop race and triggers clean process exit.
 pub(crate) async fn feeder_loop(
-    driver: Arc<Driver>,
+    hub: Arc<crate::hub::WitnessHub>,
     normal_tx: AsyncSender<ExecutionTask>,
     known_responses: KnownResponses,
+    starting_block: u64,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
-    const FEEDER_IDLE: Duration = Duration::from_millis(500);
+    const FEEDER_IDLE: Duration = Duration::from_millis(100);
+    let mut next_block = starting_block;
     loop {
         if shutdown.is_cancelled() {
             info!("Feeder: shutdown — exiting");
             break;
         }
-        match driver.try_take_new_block(&shutdown).await {
-            Ok(Some(req)) => {
-                let bn = req.block_number;
-                // Dedup: if the main loop already has a response for this
-                // block (e.g. after a startup checkpoint rollback that
-                // caused the driver to re-feed covered blocks), skip the
-                // proxy round-trip. The main loop's gap-check gate in
-                // `on_block_result` still rejects duplicates if they slip
-                // through, so this is an efficiency layer, not a
-                // correctness gate.
-                if known_responses.read().unwrap_or_else(|e| e.into_inner()).contains(&bn) {
-                    continue;
-                }
-                let task = ExecutionTask { block_number: bn, payload: req.payload };
+
+        // Dedup: if the main loop already has a response for this block
+        // (startup checkpoint rollback path), skip the proxy round-trip and
+        // advance. `on_block_result` enforces the gate if a dup slips through;
+        // this is an efficiency layer.
+        if known_responses.read().unwrap_or_else(|e| e.into_inner()).contains(&next_block) {
+            next_block += 1;
+            continue;
+        }
+
+        match hub.get_witness(next_block).await {
+            Some(req) => {
+                let task = ExecutionTask { block_number: req.block_number, payload: req.payload };
                 if normal_tx.send(task).await.is_err() {
                     warn!("Feeder: normal_tx closed — exiting");
                     break;
                 }
+                next_block += 1;
             }
-            Ok(None) => {
+            None => {
+                // Driver has not yet committed block `next_block` — sleep and retry.
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(FEEDER_IDLE) => continue,
                 }
-            }
-            Err(e) => {
-                error!(err = %e, "Feeder: driver fatal — cancelling shutdown");
-                shutdown.cancel();
-                return Err(e);
             }
         }
     }
@@ -475,19 +474,22 @@ pub(crate) async fn feeder_loop(
 ///
 /// `known_responses` is shared with the feeder and is seeded here from the
 /// persistent accumulator before entering the main select loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     config: OrchestratorConfig,
+    db: Arc<Mutex<Db>>,
+    db_tx: mpsc::Sender<DbCommand>,
     driver: Arc<Driver>,
+    orchestrator_tip: Arc<AtomicU64>,
     mut l1_events: mpsc::Receiver<L1Event>,
     shutdown: CancellationToken,
     normal_rx: AsyncReceiver<ExecutionTask>,
     known_responses: KnownResponses,
 ) {
-    let db =
-        Arc::new(Mutex::new(Db::open(&config.db_path).expect("Failed to open orchestrator DB")));
     let mut accumulator = {
         let db = Arc::clone(&db);
-        tokio::task::spawn_blocking(move || BatchAccumulator::with_db(db))
+        let db_tx = db_tx.clone();
+        tokio::task::spawn_blocking(move || BatchAccumulator::with_db(db, db_tx))
             .await
             .expect("startup accumulator load panicked")
     };
@@ -528,7 +530,8 @@ pub(crate) async fn run(
         let _ = apply_finalization_changes(
             done,
             &mut accumulator,
-            &db,
+            &db_tx,
+            &orchestrator_tip,
             &known_responses,
             &mut missing_receipt_first_seen,
             &mut last_batch_end,
@@ -587,9 +590,18 @@ pub(crate) async fn run(
         .expect("NonceAllocator bootstrap failed — L1 RPC unreachable at startup"),
     );
 
+    let initial_checkpoint = from_block.saturating_sub(1);
+    // Seed the shared driver watermark with the higher of checkpoint or
+    // last_batch_end so the driver's lookahead starts with an accurate view
+    // of orchestrator progress (finalized batches imply the checkpoint has
+    // already passed that block).
+    orchestrator_tip.store(initial_checkpoint.max(last_batch_end.unwrap_or(0)), Ordering::Relaxed);
+
     let mut state = OrchestratorState {
         config: config.clone(),
         db: Arc::clone(&db),
+        db_tx: db_tx.clone(),
+        orchestrator_tip: Arc::clone(&orchestrator_tip),
         driver: Arc::clone(&driver),
         high_tx: high_tx.clone(),
         sign_done_tx,
@@ -598,7 +610,7 @@ pub(crate) async fn run(
         dispatch_cancel: HashMap::new(),
         key_check_tx,
         finalization_done_tx,
-        checkpoint: from_block.saturating_sub(1),
+        checkpoint: initial_checkpoint,
         confirmed: HashSet::new(),
         signing_batch: None,
         dispatching_batch: None,
@@ -749,7 +761,17 @@ pub(crate) async fn run(
 
 struct OrchestratorState {
     config: OrchestratorConfig,
+    /// Kept for synchronous startup reads + the mid-flight
+    /// `get_batch_signature` cache-check in `sign_batch_io`. All writes go
+    /// through `db_tx` so this handle is never used for mutations at runtime.
     db: Arc<Mutex<Db>>,
+    /// Sender into the DB writer actor. Every mutating SQL operation in the
+    /// orchestrator routes through this channel.
+    db_tx: mpsc::Sender<DbCommand>,
+    /// Shared watermark read by the driver's lookahead gate. Advanced to
+    /// `self.checkpoint` on every block-result update and to `last_batch_end`
+    /// on finalization.
+    orchestrator_tip: Arc<AtomicU64>,
     driver: Arc<Driver>,
     high_tx: AsyncSender<ExecutionTask>,
     sign_done_tx: mpsc::Sender<(u64, SignOutcome)>,
@@ -840,17 +862,12 @@ impl OrchestratorState {
             self.checkpoint += 1;
             self.confirmed.remove(&self.checkpoint);
         }
-        {
-            let db = Arc::clone(&self.db);
-            let cp = self.checkpoint;
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                db.lock().unwrap_or_else(|e| e.into_inner()).save_checkpoint(cp);
-            })
-            .await
-            {
-                warn!(cp, err = %e, "save_checkpoint: spawn_blocking failed");
-            }
+        let cp = self.checkpoint;
+        if self.db_tx.send(DbCommand::SaveCheckpoint(cp)).await.is_err() {
+            warn!(cp, "save_checkpoint: db writer channel closed");
         }
+        // Publish the new watermark so the driver's lookahead gate can observe it.
+        self.orchestrator_tip.store(cp, Ordering::Relaxed);
 
         self.try_sign_next_batch(accumulator);
         self.try_dispatch_next_batch(accumulator);
@@ -892,13 +909,8 @@ impl OrchestratorState {
                 self.try_dispatch_next_batch(accumulator);
             }
             L1Event::Checkpoint(l1_block) => {
-                let db = Arc::clone(&self.db);
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    db.lock().unwrap_or_else(|e| e.into_inner()).save_l1_checkpoint(l1_block);
-                })
-                .await
-                {
-                    warn!(l1_block, err = %e, "save_l1_checkpoint: spawn_blocking failed");
+                if self.db_tx.send(DbCommand::SaveL1Checkpoint(l1_block)).await.is_err() {
+                    warn!(l1_block, "save_l1_checkpoint: db writer channel closed");
                 }
             }
             L1Event::BatchReverted { from_batch_index, l1_block } => {
@@ -912,20 +924,16 @@ impl OrchestratorState {
                     from_batch_index,
                     l1_block, "BatchReverted — wiping DB and scheduling restart"
                 );
-                let db = Arc::clone(&self.db);
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    db.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .wipe_for_revert(from_batch_index, l1_block + 1);
-                })
-                .await
+                if self
+                    .db_tx
+                    .send(DbCommand::WipeForRevert {
+                        start_batch_id: from_batch_index,
+                        l1_block: l1_block + 1,
+                    })
+                    .await
+                    .is_err()
                 {
-                    error!(
-                        from_batch_index,
-                        l1_block,
-                        err = %e,
-                        "wipe_for_revert: spawn_blocking failed"
-                    );
+                    error!(from_batch_index, l1_block, "wipe_for_revert: db writer channel closed");
                 }
                 self.shutdown.cancel();
             }
@@ -981,6 +989,7 @@ impl OrchestratorState {
         let cfg = self.config.clone();
         let tx = self.sign_done_tx.clone();
         let db = Arc::clone(&self.db);
+        let db_tx = self.db_tx.clone();
         let from_block = batch.from_block;
         let to_block = batch.to_block;
         let l2_provider = cfg.l2_provider.clone();
@@ -997,6 +1006,7 @@ impl OrchestratorState {
                 to_block,
                 responses,
                 db,
+                db_tx,
                 &l2_provider,
                 &shutdown,
             )
@@ -1418,7 +1428,8 @@ impl OrchestratorState {
         let changed = apply_finalization_changes(
             done,
             accumulator,
-            &self.db,
+            &self.db_tx,
+            &self.orchestrator_tip,
             &self.known_responses,
             missing_receipt_first_seen,
             &mut self.last_batch_end,
@@ -1514,7 +1525,8 @@ async fn check_finalized_batches_query(
 async fn apply_finalization_changes(
     done: FinalizationDone,
     accumulator: &mut BatchAccumulator,
-    db: &Arc<Mutex<Db>>,
+    db_tx: &mpsc::Sender<DbCommand>,
+    orchestrator_tip: &Arc<AtomicU64>,
     known_responses: &KnownResponses,
     missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
     last_batch_end: &mut Option<u64>,
@@ -1537,19 +1549,20 @@ async fn apply_finalization_changes(
                     }
                 }
                 {
-                    let db = Arc::clone(db);
                     let block = dispatched.to_block;
-                    if let Err(e) = tokio::task::spawn_blocking(move || {
-                        db.lock().unwrap_or_else(|e| e.into_inner()).save_last_batch_end(block);
-                    })
-                    .await
-                    {
-                        warn!(block, err = %e, "save_last_batch_end: spawn_blocking failed");
+                    if db_tx.send(DbCommand::SaveLastBatchEnd(block)).await.is_err() {
+                        warn!(block, "save_last_batch_end: db writer channel closed");
                     }
                     *last_batch_end = Some(match *last_batch_end {
                         Some(prev) => prev.max(block),
                         None => block,
                     });
+                    // Advance the shared driver watermark monotonically so a
+                    // late checkpoint update does not roll the tip backward.
+                    let current = orchestrator_tip.load(Ordering::Relaxed);
+                    if block > current {
+                        orchestrator_tip.store(block, Ordering::Relaxed);
+                    }
                 }
                 info!(batch_index, %tx_hash, to_block = dispatched.to_block, "Batch finalized on L1 — cleaned up");
                 changed = true;
@@ -1612,6 +1625,7 @@ async fn sign_batch_io(
     to_block: u64,
     responses: Vec<EthExecutionResponse>,
     db: Arc<Mutex<Db>>,
+    db_tx: mpsc::Sender<DbCommand>,
     l2_provider: &alloy_provider::RootProvider,
     shutdown: &CancellationToken,
 ) -> SignOutcome {
@@ -1668,16 +1682,12 @@ async fn sign_batch_io(
             Ok(resp) => {
                 metrics::histogram!(crate::metrics::SIGN_BATCH_ROOT_DURATION)
                     .record(t_start.elapsed().as_secs_f64());
-                let db = Arc::clone(&db);
-                let resp_clone = resp.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    db.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .save_batch_signature(batch_index, &resp_clone);
-                })
-                .await
+                if db_tx
+                    .send(DbCommand::SaveBatchSignature { batch_index, resp: resp.clone() })
+                    .await
+                    .is_err()
                 {
-                    warn!(batch_index, err = %e, "save_batch_signature: spawn_blocking failed");
+                    warn!(batch_index, "save_batch_signature: db writer channel closed");
                 }
                 info!(batch_index, "Batch root signed and persisted");
                 return SignOutcome::Signed { response: resp };
@@ -2392,7 +2402,8 @@ mod tests {
     /// while exercising the new split signatures end-to-end.
     async fn run_finalization_once(
         provider: &dyn FinalityRpc,
-        db: &Arc<StdMutex<Db>>,
+        db_tx: &mpsc::Sender<DbCommand>,
+        orchestrator_tip: &Arc<AtomicU64>,
         accumulator: &mut BatchAccumulator,
         missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
         known_responses: &KnownResponses,
@@ -2406,7 +2417,8 @@ mod tests {
         apply_finalization_changes(
             done,
             accumulator,
-            db,
+            db_tx,
+            orchestrator_tip,
             known_responses,
             missing_receipt_first_seen,
             last_batch_end,
@@ -2422,7 +2434,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn receipt_missing_window_logs_only() {
         let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let (dummy_db_tx, _dummy_db_rx) = mpsc::channel(100);
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db), dummy_db_tx.clone());
+        let tip = Arc::new(AtomicU64::new(0));
         let tx_hash = B256::repeat_byte(0xAA);
         register_dispatched(&mut acc, 1, 100, 110, tx_hash, 500).await;
 
@@ -2433,7 +2447,8 @@ mod tests {
         let mut last_batch_end: Option<u64> = None;
         let changed = run_finalization_once(
             &provider,
-            &db,
+            &dummy_db_tx,
+            &tip,
             &mut acc,
             &mut first_seen,
             &known_responses,
@@ -2448,7 +2463,8 @@ mod tests {
         let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
         let changed = run_finalization_once(
             &provider,
-            &db,
+            &dummy_db_tx,
+            &tip,
             &mut acc,
             &mut first_seen,
             &known_responses,
@@ -2495,7 +2511,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn finalization_no_break_after_transient_none() {
         let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let (dummy_db_tx, _dummy_db_rx) = mpsc::channel(100);
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db), dummy_db_tx.clone());
+        let tip = Arc::new(AtomicU64::new(0));
 
         let tx_a = B256::repeat_byte(0x01);
         let tx_b = B256::repeat_byte(0x02);
@@ -2513,7 +2531,8 @@ mod tests {
         let mut last_batch_end: Option<u64> = None;
         let changed = run_finalization_once(
             &provider,
-            &db,
+            &dummy_db_tx,
+            &tip,
             &mut acc,
             &mut first_seen,
             &known_responses,
