@@ -1,0 +1,20 @@
+[package]
+name = "nitro-types"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+exclude.workspace = true
+
+[dependencies]
+revm-primitives.workspace = true
+serde = { workspace = true,  features = ["derive", "alloc"] }
+serde-big-array = "0.5"
+alloy-primitives = { workspace = true, features = ["serde"] }
+rsp-client-executor = { workspace = true, default-features = false }
+base64 = { workspace = true }
+
+[lints]
+workspace = true

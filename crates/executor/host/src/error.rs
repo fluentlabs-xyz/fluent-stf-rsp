@@ -27,6 +27,4 @@ pub enum Error {
     HeaderMismatch(B256, B256),
     #[error("State root mismatch after local execution \n found {0} expected {1}")]
     StateRootMismatch(B256, B256),
-    #[error("Failed to read the genesis file: {0}")]
-    FailedToReadGenesisFile(#[from] std::io::Error),
 }

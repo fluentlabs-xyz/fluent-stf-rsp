@@ -1,0 +1,24 @@
+[package]
+name = "rsp-blob-builder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-provider.workspace = true
+alloy-rlp.workspace = true
+brotlic.workspace = true
+eyre.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+brotli = "8.0.2"

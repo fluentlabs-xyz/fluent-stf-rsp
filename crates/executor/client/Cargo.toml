@@ -10,57 +10,52 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["mainnet"]
+sp1 = []
+nitro = ["fluentbase-revm/wasmtime"]
+wasmtime = ["fluentbase-revm/wasmtime"]
+mainnet = ["fluent-stf-primitives/mainnet"]
+testnet = ["fluent-stf-primitives/testnet"]
+devnet  = ["fluent-stf-primitives/devnet"]
+
 [dependencies]
 thiserror.workspace = true
-serde_json.workspace = true
 serde.workspace = true
-serde_with = "3.12.0"
-itertools = "0.13.0"
+serde_with.workspace = true
+itertools.workspace = true
+bincode.workspace = true
 
-# workspace
+# workspace crates
 rsp-mpt.workspace = true
-rsp-primitives.workspace = true
+fluent-stf-primitives = { workspace = true, default-features = false }
 
 # reth
 reth-consensus.workspace = true
-reth-consensus-common.workspace = true
 reth-ethereum-consensus.workspace = true
+reth-consensus-common.workspace = true
 reth-ethereum-primitives = { workspace = true, features = ["serde-bincode-compat"] }
 reth-execution-types.workspace = true
 reth-primitives-traits.workspace = true
 reth-trie.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
-reth-optimism-evm = { workspace = true, optional = true }
-reth-optimism-consensus = { workspace = true, optional = true }
-reth-optimism-chainspec = { workspace = true, optional = true }
-reth-optimism-primitives = { workspace = true, optional = true, features = ["serde", "serde-bincode-compat"]}
 reth-errors.workspace = true
 reth-chainspec.workspace = true
 
 # revm
 revm.workspace = true
-revm-primitives.workspace = true
-
+revm-primitives = { workspace = true, features = ["serde"] }
 # alloy
 alloy-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types.workspace = true
+alloy-sol-types.workspace = true
 
-# op
-op-alloy-network = { workspace = true, optional = true }
-op-alloy-rpc-types = { workspace = true, optional = true }
+fluentbase-revm = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch="devel", default-features = false, features = ["std"]}
+fluentbase-runtime = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch="devel", default-features = false}
+reth-revm.workspace = true
+reth-primitives.workspace = true
 
-
-[features]
-optimism = [
-    "dep:op-alloy-network",
-    "dep:op-alloy-rpc-types",
-    "dep:reth-optimism-evm",
-    "dep:reth-optimism-consensus",
-    "dep:reth-optimism-chainspec",
-    "dep:reth-optimism-primitives",
-    "rsp-primitives/optimism",
-]

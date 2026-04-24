@@ -1,4 +1,5 @@
 use alloy_transport::TransportError;
+use reth_provider::ProviderError;
 use revm_primitives::{Address, U256};
 use rsp_mpt::FromProofError;
 
@@ -7,6 +8,8 @@ use rsp_mpt::FromProofError;
 pub enum RpcDbError {
     #[error("Transport Error: {}", .0)]
     Transport(#[from] TransportError),
+    #[error("Provider Error: {}", .0)]
+    Provider(#[from] ProviderError),
     #[error("From proof Error: {}", .0)]
     FromProof(#[from] FromProofError),
     #[error("failed fetch proof at {0}: {1}")]

@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
+use crate::{evm::FluentEvmConfig, io::ClientExecutorInput};
 use alloy_consensus::{BlockHeader, Header};
+use fluent_stf_primitives::{
+    BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC, BRIDGE_ROLLBACK_TOPIC, BRIDGE_WITHDRAWAL_TOPIC,
+};
 use itertools::Itertools;
 use reth_chainspec::ChainSpec;
 use reth_errors::BlockExecutionError;
@@ -8,7 +12,6 @@ use reth_evm::{
     execute::{BasicBlockExecutor, Executor},
     ConfigureEvm, OnStateHook,
 };
-use reth_evm_ethereum::EthEvmConfig;
 use reth_execution_types::ExecutionOutcome;
 use reth_primitives_traits::Block;
 use reth_trie::KeccakKeyHasher;
@@ -16,10 +19,10 @@ use revm::database::WrapDatabaseRef;
 use revm_primitives::Address;
 
 use crate::{
-    custom::CustomEvmFactory,
     error::ClientError,
+    events_hash::{BridgeHashes, BridgeInfo},
     into_primitives::FromInput,
-    io::{ClientExecutorInput, TrieDB, WitnessInput},
+    io::{TrieDB, WitnessInput},
     tracking::OpCodesTrackingBlockExecutor,
     BlockValidator,
 };
@@ -32,18 +35,21 @@ pub const VALIDATE_HEADER: &str = "validate header";
 pub const VALIDATE_EXECUTION: &str = "validate block post-execution";
 pub const COMPUTE_STATE_ROOT: &str = "compute state root";
 
-pub type EthClientExecutor = ClientExecutor<EthEvmConfig<ChainSpec, CustomEvmFactory>, ChainSpec>;
+pub type EthClientExecutor = ClientExecutor<FluentEvmConfig, ChainSpec>;
 
-#[cfg(feature = "optimism")]
-pub type OpClientExecutor =
-    ClientExecutor<reth_optimism_evm::OpEvmConfig, reth_optimism_chainspec::OpChainSpec>;
-
-/// An executor that executes a block inside a zkVM.
+/// An executor that fetches data from a [Provider] to execute blocks in the [ClientExecutor].
 #[derive(Debug, Clone)]
 pub struct ClientExecutor<C: ConfigureEvm, CS> {
     evm_config: C,
     chain_spec: Arc<CS>,
 }
+
+static BRIDGE_INFO: BridgeInfo = BridgeInfo {
+    bridge_address: BRIDGE_ADDRESS,
+    withdrawal_topic: BRIDGE_WITHDRAWAL_TOPIC,
+    rollback_topic: BRIDGE_ROLLBACK_TOPIC,
+    deposit_topic: BRIDGE_DEPOSIT_TOPIC,
+};
 
 impl<C, CS> ClientExecutor<C, CS>
 where
@@ -53,7 +59,7 @@ where
     pub fn execute(
         &self,
         mut input: ClientExecutorInput<C::Primitives>,
-    ) -> Result<Header, ClientError> {
+    ) -> Result<(Header, BridgeHashes), ClientError> {
         let sealed_headers = input.sealed_headers().collect::<Vec<_>>();
 
         // Initialize the witnessed database with verified storage proofs.
@@ -144,27 +150,14 @@ where
             requests_hash: input.current_block.header().requests_hash(),
         };
 
-        Ok(header)
+        Ok((header, BRIDGE_INFO.calculate_bridge_hashes(&executor_outcome)?))
     }
 }
 
 impl EthClientExecutor {
-    pub fn eth(chain_spec: Arc<ChainSpec>, custom_beneficiary: Option<Address>) -> Self {
+    pub fn eth(chain_spec: Arc<ChainSpec>, _custom_beneficiary: Option<Address>) -> Self {
         Self {
-            evm_config: EthEvmConfig::new_with_evm_factory(
-                chain_spec.clone(),
-                CustomEvmFactory::new(custom_beneficiary),
-            ),
-            chain_spec,
-        }
-    }
-}
-
-#[cfg(feature = "optimism")]
-impl OpClientExecutor {
-    pub fn optimism(chain_spec: Arc<reth_optimism_chainspec::OpChainSpec>) -> Self {
-        Self {
-            evm_config: reth_optimism_evm::OpEvmConfig::optimism(chain_spec.clone()),
+            evm_config: FluentEvmConfig::new_with_default_factory(chain_spec.clone()),
             chain_spec,
         }
     }

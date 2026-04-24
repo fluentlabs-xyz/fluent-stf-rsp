@@ -1,0 +1,157 @@
+# Production docker-compose for Fluent STF proxy + witness-orchestrator.
+#
+# All environment variables and their defaults live in `.env.example` — copy it
+# to `.env`, fill in the blanks, and this file will pick them up automatically.
+# Do NOT duplicate defaults here; `.env.example` is the single source of truth.
+#
+# Runtime assumptions:
+#   - AWS Nitro Enclave is launched OUTSIDE Docker on the same EC2 host via
+#     `nitro-cli run-enclave` with --enclave-cid 10 (see Makefile run-enclave).
+#   - SP1 client ELF and nitro-validator ELF have been built on the host
+#     before `docker compose build`: run `make compose-build` for the full chain.
+#   - Secrets (API_KEY, L1_SUBMITTER_KEY) are provided via `.env` (chmod 600,
+#     gitignored). See `.env.example` for the template.
+#
+# Both services use `network_mode: host` so the orchestrator can reach the
+# host-side Fluent gRPC at 127.0.0.1:10000 without extra_hosts tricks.
+
+name: fluent-stf
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: rsp-proxy
+      args:
+        NETWORK: ${NETWORK}
+    image: fluent-stf/proxy:${NETWORK}
+    container_name: fluent-proxy
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    network_mode: host
+    # /dev/vsock is 0666 (world-writable) on the target EC2 — no group_add
+    # required today. If the aws-nitro-enclaves-cli udev rule is reapplied
+    # (e.g. after a CLI reinstall) the device will tighten to 0660 root:ne
+    # and `group_add: ["<ne gid>"]` will need to be added here.
+    devices:
+      - /dev/vsock:/dev/vsock
+    volumes:
+      - ./data/proxy:/var/lib/proxy
+    # NOTE: secrets below are visible via `docker inspect fluent-proxy` to
+    # anyone with access to the docker socket. This is acceptable on a
+    # dedicated EC2 host where the only docker user is root, but must be
+    # documented in the deploy runbook. Future work: move L1_SUBMITTER_KEY and
+    # API_KEY to compose `secrets:` with file-backed delivery — requires
+    # Rust-side support for `*_FILE` env var pattern (out of scope here).
+    environment:
+      API_KEY: ${API_KEY:?API_KEY is required in .env}
+      LISTEN_ADDR: ${PROXY_LISTEN_ADDR}
+      PROXY_DB_PATH: ${PROXY_DB_PATH}
+      RUST_LOG: ${RUST_LOG}
+      RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
+      L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}
+      L1_ROLLUP_ADDR: ${L1_ROLLUP_ADDR:?L1_ROLLUP_ADDR is required in .env}
+      L1_ROLLUP_DEPLOY_BLOCK: ${L1_ROLLUP_DEPLOY_BLOCK}
+      L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
+      SP1_PROVER: ${SP1_PROVER}
+      NETWORK_PRIVATE_KEY: ${SP1_PRIVATE_KEY}
+      WITNESS_HUB_URL: ${WITNESS_HUB_URL}
+    # TCP-only liveness probe. This verifies only that proxy has bound the
+    # socket — it does NOT verify that the enclave handshake succeeded or that
+    # the signing pipeline is ready. If proxy is stuck retrying vsock handshake
+    # it will still appear "healthy" here. Accepted trade-off because adding a
+    # real /health endpoint requires Rust code changes (out of scope).
+    healthcheck:
+      # /busybox is a static musl binary copied into the distroless image
+      # specifically for this TCP-only liveness probe. -w 1 = 1s connect timeout.
+      test: ["CMD", "/busybox", "nc", "-z", "-w", "1", "127.0.0.1", "8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    # SP1 v6 native JIT executor uses /dev/shm for shared memory between
+    # parent and child processes. Docker's default is 64MB which is too
+    # small — SIGBUS at 0x0 when the mapping is exhausted.
+    shm_size: 4g
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    security_opt:
+      - no-new-privileges:true
+      # Docker's default seccomp profile blocks socket(AF_VSOCK) — required
+      # for VSOCK communication with the Nitro Enclave. Disabled seccomp is
+      # acceptable here: the container runs as nonroot (UID 65532) with
+      # cap_drop ALL, no-new-privileges, and read_only rootfs.
+      - seccomp:unconfined
+    cap_drop:
+      - ALL
+    # Read-only root filesystem for security. SP1 prover caches data in
+    # $HOME/.sp1/ — because the Dockerfile sets HOME=/var/lib/proxy and this
+    # path is a writable bind mount, SP1 operates normally without requiring
+    # a writable rootfs or dedicated tmpfs for its cache.
+    read_only: true
+    tmpfs:
+      # `exec` is required: SP1 v6 native executor extracts a JIT runner
+      # binary into /tmp and executes it as a child process. Docker's
+      # default tmpfs is mounted with noexec, which blocks execve().
+      - /tmp:size=1g,mode=1777,exec
+
+  witness-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: rsp-witness-orchestrator
+      args:
+        NETWORK: ${NETWORK}
+    image: fluent-stf/witness-orchestrator:${NETWORK}
+    container_name: fluent-witness-orchestrator
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    network_mode: host
+    volumes:
+      - ./data/witness:/var/lib/witness
+    environment:
+      RUST_LOG: ${RUST_LOG}
+      RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
+      DATADIR: ${DATADIR}
+      WITNESS_COLD_FILE: ${WITNESS_COLD_FILE}
+      MAX_COLD_BYTES: ${MAX_COLD_BYTES}
+      WITNESS_RETENTION_BLOCKS: ${WITNESS_RETENTION_BLOCKS}
+      WITNESS_HUB_LISTEN_ADDR: ${WITNESS_HUB_LISTEN_ADDR}
+      MDBX_MAX_SIZE: ${MDBX_MAX_SIZE}
+      PRUNE_FULL: ${PRUNE_FULL}
+      DB_PATH: ${DB_PATH}
+      PROXY_URL: ${PROXY_URL}
+      HTTP_TIMEOUT_SECS: ${HTTP_TIMEOUT_SECS}
+      API_KEY: ${API_KEY:?API_KEY is required in .env}
+      L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}
+      L1_ROLLUP_ADDR: ${L1_ROLLUP_ADDR:?L1_ROLLUP_ADDR is required in .env}
+      L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
+      L1_START_BATCH_ID: ${L1_START_BATCH_ID}
+      L1_ROLLUP_DEPLOY_BLOCK: ${L1_ROLLUP_DEPLOY_BLOCK}
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+

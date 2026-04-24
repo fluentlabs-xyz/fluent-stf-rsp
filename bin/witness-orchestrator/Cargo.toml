@@ -1,0 +1,93 @@
+[package]
+name = "witness-orchestrator-bin"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "witness-orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+zstd.workspace = true
+redb.workspace = true
+nitro-types.workspace = true
+tokio-util.workspace = true
+async-channel.workspace = true
+bincode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+axum = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+url.workspace = true
+rusqlite.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# alloy
+alloy-primitives = { workspace = true, features = ["k256"] }
+alloy-sol-types.workspace = true
+alloy-rpc-types.workspace = true
+alloy-network.workspace = true
+alloy-provider.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+alloy-eips.workspace = true
+alloy-consensus.workspace = true
+alloy-rpc-client.workspace = true
+
+# workspace crates
+rsp-blob-builder.workspace = true
+l1-rollup-client.workspace = true
+rsp-provider.workspace = true
+rsp-host-executor = { workspace = true, default-features = false }
+rsp-client-executor = { workspace = true }
+fluent-stf-primitives = { workspace = true, default-features = false }
+
+# reth — read side
+reth-db = { workspace = true }
+reth-provider = { workspace = true }
+reth-chainspec = { workspace = true }
+reth-node-types = { workspace = true }
+reth-ethereum-primitives = { workspace = true }
+reth-ethereum-engine-primitives = { workspace = true }
+reth-tasks = { workspace = true }
+
+# reth — write side
+reth-db-common = { workspace = true }
+reth-chain-state = { workspace = true }
+reth-trie = { workspace = true }
+reth-evm = { workspace = true }
+reth-revm = { workspace = true }
+reth-primitives-traits = { workspace = true }
+
+# reth — pruning
+reth-prune = { workspace = true }
+reth-prune-types = { workspace = true }
+reth-config = { workspace = true }
+
+# blob inspection
+c-kzg = "2.1.7"
+sha2 = "0.10"
+brotli = "8"
+alloy-rlp.workspace = true
+
+[features]
+default = ["mainnet", "zstd-block-payload"]
+mainnet = ["fluent-stf-primitives/mainnet", "rsp-host-executor/mainnet"]
+testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet", "zstd-block-payload"]
+devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet"]
+# Compress `/sign-block-execution` request bodies with zstd. Disable to send
+# the raw bincode witness uncompressed (useful for local proxies or when the
+# receiving side negotiates a different encoding).
+zstd-block-payload = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

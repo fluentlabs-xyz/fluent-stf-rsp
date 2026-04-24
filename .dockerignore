@@ -6,3 +6,14 @@
 !/crates
 !Cargo.lock
 !Cargo.toml
+
+# Pre-built ELFs required by rsp-proxy runtime stage
+!rsp-client-*.elf
+!nitro-validator-*.elf
+
+# Pre-downloaded genesis cache (populated by `make download-genesis-cache`)
+!.docker-cache/
+!.docker-cache/**
+
+# Exclude build artifacts from context
+**/target

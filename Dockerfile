@@ -1,116 +1,274 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get -y upgrade && apt-get install -y \
+# System dependencies. Intentionally no `apt-get upgrade` — it makes builds
+# non-reproducible across days (different package versions appear over time).
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libclang-dev \
     pkg-config \
+    protobuf-compiler \
+    libprotobuf-dev \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Builds a cargo-chef plan
+# Builds a cargo-chef plan. Copy only what chef needs to read manifests —
+# avoids invalidating recipe.json when unrelated files (ELFs, bin/client,
+# bin/aws-nitro-validator) change.
 FROM chef AS planner
 
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY bin/proxy/ bin/proxy/
+COPY bin/witness-orchestrator/ bin/witness-orchestrator/
 RUN cargo chef prepare --recipe-path recipe.json
 
 ###############################################################################
 #                                                                             #
-#                                Base Builder                                 #
+#                              Combined Builder                               #
 #                                                                             #
+# Compiles proxy + witness-orchestrator in one cargo invocation so that       #
+# shared workspace crates (rsp-host-executor, fluent-stf-primitives, etc)     #
+# are compiled once, not per-binary.                                          #
 ###############################################################################
 FROM chef AS builder
+
+ARG NETWORK=mainnet
+
 COPY --from=planner /app/recipe.json recipe.json
 
-# Install dependencies
-RUN apt-get update && apt-get -y upgrade && apt-get install -y jq
+# Pre-downloaded genesis cache. crates/primitives/build.rs resolves its cache
+# dir via directories::ProjectDirs — on Linux with HOME=/root it lands here.
+# Without this COPY, build.rs would HTTPS-pull three genesis.json.gz files
+# from GitHub on every cold build.
+COPY .docker-cache/genesis /root/.cache/fluent/genesis
 
-# Install Rust Stable
-RUN rustup toolchain install stable
+# Cook deps with the SAME feature flags as the final cargo build, otherwise
+# feature unification forces partial recompilation during the real build.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo chef cook --profile release --recipe-path recipe.json \
+        --no-default-features --features "${NETWORK}" \
+        -p proxy -p witness-orchestrator-bin
 
-# Builds dependencies
-RUN cargo chef cook --profile release --recipe-path recipe.json
+# Application source. trusted_setup.txt is pulled via include_bytes! in
+# bin/proxy/src/main.rs; the file ships with bin/client but is read at
+# compile time from here.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY bin/proxy/ bin/proxy/
+COPY bin/witness-orchestrator/ bin/witness-orchestrator/
+COPY bin/client/trusted_setup.txt bin/client/trusted_setup.txt
 
-# Install SP1
-RUN curl -L https://sp1.succinct.xyz | bash && \
-    ~/.sp1/bin/sp1up -v v5.0.5 && \
-    ~/.sp1/bin/cargo-prove prove --version
-
-###############################################################################
-#                                                                             #
-#                             Continuous Builder                              #
-#                                                                             #
-###############################################################################
-FROM builder as continuous-builder
-
-# Build continuous application
-COPY . .
-RUN cargo build --profile release --locked --bin continuous
-
-# ARG is not resolved in COPY so we have to hack around it by copying the
-# binary to a temporary location
-RUN cp /app/target/release/continuous /app/continuous
-
-
-###############################################################################
-#                                                                             #
-#                             Ethproofs Builder                               #
-#                                                                             #
-###############################################################################
-FROM builder as eth-proofs-builder
-
-# Build eth-proofs application
-COPY . .
-RUN cargo build --profile release --locked --bin eth-proofs
-
-# ARG is not resolved in COPY so we have to hack around it by copying the
-# binary to a temporary location
-RUN cp /app/target/release/eth-proofs /app/eth-proofs
+# Single cargo build — compiles both binaries against a unified dep graph.
+# The `cp` must run inside the same RUN as cargo build because /app/target
+# is a cache mount (not a layer-visible directory).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --profile release --locked \
+        -p proxy -p witness-orchestrator-bin \
+        --no-default-features --features "${NETWORK}" \
+    && cp /app/target/release/proxy /app/proxy \
+    && cp /app/target/release/witness-orchestrator /app/witness-orchestrator
 
 ###############################################################################
 #                                                                             #
-#                               Base Runtime                                  #
+#                            SP1 Toolchain Base                               #
 #                                                                             #
+# Debian + rust + sp1up-installed cargo-prove and succinct toolchain. Shared  #
+# base for both ELF builders so `cargo prove build` and `cargo prove vkey`    #
+# are available without installing anything on the host.                      #
 ###############################################################################
-FROM ubuntu AS runtime
-WORKDIR /app
+FROM rust:1.94-bookworm AS sp1-tools
 
-# Install Rust and required dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    jq \
-    clang \
-    build-essential \
-    git \
-    pkg-config \
-    libssl-dev \
+ARG SP1_VERSION=v6.1.0
+
+# curl/git: needed by the sp1up installer. clang/libssl/pkg-config: needed by
+# some SP1-program build scripts (k256, etc).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates git clang libclang-dev libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH=/root/.cargo/bin:$PATH
+ENV PATH="/root/.sp1/bin:${PATH}"
 
-# Install SP1
-RUN curl -L https://sp1.succinct.xyz | bash && \
-    ~/.sp1/bin/sp1up -v v5.0.5 && \
-    ~/.sp1/bin/cargo-prove prove --version
-
-###############################################################################
-#                                                                             #
-#                            Continuous Runtime                               #
-#                                                                             #
-###############################################################################
-FROM runtime as rsp-continuous
-
-COPY --from=continuous-builder /app/continuous /usr/local/bin
-
-ENTRYPOINT ["/usr/local/bin/continuous"]
+# sp1up downloads the cargo-prove binary + the succinct rust toolchain (linked
+# into rustup as `succinct`). Both pinned to ${SP1_VERSION}, so reproducibility
+# is the same as pinning a docker image tag.
+RUN curl -sSL https://sp1.succinct.xyz | bash \
+    && sp1up --version ${SP1_VERSION}
 
 ###############################################################################
 #                                                                             #
-#                            Ethproofs Runtime                                #
+#                          SP1 Client ELF Builder                             #
+#                                                                             #
+# Runs `cargo prove build` (handles RUSTFLAGS / --cfg getrandom_backend /     #
+# RISC-V target selection internally) and then `cargo prove vkey` to produce  #
+# a vkey file alongside the ELF.                                              #
+###############################################################################
+FROM sp1-tools AS sp1-client-elf-builder
+
+ARG NETWORK=mainnet
+
+WORKDIR /app
+
+# Genesis cache — crates/primitives/build.rs resolves its cache dir via
+# directories::ProjectDirs (Linux: $HOME/.cache/<name>). Without this COPY,
+# build.rs HTTPS-fetches on every build.
+COPY .docker-cache/genesis /root/.cache/fluent/genesis
+
+# bin/client has its own [workspace], but its path deps under crates/ inherit
+# `edition.workspace = true` from the REPO-ROOT Cargo.toml — cargo walks up
+# from each path dep to find a workspace for inheritance. So the root
+# Cargo.toml / Cargo.lock are required, and every member listed in its
+# `[workspace].members` must exist on disk (cargo validates the list before
+# resolving). We therefore also ship bin/proxy and bin/witness-orchestrator
+# manifests — they're never compiled here, just parsed.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY bin/proxy/ bin/proxy/
+COPY bin/witness-orchestrator/ bin/witness-orchestrator/
+COPY bin/client/ bin/client/
+
+# `cargo prove vkey --elf` fails ("setup task failed") on externally-built
+# ELFs in SP1 v6.1, so we derive the vkey via `--program` from the crate
+# directory instead. The second invocation re-uses the compile cache from the
+# first, so only the setup step runs. The `mv` / write must live in the same
+# RUN because target/ is a cache mount.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/bin/client/target \
+    cd bin/client \
+    && cargo prove build \
+        --elf-name sp1-client.elf \
+        --locked \
+        --output-directory /out \
+        --no-default-features \
+        --features "sp1 ${NETWORK}" \
+    && cargo prove vkey --program rsp-client \
+        | awk '/^0x/{print $1}' > /out/sp1-client.vkey
+
+###############################################################################
+# SP1 Client ELF Export Stage
+#
+# Exists only to let `docker build --target sp1-client-elf-export --output
+# type=local,dest=.` extract the ELF + vkey onto the host with the network-
+# tagged filenames the Makefile expects. `FROM scratch` keeps the export tree
+# empty so BuildKit writes exactly the files we copy in.
+###############################################################################
+FROM scratch AS sp1-client-elf-export
+
+ARG NETWORK=mainnet
+
+COPY --from=sp1-client-elf-builder /out/sp1-client.elf  /rsp-client-${NETWORK}.elf
+COPY --from=sp1-client-elf-builder /out/sp1-client.vkey /rsp-client-${NETWORK}.vkey
+
+###############################################################################
+#                                                                             #
+#                       Nitro-Validator ELF Builder                           #
+#                                                                             #
+# Standalone SP1 program (its own workspace, no crates/ path deps).           #
+###############################################################################
+FROM sp1-tools AS nitro-validator-elf-builder
+
+ARG NETWORK=mainnet
+
+WORKDIR /app
+
+COPY bin/aws-nitro-validator/ bin/aws-nitro-validator/
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/bin/aws-nitro-validator/target \
+    cd bin/aws-nitro-validator \
+    && cargo prove build \
+        --elf-name nitro-validator.elf \
+        --locked \
+        --output-directory /out \
+        --no-default-features \
+        --features "${NETWORK}" \
+    && cargo prove vkey --program nitro-validator \
+        | awk '/^0x/{print $1}' > /out/nitro-validator.vkey
+
+###############################################################################
+# Nitro-Validator ELF Export Stage (see SP1 client export stage above)
+###############################################################################
+FROM scratch AS nitro-validator-elf-export
+
+ARG NETWORK=mainnet
+
+COPY --from=nitro-validator-elf-builder /out/nitro-validator.elf  /nitro-validator-${NETWORK}.elf
+COPY --from=nitro-validator-elf-builder /out/nitro-validator.vkey /nitro-validator-${NETWORK}.vkey
+
+###############################################################################
+#                                                                             #
+#                            Proxy Runtime Prep                               #
 #                                                                             #
 ###############################################################################
-FROM runtime as rsp-eth-proofs
+# Distroless has no shell / mkdir / chown, so we prepare writable directories
+# with correct ownership in a throwaway debian stage and COPY --from=prep them.
+# nonroot in distroless is UID 65532.
+FROM debian:bookworm-slim AS rsp-proxy-prep
+RUN mkdir -p /out/var/lib/proxy /out/opt/elfs && \
+    chown -R 65532:65532 /out/var/lib/proxy
 
-COPY --from=eth-proofs-builder /app/eth-proofs /usr/local/bin
+###############################################################################
+#                                                                             #
+#                              Proxy Runtime                                  #
+#                                                                             #
+###############################################################################
+FROM gcr.io/distroless/cc-debian12:nonroot AS rsp-proxy
 
-ENTRYPOINT ["/usr/local/bin/eth-proofs"]
+ARG NETWORK=mainnet
+
+# busybox (static) for the TCP healthcheck — distroless has no shell/nc.
+# ~1MB overhead, single binary, musl-static.
+COPY --from=busybox:1.37.0-musl /bin/busybox /busybox
+
+COPY --from=rsp-proxy-prep --chown=65532:65532 /out/var/lib/proxy /var/lib/proxy
+COPY --from=rsp-proxy-prep /out/opt/elfs /opt/elfs
+
+COPY rsp-client-${NETWORK}.elf       /opt/elfs/sp1-client.elf
+COPY nitro-validator-${NETWORK}.elf  /opt/elfs/nitro-validator.elf
+
+COPY --from=builder /app/proxy /usr/local/bin/proxy
+
+ENV SP1_ELF_PATH=/opt/elfs/sp1-client.elf \
+    NITRO_VALIDATOR_ELF_PATH=/opt/elfs/nitro-validator.elf \
+    PROXY_DB_PATH=/var/lib/proxy/proxy.db \
+    HOME=/var/lib/proxy
+
+USER nonroot:nonroot
+WORKDIR /var/lib/proxy
+
+ENTRYPOINT ["/usr/local/bin/proxy"]
+
+###############################################################################
+#                                                                             #
+#                      Witness-Orchestrator Runtime Prep                      #
+#                                                                             #
+###############################################################################
+FROM debian:bookworm-slim AS rsp-witness-orchestrator-prep
+RUN mkdir -p /out/var/lib/witness && \
+    chown -R 65532:65532 /out/var/lib/witness
+
+###############################################################################
+#                                                                             #
+#                       Witness-Orchestrator Runtime                          #
+#                                                                             #
+###############################################################################
+FROM gcr.io/distroless/cc-debian12:nonroot AS rsp-witness-orchestrator
+
+COPY --from=busybox:1.37.0-musl /bin/busybox /busybox
+
+COPY --from=rsp-witness-orchestrator-prep --chown=65532:65532 /out/var/lib/witness /var/lib/witness
+
+COPY --from=builder /app/witness-orchestrator /usr/local/bin/witness-orchestrator
+
+ENV FLUENT_DB_PATH=/var/lib/witness/witness_courier.db \
+    HOME=/var/lib/witness
+
+USER nonroot:nonroot
+WORKDIR /var/lib/witness
+
+ENTRYPOINT ["/usr/local/bin/witness-orchestrator"]

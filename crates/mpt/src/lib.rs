@@ -2,7 +2,7 @@
 
 use alloy_primitives::{keccak256, map::HashMap, Address, B256};
 use alloy_rpc_types::EIP1186AccountProofResponse;
-use reth_trie::{AccountProof, HashedPostState, HashedStorage, TrieAccount};
+use reth_trie::{AccountProof, HashedPostState, HashedStorage, MultiProof, TrieAccount};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "execution-witness")]
@@ -13,8 +13,10 @@ mod mpt;
 pub use mpt::Error;
 use mpt::{
     mpt_from_proof, parse_proof, proofs_to_tries, resolve_nodes, transition_proofs_to_tries,
-    MptNode,
+    MptNode, MptNodeData, EMPTY_ROOT,
 };
+
+use crate::mpt::transition_multiproofs_to_tries;
 
 /// Ethereum state trie and account storage tries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +33,14 @@ impl EthereumState {
         proofs: &HashMap<Address, AccountProof>,
     ) -> Result<Self, FromProofError> {
         transition_proofs_to_tries(state_root, parent_proofs, proofs)
+    }
+
+    pub fn from_transition_multiproofs(
+        state_root: B256,
+        before_multiproof: &MultiProof,
+        after_multiproof: &MultiProof,
+    ) -> Result<Self, FromProofError> {
+        transition_multiproofs_to_tries(state_root, before_multiproof, after_multiproof)
     }
 
     /// Builds Ethereum state tries from relevant proofs from a given state.
@@ -51,7 +61,7 @@ impl EthereumState {
             let proof_nodes = parse_proof(&storage_proof.proof)?;
             mpt_from_proof(&proof_nodes)?;
 
-            // the first node in the proof is the root
+            // The first node in the proof is the root
             if let Some(node) = proof_nodes.first() {
                 storage_root_node = node.clone();
             }
@@ -93,8 +103,25 @@ impl EthereumState {
                         .get(hashed_address)
                         .cloned()
                         .unwrap_or_else(|| HashedStorage::new(false));
+
                     let storage_root = {
                         let storage_trie = self.storage_tries.entry(*hashed_address).or_default();
+
+                        // Recover the actual storage root from the state trie if the current
+                        // storage trie is uninitialized. This occurs when the provider returns
+                        // an empty root due to no storage keys being targeted in the multiproof.
+                        if storage_trie.is_empty() {
+                            if let Ok(Some(existing_acc)) =
+                                self.state_trie.get_rlp::<TrieAccount>(hashed_address.as_slice())
+                            {
+                                if existing_acc.storage_root != EMPTY_ROOT &&
+                                    existing_acc.storage_root != B256::ZERO
+                                {
+                                    *storage_trie =
+                                        MptNodeData::Digest(existing_acc.storage_root).into();
+                                }
+                            }
+                        }
 
                         if state_storage.wiped {
                             storage_trie.clear();
@@ -137,15 +164,14 @@ impl EthereumState {
 pub enum FromProofError {
     #[error("Node {} is not found by hash", .0)]
     NodeNotFoundByHash(usize),
-    #[error("Node {} refrences invalid successor", .0)]
+    #[error("Node {} references an invalid successor", .0)]
     NodeHasInvalidSuccessor(usize),
     #[error("Node {} cannot have children and is invalid", .0)]
     NodeCannotHaveChildren(usize),
     #[error("Found mismatched storage root after reconstruction \n account {}, found {}, expected {}", .0, .1, .2)]
     MismatchedStorageRoot(Address, B256, B256),
-    #[error("Found mismatched staet root after reconstruction \n found {}, expected {}", .0, .1)]
+    #[error("Found mismatched state root after reconstruction \n found {}, expected {}", .0, .1)]
     MismatchedStateRoot(B256, B256),
-    // todo: Should decode return a decoder error?
     #[error("Error decoding proofs from bytes, {}", .0)]
     DecodingError(#[from] Error),
 }

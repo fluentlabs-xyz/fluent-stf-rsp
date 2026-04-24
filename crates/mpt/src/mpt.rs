@@ -27,7 +27,7 @@ use core::{
     fmt::{Debug, Write},
     iter, mem,
 };
-use reth_trie::{AccountProof, Nibbles};
+use reth_trie::{AccountProof, MultiProof, Nibbles};
 use std::sync::Mutex;
 
 use rlp::{Decodable, DecoderError, Prototype, Rlp};
@@ -871,7 +871,7 @@ pub fn to_nibs(slice: &[u8]) -> Vec<u8> {
 /// bytes.
 pub fn to_encoded_path(mut nibs: &[u8], is_leaf: bool) -> Vec<u8> {
     let mut prefix = (is_leaf as u8) * 0x20;
-    if nibs.len() % 2 != 0 {
+    if !nibs.len().is_multiple_of(2) {
         prefix += 0x10 + nibs[0];
         nibs = &nibs[1..];
     }
@@ -931,7 +931,7 @@ pub fn mpt_from_proof(proof_nodes: &[MptNode]) -> Result<MptNode, FromProofError
                 if let Some(child) = children.iter_mut().flatten().find(
                     |child| matches!(child.as_data(), MptNodeData::Digest(d) if d == child_ref),
                 ) {
-                    *child = Box::new(replacement);
+                    **child = replacement;
                 } else {
                     return Err(FromProofError::NodeHasInvalidSuccessor(i));
                 }
@@ -991,6 +991,138 @@ pub fn resolve_nodes(root: &MptNode, node_store: &HashMap<MptNodeReference, MptN
     debug_assert_eq!(root.hash(), trie.hash());
 
     trie
+}
+
+/// Builds [`EthereumState`] from two [`MultiProof`] snapshots taken before and after
+/// a block transition.
+///
+/// The before-proof provides the sparse state trie and storage tries rooted at
+/// `state_root` (block N-1). The after-proof contributes orphaned leaves that become
+/// unreachable in the before-trie after branches collapse during the transition
+/// (e.g., due to account deletions or storage slot removals).
+///
+/// # Storage root recovery
+///
+/// reth's `multiproof()` with an empty slot target set returns
+/// `StorageMultiProof { root: EMPTY_ROOT_HASH, subtree: {} }` even for accounts with
+/// non-empty storage. This function uses the authoritative `storage_root` field from
+/// the `before_storage` entry (which reth always populates correctly from the trie walk)
+/// so the stored digest stubs carry the right root.
+pub fn transition_multiproofs_to_tries(
+    state_root: B256,
+    before_multiproof: &MultiProof,
+    after_multiproof: &MultiProof,
+) -> Result<EthereumState, FromProofError> {
+    if before_multiproof.account_subtree.is_empty() {
+        return Ok(EthereumState {
+            state_trie: node_from_digest(state_root),
+            storage_tries: HashMap::with_hasher(Default::default()),
+        });
+    }
+
+    let mut state_nodes = HashMap::with_hasher(Default::default());
+    let mut state_root_node = MptNode::default();
+
+    for (_path, rlp_bytes) in before_multiproof.account_subtree.iter() {
+        let node = MptNode::decode(rlp_bytes).map_err(FromProofError::DecodingError)?;
+
+        if node.hash() == state_root {
+            state_root_node = node.clone();
+        }
+
+        state_nodes.insert(node.reference(), node);
+    }
+
+    // =========================================================================
+    // State trie: merge orphaned leaves from the after-proof + shorten paths.
+    //
+    // After a trie transition, some leaves or extensions in the before-proof may
+    // reference sub-tries that were restructured (branches collapsed). The after-proof
+    // contains the post-collapse nodes. `shorten_node_path` generates all prefix
+    // variants so that `resolve_nodes` can match them against Digest stubs left in
+    // the before-proof.
+    // =========================================================================
+    for (_path, rlp_bytes) in after_multiproof.account_subtree.iter() {
+        let node = MptNode::decode(rlp_bytes).map_err(FromProofError::DecodingError)?;
+
+        let reference = node.reference();
+        state_nodes.entry(reference).or_insert_with(|| node.clone());
+
+        for short_node in shorten_node_path(&node) {
+            let short_ref = short_node.reference();
+            state_nodes.entry(short_ref).or_insert(short_node);
+        }
+    }
+
+    // =========================================================================
+    // Storage tries: collect before-nodes + after orphaned leaves per account.
+    // =========================================================================
+    let mut storage_tries =
+        HashMap::with_capacity_and_hasher(before_multiproof.storages.len(), Default::default());
+
+    for (hashed_address, before_storage) in &before_multiproof.storages {
+        let storage_root = before_storage.root;
+
+        if before_storage.subtree.is_empty() {
+            // No storage slots were targeted — insert a digest stub so that
+            // `EthereumState::update` can recover the real root later.
+            storage_tries.insert(*hashed_address, node_from_digest(storage_root));
+            continue;
+        }
+
+        let mut storage_nodes = HashMap::with_hasher(Default::default());
+        let mut storage_root_node = MptNode::default();
+
+        for (_path, rlp_bytes) in before_storage.subtree.iter() {
+            let node = MptNode::decode(rlp_bytes).map_err(FromProofError::DecodingError)?;
+
+            if node.hash() == storage_root {
+                storage_root_node = node.clone();
+            }
+
+            storage_nodes.insert(node.reference(), node);
+        }
+
+        // Merge after-storage orphaned leaves (same logic as state trie above).
+        if let Some(after_storage) = after_multiproof.storages.get(hashed_address) {
+            for (_path, rlp_bytes) in after_storage.subtree.iter() {
+                let node = MptNode::decode(rlp_bytes).map_err(FromProofError::DecodingError)?;
+
+                let reference = node.reference();
+                storage_nodes.entry(reference).or_insert_with(|| node.clone());
+
+                for short_node in shorten_node_path(&node) {
+                    let short_ref = short_node.reference();
+                    storage_nodes.entry(short_ref).or_insert(short_node);
+                }
+            }
+        }
+
+        let storage_trie = resolve_nodes(&storage_root_node, &storage_nodes);
+        let storage_trie_hash = storage_trie.hash();
+
+        if storage_trie_hash != storage_root {
+            return Err(FromProofError::MismatchedStorageRoot(
+                Address::default(),
+                storage_trie_hash,
+                storage_root,
+            ));
+        }
+
+        storage_tries.insert(*hashed_address, storage_trie);
+    }
+
+    // =========================================================================
+    // Final state trie reconstruction and validation.
+    // =========================================================================
+    let state_trie = resolve_nodes(&state_root_node, &state_nodes);
+    let state_trie_hash = state_trie.hash();
+
+    if state_trie_hash != state_root {
+        return Err(FromProofError::MismatchedStateRoot(state_trie_hash, state_root));
+    }
+
+    Ok(EthereumState { state_trie, storage_tries })
 }
 
 /// Returns a list of all possible nodes that can be created by shortening the path of the

@@ -1,134 +1,175 @@
 [workspace]
 members = [
-    "bin/host",
-    "bin/continuous",
-    "bin/eth-proofs",
+    "bin/proxy",
     "crates/executor/client",
     "crates/executor/host",
     "crates/mpt",
     "crates/primitives",
     "crates/provider",
     "crates/storage/rpc-db",
-    "crates/storage/witness-db",
+    "crates/storage/witness-db","crates/nitro-types",
+    "crates/blob-builder",
+    "crates/l1-rollup-client",
+    "bin/witness-orchestrator",
 ]
 exclude = []
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
+version = "0.1.0"
 license = "MIT OR Apache-2.0"
 authors = ["puma314", "jtguibas", "rkrasiuk"]
 repository = "https://github.com/moongate-forks/minimal-reth"
 homepage = "https://github.com/moongate-forks/minimal-reth"
 exclude = ["**/target"]
-version = "0.1.0"
 
 [workspace.dependencies]
+# --- std utils ---
 tracing = { version = "0.1.40", default-features = false }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 cfg-if = "1.0.0"
 spin = { version = "0.9.8", features = ["mutex"] }
 async-trait = "0.1.80"
-tokio = { version = "1.21", default-features = false, features = [
-    "rt",
-    "rt-multi-thread",
-] }
+tokio = { version = "1.21", default-features = false, features = ["rt", "rt-multi-thread"] }
 reqwest = "0.12.9"
 serde_json = "1.0.94"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_with = "3.12.0"
 futures = "0.3"
 url = "2.3"
 thiserror = "1.0.61"
+anyhow = "1.0"
+eyre = "0.6.12"
+hex = "0.4"
 hex-literal = "0.4.1"
+base64 = "0.22.1"
 rayon = "1.10.0"
 rlp = "0.5.2"
+itertools = "0.13.0"
+bincode = "1.3.3"
+either = "1.13.0"
+clap = { version = "4.5.7", features = ["derive", "env"] }
+dotenv = "0.15.0"
+strum = "0.27"
+csv = "1.1"
+axum = "0.8.8"
+zstd = "0.13"
+redb = "2.1"
+vsock = "0.5.2"
+derive_more = { version = "2.0.1", features = ["full"] }
 
-# workspace
+# --- gRPC ---
+tonic = "0.14.5"
+tonic-prost = "0.14.5"
+prost = "0.14.3"
+
+# --- async extensions ---
+tokio-stream = "0.1.18"
+tokio-util = "0.7"
+async-channel = "2"
+
+# --- persistence ---
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# --- compression ---
+brotlic = "0.8"
+
+# --- signing ---
+alloy-signer = "1.8.1"
+alloy-signer-local = { version = "1.8.1", default-features = false }
+
+# --- misc ---
+bytes = "1.10.1"
+
+# --- workspace crates ---
+rsp-blob-builder = { path = "./crates/blob-builder" }
+l1-rollup-client = { path = "./crates/l1-rollup-client" }
 rsp-rpc-db = { path = "./crates/storage/rpc-db" }
 rsp-witness-db = { path = "./crates/storage/witness-db" }
-rsp-client-executor = { path = "./crates/executor/client" }
-rsp-host-executor = { path = "./crates/executor/host" }
+rsp-client-executor = { path = "./crates/executor/client", default-features = false }
+rsp-host-executor = { path = "./crates/executor/host", default-features = false }
 rsp-mpt = { path = "./crates/mpt" }
-rsp-primitives = { path = "./crates/primitives" }
+fluent-stf-primitives = { path = "./crates/primitives", default-features = false }
 rsp-provider = { path = "./crates/provider" }
+nitro-types = { path = "./crates/nitro-types" }
+witness-orchestrator = { path = "./bin/witness-orchestrator", package = "witness-orchestrator-bin" }
+
+# --- sp1 ---
+sp1-core-executor = { version = "6.1.0", features = ["bigint-rug"] }
+sp1-prover = "6.1.0"
+sp1-sdk = "6.1.0"
+
+# --- reth ---
+reth-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["alloy-compat", "std"], branch = "v1.11-patched" }
+reth-primitives-traits = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["serde"], branch = "v1.11-patched" }
+reth-consensus = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-ethereum-consensus = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-optimism-consensus = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-consensus-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-evm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-evm-ethereum = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-storage-errors = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-trie = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-chainspec = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v1.11-patched" }
+reth-execution-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-errors = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-ethereum-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["serde"], branch = "v1.11-patched" }
+reth-optimism-forks = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-provider = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-revm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-node-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-ethereum-engine-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-tasks = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-db-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-chain-state = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-trie-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-prune = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-prune-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-config = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 
 
-# sp1
-sp1-build = "5.1.0"
-sp1-core-executor = { version = "5.1.0", features = ["bigint-rug"] }
-sp1-prover = "5.1.0"
-sp1-sdk = "5.1.0"
+# --- revm ---
+revm = { version = "34.0.0", default-features = false }
+revm-primitives = { version = "22.0.0", default-features = false }
+revm-bytecode = { version = "8.0.0", default-features = false }
+revm-database = { version = "10.0.0", default-features = false }
+revm-database-interface = { version = "9.0.0", default-features = false }
+revm-state = { version = "9.0.0", default-features = false }
+revm-interpreter = { version = "18.0.0", default-features = false }
+revm-inspector = { version = "9.0.0", default-features = false }
+revm-context = { version = "9.0.0", default-features = false }
+revm-context-interface = { version = "9.0.0", default-features = false }
+op-revm = { version = "9.0.0", default-features = false }
 
-# reth
-reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-optimism-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-optimism-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-optimism-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false, features = ["serde"] }
-reth-optimism-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-optimism-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-
-# revm
-revm = { version = "27.0.3", features = [
-    "serde",
-    "kzg-rs",
-    "bn"
-], default-features = false }
-revm-bytecode = { version = "6.0.1", default-features = false }
-revm-state = { version = "7.0.1", default-features = false }
-revm-primitives = { version = "20.0.0", features = [
-    "serde",
-], default-features = false }
-revm-interpreter = { version = "23.0.1", default-features = false }
-revm-database = { version = "7.0.1", default-features = false }
-revm-database-interface = { version = "7.0.1", default-features = false }
-op-revm = { version = "8.0.1", default-features = false }
-
-revm-inspectors = "0.27.1"
-
-# alloy
+# --- alloy ---
 alloy-chains = { version = "0.2.5", default-features = false }
-alloy-evm = { version = "0.15", default-features = false }
-alloy-primitives = { version = "1.3.0", default-features = false, features = ["sha3-keccak", "map-foldhash"] }
-alloy-provider = { version = "1.0.23", default-features = false, features = [
-    "reqwest",
-    "reqwest-rustls-tls",
-] }
-alloy-rpc-types = { version = "1.0.23", default-features = false, features = [
-    "eth",
-] }
-alloy-rpc-types-debug = { version = "1.0.23", default-features = false }
-
-alloy-json-rpc = { version = "1.0.23", default-features = false }
-alloy-genesis = { version = "1.0.23", default-features = false }
-alloy-consensus = { version = "1.0.23", default-features = false, features = ["serde", "serde-bincode-compat"] }
-alloy-network = { version = "1.0.23", default-features = false }
-alloy-transport = { version = "1.0.23", default-features = false }
-alloy-transport-http = { version = "1.0.23", features = [
-    "reqwest-rustls-tls",
-], default-features = false }
-alloy-transport-ws = { version = "1.0.23" }
-alloy-rpc-client = { version = "1.0.23", default-features = false }
-alloy-eips = { version = "1.0.23", default-features = false }
-alloy-serde = "1.0.23"
+alloy-evm = { version = "0.27.2", default-features = false }
+alloy-primitives = { version = "1.5.7", default-features = false, features = ["sha3-keccak", "map-foldhash", "getrandom"] }
+alloy-provider = { version = "1.8.1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
+alloy-rpc-types = { version = "1.8.1", default-features = false, features = ["eth"] }
+alloy-rpc-types-debug = { version = "1.8.1", default-features = false }
+alloy-json-rpc = { version = "1.8.1", default-features = false }
+alloy-genesis = { version = "1.8.1", default-features = false }
+alloy-consensus = { version = "1.8.1", default-features = false, features = ["serde", "serde-bincode-compat"] }
+alloy-network = { version = "1.8.1", default-features = false }
+alloy-transport = { version = "1.8.1", default-features = false }
+alloy-transport-http = { version = "1.8.1", default-features = false, features = ["reqwest-rustls-tls"] }
+alloy-transport-ws = { version = "1.8.1" }
+alloy-rpc-client = { version = "1.8.1", default-features = false }
+alloy-eips = { version = "1.8.1", default-features = false }
+alloy-serde = "1.8.1"
 alloy-rlp = "0.3.10"
 alloy-trie = "0.9.0"
+alloy-sol-types = { version = "1.5.7", default-features = false, features = ["json"] }
 
-# op
-alloy-op-evm = { version = "0.15", default-features = false }
+# --- op ---
 op-alloy-consensus = "0.18.12"
 op-alloy-network = "0.18.12"
 op-alloy-rpc-types = "0.18.12"
 
+kzg-rs = { git = "https://github.com/succinctlabs/kzg-rs" }
 
 [workspace.lints]
 rust.missing_debug_implementations = "warn"
@@ -137,10 +178,17 @@ rust.unused_must_use = "deny"
 rust.rust_2018_idioms = { level = "deny", priority = -1 }
 rustdoc.all = "warn"
 
+# ─── patches (single source of truth) ────────────────────────────────────────
 [patch.crates-io]
-# Precompile patches
-sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha2-0.10.9-sp1-4.0.0", package = "sha2" }
-bn = { git = "https://github.com/sp1-patches/bn", tag = "patch-0.6.0-sp1-5.0.0", package = "substrate-bn" }
-sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha3-0.10.8-sp1-4.0.0" }
-k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-5.0.0" }
-p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p256-13.2-sp1-5.0.0" }
+# revm patches
+revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-state = { package = "revm-state", git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-interpreter = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-inspector = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }

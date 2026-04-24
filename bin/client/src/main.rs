@@ -1,27 +1,18 @@
-#![no_main]
-sp1_zkvm::entrypoint!(main);
+#![cfg_attr(all(feature = "sp1", not(test)), no_main)]
 
-use rsp_client_executor::{
-    executor::{EthClientExecutor, DESERIALZE_INPUTS},
-    io::{CommittedHeader, EthClientExecutorInput},
-    utils::profile_report,
-};
-use std::sync::Arc;
+#[cfg(any(feature = "nitro", feature = "sp1"))]
+mod blob;
 
-pub fn main() {
-    // Read the input.
-    let input = profile_report!(DESERIALZE_INPUTS, {
-        let input = sp1_zkvm::io::read_vec();
-        bincode::deserialize::<EthClientExecutorInput>(&input).unwrap()
-    });
+#[cfg(feature = "nitro")]
+pub mod nitro;
 
-    // Execute the block.
-    let executor = EthClientExecutor::eth(
-        Arc::new((&input.genesis).try_into().unwrap()),
-        input.custom_beneficiary,
-    );
-    let header = executor.execute(input).expect("failed to execute client");
+#[cfg(feature = "sp1")]
+pub mod sp1;
 
-    // Commit the block header.
-    sp1_zkvm::io::commit::<CommittedHeader>(&header.into());
+#[cfg(not(feature = "sp1"))]
+fn main() {
+    #[cfg(feature = "nitro")]
+    {
+        let _ = nitro::main();
+    }
 }
