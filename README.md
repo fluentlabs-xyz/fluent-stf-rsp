@@ -82,7 +82,7 @@ Each network has its own set of cryptographic trust anchors. The values below ar
 | nitro-validator vkey | <!-- nv-vkey:devnet:begin -->`0x00260116370cce6ac4789aefcc1d540abaf2fdd1bb49b5b39a3d0935b3af57b1`<!-- nv-vkey:devnet:end --> |
 | rsp-client vkey | <!-- rsp-vkey:devnet:begin -->`0x006bafeee4793b0f76b197f903d7075fec3b9a0b69a8d7919c1e1c05f482f68f`<!-- rsp-vkey:devnet:end --> |
 
-Values built from release <!-- version:begin -->`v1.0.0`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.0`) and follow the commands in §5.
+Values built from release <!-- version:begin -->`v0.0.0`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v0.0.0`) and follow the commands in §5.
 
 ### 3.4 Identity Injection into the ZK Circuit
 
@@ -133,7 +133,7 @@ parent_hash || block_hash || withdrawal_hash || deposit_hash || versioned_hashes
 
 ## 5. Build Reproduction
 
-All commands below run from the repository root. To independently verify that the values in the §3.3 tables are correct, check out the release tag shown in §3.3 (e.g. `git checkout v1.0.0`) and execute:
+All commands below run from the repository root. To independently verify that the values in the §3.3 tables are correct, check out the release tag shown in §3.3 (e.g. `git checkout v0.0.0`) and execute:
 
 ```sh
 # Prerequisites: docker, python3, git, jq.
