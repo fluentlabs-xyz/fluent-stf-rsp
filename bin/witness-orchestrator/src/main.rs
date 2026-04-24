@@ -30,7 +30,6 @@
 //! | `L1_RPC_URL` | — | L1 Ethereum RPC URL |
 //! | `L1_ROLLUP_ADDR` | — | Rollup contract address on L1 |
 //! | `L1_SUBMITTER_KEY` | — | Private key for signing `preconfirmBatch` txs |
-//! | — | — | `NITRO_VERIFIER_ADDR` removed: now compile-time constant from `fluent_stf_primitives` |
 //! | `L1_START_BATCH_ID` | — | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
 //! | `L1_ROLLUP_DEPLOY_BLOCK` | `0` | L1 block where Rollup contract was deployed (lower bound for event scans) |
 //! | `API_KEY` | — | API key forwarded to the proxy |
@@ -47,7 +46,7 @@
 //! |--------|------|-------------|
 //! | `orchestrator_last_block_witness_built` | **gauge** | Latest L2 block number for which a witness is available (built fresh or reused from cold store). |
 //! | `orchestrator_last_block_executed` | **gauge** | Latest L2 block number executed by the proxy/enclave. |
-//! | `orchestrator_last_block_signed` | **gauge** | Latest L2 block number with a signed `/sign-block-execution` response. |
+//! | `orchestrator_last_block_signed` | **gauge** | Latest L2 block number included in a batch whose `/sign-batch-root` has succeeded (equals `last_batch_signed_to_block`). |
 //! | `orchestrator_last_batch_signed` | **gauge** | Index of the most recently signed L1 batch (`/sign-batch-root`). |
 //! | `orchestrator_last_batch_signed_from_block` | **gauge** | `from_block` of the most recently signed batch. |
 //! | `orchestrator_last_batch_signed_to_block` | **gauge** | `to_block` of the most recently signed batch. |
@@ -59,8 +58,7 @@
 //! | `orchestrator_sign_failures_total` | **counter** | Sign-endpoint failures. Labels: `stage=block|batch`, `kind=enclave_busy|other`. |
 //! | `orchestrator_l1_dispatch_rejected_total` | **counter** | `preconfirmBatch` txs that were mined with status=0 (on-chain revert). |
 //! | `orchestrator_l1_broadcast_failures_total` | **counter** | `preconfirmBatch` broadcast attempts rejected by the L1 RPC before mempool admission. Labels: `kind=nonce_too_low|stuck_at_cap|other`. |
-//! | `orchestrator_l1_dispatch_cost_eth_total` | **counter** | Cumulative ETH spent on L1 `preconfirmBatch` gas. |
-//! | `orchestrator_l1_dispatch_cost_eth` | **histogram** | Per-tx ETH cost of L1 `preconfirmBatch` (`gas_used` × `effective_gas_price` / 1e18). |
+//! | `orchestrator_l1_dispatch_cost_eth` | **histogram** | Per-tx ETH cost of L1 `preconfirmBatch` (`gas_used` × `effective_gas_price` / 1e18). Cumulative sum available via the Prometheus-emitted `_sum` counterpart. |
 
 mod accumulator;
 mod db;
@@ -206,8 +204,7 @@ async fn main() -> eyre::Result<()> {
     let l1_read_provider: RootProvider = rsp_provider::create_provider(l1_rpc_url_parsed.clone())
         .expect("failed to build L1 read provider");
 
-    // L2 provider — used by the startup resolver (for `lastBlockHash` lookup)
-    // AND later by the embedded driver + blob builder.
+    // Shared L2 provider: startup `lastBlockHash` resolve, embedded driver, blob builder.
     let l2_rpc_parsed: url::Url = rpc_url.parse().expect("Invalid RPC_URL");
     let l2_provider =
         rsp_provider::create_provider(l2_rpc_parsed).expect("failed to build L2 provider");

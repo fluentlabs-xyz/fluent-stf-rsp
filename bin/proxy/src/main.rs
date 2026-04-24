@@ -95,11 +95,11 @@ struct AppState {
     nitro: NitroConfig,
     att_cfg: Option<Arc<attestation::AttestationConfig>>,
     sp1: Option<LazySp1>,
-    /// Raw SP1 ELF bytes — used by mock endpoint for local CPU execution.
+    /// Raw SP1 ELF bytes for local CPU execution via the mock endpoint.
     sp1_elf_bytes: Option<Arc<Vec<u8>>>,
-    /// RPC / chain context — used by challenge endpoints to build ClientInput.
+    /// RPC / chain context for `ClientInput` construction on challenge paths.
     chain: ChainContext,
-    /// L1 context — used by `/sign-batch-root` for blob fetching.
+    /// L1 context for EIP-4844 blob fetching on the `/sign-batch-root` path.
     l1: Option<L1State>,
     /// Witness-orchestrator cold-storage HTTP client. If set, challenge/mock
     /// handlers query it before falling back to host execution.
@@ -746,8 +746,8 @@ async fn main() -> eyre::Result<()> {
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
-    // Witness-orchestrator HTTP cold-storage client. Optional — without it,
-    // challenge/mock handlers always execute via host RPC (legacy behaviour).
+    // Witness-orchestrator HTTP cold-storage client. Optional — when unset,
+    // challenge/mock handlers always fall back to host RPC execution.
     let witness_hub = match env::var("WITNESS_HUB_URL") {
         Ok(url) => {
             let http = reqwest::Client::builder()

@@ -46,11 +46,11 @@ pub(crate) const L1_DISPATCH_REJECTED_TOTAL: &str = "orchestrator_l1_dispatch_re
 /// Alert suggestion:
 /// `rate(orchestrator_l1_broadcast_failures_total[5m]) > 0.05` warns on a
 /// sustained L1 send problem; filtering `kind="nonce_too_low"` catches the
-/// exact race the `NonceAllocator` was introduced to prevent.
+/// exact race that `NonceAllocator` prevents.
 pub(crate) const L1_BROADCAST_FAILURES_TOTAL: &str = "orchestrator_l1_broadcast_failures_total";
 
-// Cost
-pub(crate) const L1_DISPATCH_COST_ETH_TOTAL: &str = "orchestrator_l1_dispatch_cost_eth_total";
+// Cost — histogram only. A `u64` counter cannot represent sub-ETH amounts
+// (`0.002 as u64 == 0`); cumulative spend is read from the histogram's `_sum`.
 pub(crate) const L1_DISPATCH_COST_ETH: &str = "orchestrator_l1_dispatch_cost_eth";
 
 // ─── Bucket configs (exponential, Go-reference parity) ───────────────────────
@@ -98,7 +98,8 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
     );
     metrics::describe_gauge!(
         LAST_BLOCK_SIGNED,
-        "Latest L2 block number with a signed /sign-block-execution response"
+        "Latest L2 block number included in a signed batch (equals last_batch_signed_to_block). \
+         Difference from last_block_executed surfaces blocks-executed-but-not-yet-in-signed-batch."
     );
     metrics::describe_gauge!(
         LAST_BATCH_SIGNED,
@@ -148,13 +149,10 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
          admission. Labels: kind=nonce_too_low|stuck_at_cap|other"
     );
 
-    metrics::describe_counter!(
-        L1_DISPATCH_COST_ETH_TOTAL,
-        "Cumulative ETH spent on L1 preconfirmBatch gas"
-    );
     metrics::describe_histogram!(
         L1_DISPATCH_COST_ETH,
-        "Per-tx ETH cost of L1 preconfirmBatch (gas_used × effective_gas_price / 1e18)"
+        "Per-tx ETH cost of L1 preconfirmBatch (gas_used × effective_gas_price / 1e18). \
+         Cumulative via `_sum`."
     );
 
     Ok(handle)
@@ -213,8 +211,38 @@ pub(crate) fn sign_failure_kind<E: std::fmt::Display>(err: &E) -> &'static str {
 pub(crate) fn observe_dispatch_cost(receipt: &TransactionReceipt) {
     let wei = U256::from(receipt.gas_used).saturating_mul(U256::from(receipt.effective_gas_price));
     let eth = wei_to_eth_f64(wei);
-    metrics::counter!(L1_DISPATCH_COST_ETH_TOTAL).increment(eth as u64);
     metrics::histogram!(L1_DISPATCH_COST_ETH).record(eth);
+}
+
+/// Set all three `last_batch_dispatched*` gauges in one call.
+pub(crate) fn set_last_batch_dispatched(batch_index: u64, from_block: u64, to_block: u64) {
+    metrics::gauge!(LAST_BATCH_DISPATCHED).set(batch_index as f64);
+    metrics::gauge!(LAST_BATCH_DISPATCHED_FROM_BLOCK).set(from_block as f64);
+    metrics::gauge!(LAST_BATCH_DISPATCHED_TO_BLOCK).set(to_block as f64);
+}
+
+/// Seed progress gauges from rehydrated state. Prometheus skips rendering a
+/// metric that has never been emitted, so low-cadence gauges
+/// (`last_batch_dispatched*`, `last_batch_signed*`) would stay absent until
+/// the next real event — potentially hours on a stalled pipeline.
+pub(crate) fn seed_gauges_on_startup(
+    checkpoint: u64,
+    dispatched: Option<(u64, u64, u64)>,
+    signed: Option<(u64, u64, u64)>,
+) {
+    if checkpoint > 0 {
+        metrics::gauge!(LAST_BLOCK_EXECUTED).set(checkpoint as f64);
+        metrics::gauge!(LAST_BLOCK_WITNESS_BUILT).set(checkpoint as f64);
+    }
+    if let Some((idx, from, to)) = signed {
+        metrics::gauge!(LAST_BATCH_SIGNED).set(idx as f64);
+        metrics::gauge!(LAST_BATCH_SIGNED_FROM_BLOCK).set(from as f64);
+        metrics::gauge!(LAST_BATCH_SIGNED_TO_BLOCK).set(to as f64);
+        metrics::gauge!(LAST_BLOCK_SIGNED).set(to as f64);
+    }
+    if let Some((idx, from, to)) = dispatched {
+        set_last_batch_dispatched(idx, from, to);
+    }
 }
 
 /// Classify a `send_raw_transaction` failure string into a stable label
