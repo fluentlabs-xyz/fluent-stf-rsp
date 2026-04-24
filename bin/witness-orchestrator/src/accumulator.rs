@@ -15,10 +15,11 @@ use std::{
 };
 
 use alloy_primitives::B256;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::{
-    db::Db,
+    db::{Db, DbCommand},
     types::{EthExecutionResponse, SubmitBatchResponse},
 };
 
@@ -53,7 +54,11 @@ pub(crate) struct BatchAccumulator {
     /// BatchSubmitted events that arrived before the batch was registered via set_batch.
     /// Applied when the batch is later registered.
     pending_blobs_accepted: HashSet<u64>,
-    db: Option<Arc<Mutex<Db>>>,
+    /// Sender into the DB writer actor. All mutating SQL goes through here —
+    /// per-row commands batch into one transaction on flush; atomic multi-
+    /// statement commands run as dedicated transactions. `None` only in the
+    /// test-only constructor `BatchAccumulator::new()`.
+    db_tx: Option<mpsc::Sender<DbCommand>>,
     /// In-memory cache of batch signatures: batch_index → SubmitBatchResponse.
     /// Mirrors the `batch_signatures` DB table. Eliminates sync SQL on the hot path.
     pub(crate) signatures: HashMap<u64, SubmitBatchResponse>,
@@ -62,18 +67,10 @@ pub(crate) struct BatchAccumulator {
 }
 
 impl BatchAccumulator {
-    async fn persist<F>(&self, f: F)
-    where
-        F: FnOnce(&mut Db) + Send + 'static,
-    {
-        if let Some(db) = &self.db {
-            let db = Arc::clone(db);
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                f(&mut db.lock().unwrap_or_else(|e| e.into_inner()));
-            })
-            .await
-            {
-                warn!(err = %e, "persist: spawn_blocking failed");
+    async fn send_cmd(&self, cmd: DbCommand) {
+        if let Some(tx) = &self.db_tx {
+            if tx.send(cmd).await.is_err() {
+                warn!("send_cmd: db writer channel closed — mutation dropped");
             }
         }
     }
@@ -84,14 +81,18 @@ impl BatchAccumulator {
             batches: BTreeMap::new(),
             responses: HashMap::new(),
             pending_blobs_accepted: HashSet::new(),
-            db: None,
+            db_tx: None,
             signatures: HashMap::new(),
             dispatched: BTreeMap::new(),
         }
     }
 
-    /// Create accumulator backed by a DB. Loads all state from DB on construction.
-    pub(crate) fn with_db(db: Arc<Mutex<Db>>) -> Self {
+    /// Create accumulator backed by a DB. Loads all state from DB on
+    /// construction. Stores the `db_tx` sender for all future mutations — the
+    /// loaded handle is used only for the synchronous startup reads + orphan
+    /// signature cleanup (safe because the writer actor is typically spawned
+    /// after this call completes).
+    pub(crate) fn with_db(db: Arc<Mutex<Db>>, db_tx: mpsc::Sender<DbCommand>) -> Self {
         let guard = db.lock().unwrap_or_else(|e| e.into_inner());
         let responses: HashMap<u64, EthExecutionResponse> =
             guard.load_responses().into_iter().map(|r| (r.block_number, r)).collect();
@@ -147,7 +148,14 @@ impl BatchAccumulator {
         }
         drop(guard);
 
-        Self { batches, responses, pending_blobs_accepted, db: Some(db), signatures, dispatched }
+        Self {
+            batches,
+            responses,
+            pending_blobs_accepted,
+            db_tx: Some(db_tx),
+            signatures,
+            dispatched,
+        }
     }
 
     /// Register a new batch from a `BatchCommitted` event.
@@ -167,7 +175,7 @@ impl BatchAccumulator {
         // Consume any buffered BatchSubmitted for this batch
         let blobs_accepted = self.pending_blobs_accepted.remove(&batch_index);
         if blobs_accepted {
-            self.persist(move |db| db.delete_pending_blobs_accepted(batch_index)).await;
+            self.send_cmd(DbCommand::DeletePendingBlobsAccepted(batch_index)).await;
         }
 
         let already = (from_block..=to_block).filter(|b| self.responses.contains_key(b)).count();
@@ -181,17 +189,19 @@ impl BatchAccumulator {
             "New batch registered"
         );
         let batch = PendingBatch { batch_index, from_block, to_block, blobs_accepted };
-        self.persist(move |db| {
-            db.save_batch(&PendingBatch { batch_index, from_block, to_block, blobs_accepted });
-        })
+        self.send_cmd(DbCommand::SaveBatch(PendingBatch {
+            batch_index,
+            from_block,
+            to_block,
+            blobs_accepted,
+        }))
         .await;
         self.batches.insert(batch_index, batch);
     }
 
     /// Store a block execution response. O(1).
     pub(crate) async fn insert_response(&mut self, resp: EthExecutionResponse) {
-        let resp_clone = resp.clone();
-        self.persist(move |db| db.save_response(&resp_clone)).await;
+        self.send_cmd(DbCommand::SaveResponse(resp.clone())).await;
         let block = resp.block_number;
         self.responses.insert(block, resp);
     }
@@ -200,11 +210,11 @@ impl BatchAccumulator {
         if let Some(batch) = self.batches.get_mut(&batch_index) {
             batch.blobs_accepted = true;
             // DB column keeps its original name — internal persistence schema.
-            self.persist(move |db| db.update_blobs_accepted(batch_index)).await;
+            self.send_cmd(DbCommand::UpdateBlobsAccepted(batch_index)).await;
             info!(batch_index, "Batch marked Submitted on L1");
         } else {
             self.pending_blobs_accepted.insert(batch_index);
-            self.persist(move |db| db.save_pending_blobs_accepted(batch_index)).await;
+            self.send_cmd(DbCommand::SavePendingBlobsAccepted(batch_index)).await;
             warn!(batch_index, "BatchSubmitted arrived before BatchCommitted — buffered");
         }
     }
@@ -262,8 +272,7 @@ impl BatchAccumulator {
         for &block in blocks {
             self.responses.remove(&block);
         }
-        let owned = blocks.to_vec();
-        self.persist(move |db| db.delete_responses_batch(&owned)).await;
+        self.send_cmd(DbCommand::DeleteResponsesBatch(blocks.to_vec())).await;
         info!(count = blocks.len(), "Purged responses");
     }
 
@@ -275,7 +284,7 @@ impl BatchAccumulator {
     /// Delete a cached batch signature (e.g. after key rotation invalidation).
     pub(crate) async fn delete_batch_signature(&mut self, batch_index: u64) {
         self.signatures.remove(&batch_index);
-        self.persist(move |db| db.delete_batch_signature(batch_index)).await;
+        self.send_cmd(DbCommand::DeleteBatchSignature(batch_index)).await;
     }
 
     /// Returns cloned responses for blocks in [from, to].
@@ -316,17 +325,15 @@ impl BatchAccumulator {
         let fb = batch.from_block;
         let tb = batch.to_block;
         let tx_h = tx_hash.0.to_vec();
-        self.persist(move |db| {
-            db.move_to_dispatched(
-                batch_index,
-                fb,
-                tb,
-                &tx_h,
-                l1_block,
-                nonce,
-                max_fee_per_gas,
-                max_priority_fee_per_gas,
-            )
+        self.send_cmd(DbCommand::MoveToDispatched {
+            batch_index,
+            from_block: fb,
+            to_block: tb,
+            tx_hash: tx_h,
+            l1_block,
+            nonce,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
         })
         .await;
 
@@ -358,8 +365,12 @@ impl BatchAccumulator {
         let fb = batch.from_block;
         let tb = batch.to_block;
         let tx_h = tx_hash.0.to_vec();
-        self.persist(move |db| {
-            db.move_to_dispatched_external(batch_index, fb, tb, &tx_h, l1_block)
+        self.send_cmd(DbCommand::MoveToDispatchedExternal {
+            batch_index,
+            from_block: fb,
+            to_block: tb,
+            tx_hash: tx_h,
+            l1_block,
         })
         .await;
 
@@ -382,8 +393,11 @@ impl BatchAccumulator {
             d.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
         }
         let tx_h = new_tx_hash.0.to_vec();
-        self.persist(move |db| {
-            db.update_rbf_state(batch_index, &tx_h, max_fee_per_gas, max_priority_fee_per_gas)
+        self.send_cmd(DbCommand::UpdateRbfState {
+            batch_index,
+            tx_hash: tx_h,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
         })
         .await;
     }
@@ -395,7 +409,7 @@ impl BatchAccumulator {
         if let Some(d) = self.dispatched.get_mut(&batch_index) {
             d.l1_block = l1_block;
         }
-        self.persist(move |db| db.update_dispatched_l1_block(batch_index, l1_block)).await;
+        self.send_cmd(DbCommand::UpdateDispatchedL1Block { batch_index, l1_block }).await;
     }
 
     /// Finalize a dispatched batch: delete all associated data from DB + memory.
@@ -407,7 +421,12 @@ impl BatchAccumulator {
         let fb = dispatched.from_block;
         let tb = dispatched.to_block;
 
-        self.persist(move |db| db.finalize_dispatched_batch(batch_index, fb, tb)).await;
+        self.send_cmd(DbCommand::FinalizeDispatchedBatch {
+            batch_index,
+            from_block: fb,
+            to_block: tb,
+        })
+        .await;
 
         for b in fb..=tb {
             self.responses.remove(&b);
@@ -451,7 +470,8 @@ impl BatchAccumulator {
 
         let fb = dispatched.from_block;
         let tb = dispatched.to_block;
-        self.persist(move |db| db.undispatch_batch(batch_index, fb, tb)).await;
+        self.send_cmd(DbCommand::UndispatchBatch { batch_index, from_block: fb, to_block: tb })
+            .await;
 
         self.batches.insert(batch_index, batch);
         true
@@ -604,10 +624,22 @@ mod tests {
         Arc::new(Mutex::new(db))
     }
 
+    /// Spawn a writer actor and build an accumulator backed by it. Tests that
+    /// assert on DB reloads must `drop(db_tx)` and `handle.await.unwrap()`
+    /// before reloading so queued mutations are flushed first.
+    fn accumulator_with_actor(
+        db: Arc<Mutex<Db>>,
+    ) -> (BatchAccumulator, mpsc::Sender<DbCommand>, tokio::task::JoinHandle<()>) {
+        let (db_tx, db_rx) = mpsc::channel(1000);
+        let acc = BatchAccumulator::with_db(Arc::clone(&db), db_tx.clone());
+        let handle = tokio::spawn(crate::db::run_db_writer(db_rx, db));
+        (acc, db_tx, handle)
+    }
+
     #[tokio::test]
     async fn first_ready_unsigned_skips_signed() {
         let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let (mut acc, _db_tx, _handle) = accumulator_with_actor(Arc::clone(&db));
 
         acc.set_batch(1, 10, 10).await;
         acc.set_batch(2, 11, 11).await;
@@ -640,7 +672,7 @@ mod tests {
     #[tokio::test]
     async fn first_sequential_signed_strict_ordering() {
         let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let (mut acc, _db_tx, _handle) = accumulator_with_actor(Arc::clone(&db));
 
         acc.set_batch(1, 10, 10).await;
         acc.set_batch(2, 11, 11).await;
@@ -783,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn dispatched_batches_db_round_trip() {
         let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let (mut acc, db_tx, handle) = accumulator_with_actor(Arc::clone(&db));
 
         acc.set_batch(1, 10, 12).await;
         acc.insert_response(mock_response(10)).await;
@@ -794,8 +826,15 @@ mod tests {
         let tx_hash = B256::from([0xEE; 32]);
         acc.mark_dispatched(1, tx_hash, 80, 0, 0, 0).await;
 
-        // Reload from DB
-        let acc2 = BatchAccumulator::with_db(Arc::clone(&db));
+        // Flush pending writes before reload.
+        drop(db_tx);
+        handle.await.unwrap();
+
+        // Reload from DB — build an accumulator without a live actor (reads
+        // only; the dummy sender drops immediately so reads succeed then the
+        // returned accumulator is discarded).
+        let (_unused_tx, _unused_rx) = mpsc::channel(1);
+        let acc2 = BatchAccumulator::with_db(Arc::clone(&db), _unused_tx);
         assert!(acc2.dispatched.contains_key(&1));
         let d = &acc2.dispatched[&1];
         assert_eq!(d.from_block, 10);
@@ -809,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn set_batch_same_range_on_dispatched_batch_is_noop() {
         let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let (mut acc, _db_tx, _handle) = accumulator_with_actor(Arc::clone(&db));
         acc.set_batch(1, 10, 20).await;
         for b in 10..=20u64 {
             acc.insert_response(mock_response(b)).await;
@@ -850,7 +889,10 @@ mod tests {
         }
 
         // with_db must drop the orphan sig (7) and keep the valid one (1).
-        let acc = BatchAccumulator::with_db(Arc::clone(&db));
+        // No actor needed — test only asserts in-memory + DB state after the
+        // synchronous orphan cleanup inside `with_db`.
+        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
+        let acc = BatchAccumulator::with_db(Arc::clone(&db), dummy_tx);
 
         assert!(acc.batches.contains_key(&1), "batch 1 pending row preserved");
         assert!(acc.signatures.contains_key(&1), "batch 1 signature preserved");

@@ -12,9 +12,13 @@
 //!
 //! All writes are immediately durable (WAL mode, synchronous=NORMAL).
 
-use std::path::Path;
+use std::{path::Path, sync::Arc, time::Duration};
 
 use rusqlite::{params, Connection, Result};
+use tokio::{
+    sync::mpsc,
+    time::{interval, MissedTickBehavior},
+};
 use tracing::error;
 
 use crate::{
@@ -23,7 +27,7 @@ use crate::{
 };
 
 pub(crate) struct Db {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl std::fmt::Debug for Db {
@@ -238,22 +242,6 @@ impl Db {
 
     // ── Responses ───────────────────────────────────────────────────────────
 
-    pub(crate) fn save_response(&self, resp: &EthExecutionResponse) {
-        let blob = match bincode::serialize(resp) {
-            Ok(b) => b,
-            Err(e) => {
-                error!(err = %e, "Failed to serialize EthExecutionResponse");
-                return;
-            }
-        };
-        if let Err(e) = self.conn.execute(
-            "INSERT OR REPLACE INTO block_responses(block_number, response) VALUES(?1, ?2)",
-            params![resp.block_number, blob],
-        ) {
-            error!(err = %e, block_number = resp.block_number, "Failed to persist block response");
-        }
-    }
-
     /// Delete many responses in a single transaction so bulk purges (e.g. key
     /// rotation) don't serialize N individual writes.
     pub(crate) fn delete_responses_batch(&mut self, blocks: &[u64]) {
@@ -307,6 +295,7 @@ impl Db {
 
     // ── Batches ─────────────────────────────────────────────────────────────
 
+    #[cfg(test)]
     pub(crate) fn save_batch(&self, batch: &PendingBatch) {
         if let Err(e) = self.conn.execute(
             "INSERT OR REPLACE INTO pending_batches(batch_index, from_block, to_block, blobs_accepted)
@@ -314,15 +303,6 @@ impl Db {
             params![batch.batch_index, batch.from_block, batch.to_block, batch.blobs_accepted as i64],
         ) {
             error!(err = %e, batch_index = batch.batch_index, "Failed to persist batch");
-        }
-    }
-
-    pub(crate) fn update_blobs_accepted(&self, batch_index: u64) {
-        if let Err(e) = self.conn.execute(
-            "UPDATE pending_batches SET blobs_accepted = 1 WHERE batch_index = ?1",
-            params![batch_index],
-        ) {
-            error!(err = %e, batch_index, "Failed to update blobs_accepted");
         }
     }
 
@@ -350,6 +330,7 @@ impl Db {
 
     // ── Batch signatures ─────────────────────────────────────────────────────
 
+    #[cfg(test)]
     pub(crate) fn save_batch_signature(&self, batch_index: u64, resp: &SubmitBatchResponse) {
         let blob = match bincode::serialize(resp) {
             Ok(b) => b,
@@ -453,24 +434,6 @@ impl Db {
     }
 
     // ── Pending blobs accepted ───────────────────────────────────────────────
-
-    pub(crate) fn save_pending_blobs_accepted(&self, batch_index: u64) {
-        if let Err(e) = self.conn.execute(
-            "INSERT OR IGNORE INTO pending_blobs_accepted(batch_index) VALUES(?1)",
-            params![batch_index],
-        ) {
-            error!(err = %e, batch_index, "Failed to save pending_blobs_accepted");
-        }
-    }
-
-    pub(crate) fn delete_pending_blobs_accepted(&self, batch_index: u64) {
-        if let Err(e) = self.conn.execute(
-            "DELETE FROM pending_blobs_accepted WHERE batch_index = ?1",
-            params![batch_index],
-        ) {
-            error!(err = %e, batch_index, "Failed to delete pending_blobs_accepted");
-        }
-    }
 
     pub(crate) fn load_pending_blobs_accepted(&self) -> Vec<u64> {
         let mut stmt = match self.conn.prepare("SELECT batch_index FROM pending_blobs_accepted") {
@@ -578,41 +541,6 @@ impl Db {
         }
     }
 
-    /// Update the RBF state of a dispatched batch after a fee bump + rebroadcast.
-    /// Atomic: updates tx_hash, max_fee_per_gas, max_priority_fee_per_gas.
-    pub(crate) fn update_rbf_state(
-        &mut self,
-        batch_index: u64,
-        tx_hash: &[u8],
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-    ) {
-        if let Err(e) = self.conn.execute(
-            "UPDATE dispatched_batches
-             SET tx_hash = ?2, max_fee_per_gas = ?3, max_priority_fee_per_gas = ?4
-             WHERE batch_index = ?1",
-            params![
-                batch_index,
-                tx_hash,
-                max_fee_per_gas.to_string(),
-                max_priority_fee_per_gas.to_string(),
-            ],
-        ) {
-            error!(err = %e, batch_index, "Failed to update RBF state");
-        }
-    }
-
-    /// Update l1_block once the tx lands. Separate from `update_rbf_state`
-    /// because RBF bumps happen many times, but l1_block updates exactly once.
-    pub(crate) fn update_dispatched_l1_block(&mut self, batch_index: u64, l1_block: u64) {
-        if let Err(e) = self.conn.execute(
-            "UPDATE dispatched_batches SET l1_block = ?2 WHERE batch_index = ?1",
-            params![batch_index, l1_block],
-        ) {
-            error!(err = %e, batch_index, "Failed to update dispatched l1_block");
-        }
-    }
-
     /// Atomically clean up a finalized dispatched batch.
     /// Single transaction: DELETE dispatched + DELETE responses + DELETE signature.
     pub(crate) fn finalize_dispatched_batch(
@@ -716,5 +644,337 @@ impl Db {
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DB writer actor
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// All mutating SQLite operations route through an `mpsc::Sender<DbCommand>`
+// into a single background task that batches per-row writes into one
+// transaction per flush (size threshold OR timer tick) — collapsing N fsyncs
+// into one. Atomic multi-statement commands drain the per-row buffer first,
+// then run as their own dedicated transaction, preserving both atomicity and
+// FIFO ordering with preceding per-row writes.
+//
+// Readers (`get_*`, `load_*`) stay synchronous on the same `Arc<Mutex<Db>>`
+// the actor owns — startup reads happen before the actor runs; the lone
+// runtime read (`get_batch_signature` in `sign_batch_io`) serializes on the
+// Mutex with the actor.
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum DbCommand {
+    // Per-row (coalesced into one batched transaction on flush)
+    SaveResponse(EthExecutionResponse),
+    SaveCheckpoint(u64),
+    SaveL1Checkpoint(u64),
+    SaveLastBatchEnd(u64),
+    SaveBatch(PendingBatch),
+    UpdateBlobsAccepted(u64),
+    SavePendingBlobsAccepted(u64),
+    DeletePendingBlobsAccepted(u64),
+    SaveBatchSignature {
+        batch_index: u64,
+        resp: SubmitBatchResponse,
+    },
+    DeleteBatchSignature(u64),
+    UpdateRbfState {
+        batch_index: u64,
+        tx_hash: Vec<u8>,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    },
+    UpdateDispatchedL1Block {
+        batch_index: u64,
+        l1_block: u64,
+    },
+
+    // Atomic multi-statement (dedicated transaction; buffer flushed first)
+    DeleteResponsesBatch(Vec<u64>),
+    MoveToDispatched {
+        batch_index: u64,
+        from_block: u64,
+        to_block: u64,
+        tx_hash: Vec<u8>,
+        l1_block: u64,
+        nonce: u64,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    },
+    MoveToDispatchedExternal {
+        batch_index: u64,
+        from_block: u64,
+        to_block: u64,
+        tx_hash: Vec<u8>,
+        l1_block: u64,
+    },
+    FinalizeDispatchedBatch {
+        batch_index: u64,
+        from_block: u64,
+        to_block: u64,
+    },
+    UndispatchBatch {
+        batch_index: u64,
+        from_block: u64,
+        to_block: u64,
+    },
+    WipeForRevert {
+        start_batch_id: u64,
+        l1_block: u64,
+    },
+}
+
+impl DbCommand {
+    fn is_atomic(&self) -> bool {
+        matches!(
+            self,
+            DbCommand::DeleteResponsesBatch(_) |
+                DbCommand::MoveToDispatched { .. } |
+                DbCommand::MoveToDispatchedExternal { .. } |
+                DbCommand::FinalizeDispatchedBatch { .. } |
+                DbCommand::UndispatchBatch { .. } |
+                DbCommand::WipeForRevert { .. }
+        )
+    }
+}
+
+/// Per-row flush threshold. Sized to cover a whole L2 batch (≤ ~10 k blocks)
+/// in a handful of flushes while keeping buffered memory bounded.
+const DB_BUFFER_FLUSH_SIZE: usize = 1000;
+
+/// Timer-driven flush cadence. Short enough for live ops visibility; long
+/// enough to amortize fsyncs across many per-row commands during bursts.
+const DB_BUFFER_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Drain `rx` until the sender is dropped, applying commands to the DB.
+/// Per-row commands coalesce into one transaction per flush; atomic multi-
+/// statement commands flush any pending buffer first and then run as their
+/// own transaction. On sender close, performs one final flush and exits.
+pub(crate) async fn run_db_writer(
+    mut rx: mpsc::Receiver<DbCommand>,
+    db: Arc<std::sync::Mutex<Db>>,
+) {
+    tracing::info!("DB writer actor started");
+    let mut buffer: Vec<DbCommand> = Vec::with_capacity(DB_BUFFER_FLUSH_SIZE);
+    let mut ticker = interval(DB_BUFFER_FLUSH_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            maybe_cmd = rx.recv() => {
+                match maybe_cmd {
+                    Some(cmd) if cmd.is_atomic() => {
+                        flush_per_row_buffer(&db, &mut buffer);
+                        run_atomic_command(&db, cmd);
+                    }
+                    Some(cmd) => {
+                        buffer.push(cmd);
+                        if buffer.len() >= DB_BUFFER_FLUSH_SIZE {
+                            flush_per_row_buffer(&db, &mut buffer);
+                        }
+                    }
+                    None => {
+                        flush_per_row_buffer(&db, &mut buffer);
+                        break;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                if !buffer.is_empty() {
+                    flush_per_row_buffer(&db, &mut buffer);
+                }
+            }
+        }
+    }
+    tracing::info!("DB writer actor exited");
+}
+
+fn flush_per_row_buffer(db: &Arc<std::sync::Mutex<Db>>, buffer: &mut Vec<DbCommand>) {
+    if buffer.is_empty() {
+        return;
+    }
+    let drained: Vec<DbCommand> = std::mem::take(buffer);
+    let count = drained.len();
+    let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
+    let tx = match guard.conn.transaction() {
+        Ok(t) => t,
+        Err(e) => {
+            error!(err = %e, count, "db writer: begin tx failed — batch dropped");
+            return;
+        }
+    };
+    for cmd in drained {
+        apply_per_row_in_tx(&tx, cmd);
+    }
+    if let Err(e) = tx.commit() {
+        error!(err = %e, count, "db writer: commit failed — batch lost");
+    }
+}
+
+fn apply_per_row_in_tx(tx: &rusqlite::Transaction<'_>, cmd: DbCommand) {
+    match cmd {
+        DbCommand::SaveResponse(resp) => {
+            let blob = match bincode::serialize(&resp) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(err = %e, "save_response: serialize failed");
+                    return;
+                }
+            };
+            if let Err(e) = tx.execute(
+                "INSERT OR REPLACE INTO block_responses(block_number, response) VALUES(?1, ?2)",
+                params![resp.block_number, blob],
+            ) {
+                error!(err = %e, block_number = resp.block_number, "save_response in batch");
+            }
+        }
+        DbCommand::SaveCheckpoint(cp) => {
+            if let Err(e) = tx.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('checkpoint', ?1)",
+                params![cp.to_string()],
+            ) {
+                error!(err = %e, cp, "save_checkpoint in batch");
+            }
+        }
+        DbCommand::SaveL1Checkpoint(cp) => {
+            if let Err(e) = tx.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('l1_checkpoint', ?1)",
+                params![cp.to_string()],
+            ) {
+                error!(err = %e, cp, "save_l1_checkpoint in batch");
+            }
+        }
+        DbCommand::SaveLastBatchEnd(b) => {
+            if let Err(e) = tx.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('last_batch_end', ?1)",
+                params![b.to_string()],
+            ) {
+                error!(err = %e, block = b, "save_last_batch_end in batch");
+            }
+        }
+        DbCommand::SaveBatch(batch) => {
+            if let Err(e) = tx.execute(
+                "INSERT OR REPLACE INTO pending_batches(batch_index, from_block, to_block, blobs_accepted) VALUES(?1, ?2, ?3, ?4)",
+                params![batch.batch_index, batch.from_block, batch.to_block, batch.blobs_accepted as i64],
+            ) {
+                error!(err = %e, batch_index = batch.batch_index, "save_batch in batch");
+            }
+        }
+        DbCommand::UpdateBlobsAccepted(batch_index) => {
+            if let Err(e) = tx.execute(
+                "UPDATE pending_batches SET blobs_accepted = 1 WHERE batch_index = ?1",
+                params![batch_index],
+            ) {
+                error!(err = %e, batch_index, "update_blobs_accepted in batch");
+            }
+        }
+        DbCommand::SavePendingBlobsAccepted(batch_index) => {
+            if let Err(e) = tx.execute(
+                "INSERT OR IGNORE INTO pending_blobs_accepted(batch_index) VALUES(?1)",
+                params![batch_index],
+            ) {
+                error!(err = %e, batch_index, "save_pending_blobs_accepted in batch");
+            }
+        }
+        DbCommand::DeletePendingBlobsAccepted(batch_index) => {
+            if let Err(e) = tx.execute(
+                "DELETE FROM pending_blobs_accepted WHERE batch_index = ?1",
+                params![batch_index],
+            ) {
+                error!(err = %e, batch_index, "delete_pending_blobs_accepted in batch");
+            }
+        }
+        DbCommand::SaveBatchSignature { batch_index, resp } => {
+            let blob = match bincode::serialize(&resp) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(err = %e, batch_index, "save_batch_signature: serialize failed");
+                    return;
+                }
+            };
+            if let Err(e) = tx.execute(
+                "INSERT OR REPLACE INTO batch_signatures(batch_index, response) VALUES(?1, ?2)",
+                params![batch_index, blob],
+            ) {
+                error!(err = %e, batch_index, "save_batch_signature in batch");
+            }
+        }
+        DbCommand::DeleteBatchSignature(batch_index) => {
+            if let Err(e) = tx.execute(
+                "DELETE FROM batch_signatures WHERE batch_index = ?1",
+                params![batch_index],
+            ) {
+                error!(err = %e, batch_index, "delete_batch_signature in batch");
+            }
+        }
+        DbCommand::UpdateRbfState {
+            batch_index,
+            tx_hash,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        } => {
+            if let Err(e) = tx.execute(
+                "UPDATE dispatched_batches SET tx_hash = ?2, max_fee_per_gas = ?3, max_priority_fee_per_gas = ?4 WHERE batch_index = ?1",
+                params![batch_index, tx_hash, max_fee_per_gas.to_string(), max_priority_fee_per_gas.to_string()],
+            ) {
+                error!(err = %e, batch_index, "update_rbf_state in batch");
+            }
+        }
+        DbCommand::UpdateDispatchedL1Block { batch_index, l1_block } => {
+            if let Err(e) = tx.execute(
+                "UPDATE dispatched_batches SET l1_block = ?2 WHERE batch_index = ?1",
+                params![batch_index, l1_block],
+            ) {
+                error!(err = %e, batch_index, "update_dispatched_l1_block in batch");
+            }
+        }
+        _ => unreachable!("atomic command reached per-row apply"),
+    }
+}
+
+fn run_atomic_command(db: &Arc<std::sync::Mutex<Db>>, cmd: DbCommand) {
+    let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
+    match cmd {
+        DbCommand::DeleteResponsesBatch(blocks) => guard.delete_responses_batch(&blocks),
+        DbCommand::MoveToDispatched {
+            batch_index,
+            from_block,
+            to_block,
+            tx_hash,
+            l1_block,
+            nonce,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        } => guard.move_to_dispatched(
+            batch_index,
+            from_block,
+            to_block,
+            &tx_hash,
+            l1_block,
+            nonce,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        ),
+        DbCommand::MoveToDispatchedExternal {
+            batch_index,
+            from_block,
+            to_block,
+            tx_hash,
+            l1_block,
+        } => {
+            guard.move_to_dispatched_external(batch_index, from_block, to_block, &tx_hash, l1_block)
+        }
+        DbCommand::FinalizeDispatchedBatch { batch_index, from_block, to_block } => {
+            guard.finalize_dispatched_batch(batch_index, from_block, to_block)
+        }
+        DbCommand::UndispatchBatch { batch_index, from_block, to_block } => {
+            guard.undispatch_batch(batch_index, from_block, to_block)
+        }
+        DbCommand::WipeForRevert { start_batch_id, l1_block } => {
+            guard.wipe_for_revert(start_batch_id, l1_block)
+        }
+        _ => unreachable!("non-atomic command reached atomic handler"),
     }
 }
