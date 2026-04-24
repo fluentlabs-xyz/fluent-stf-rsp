@@ -254,8 +254,8 @@ impl Db {
         }
     }
 
-    /// Delete many responses in a single transaction — used by key-rotation
-    /// purge so the accumulator doesn't serialize N writes.
+    /// Delete many responses in a single transaction so bulk purges (e.g. key
+    /// rotation) don't serialize N individual writes.
     pub(crate) fn delete_responses_batch(&mut self, blocks: &[u64]) {
         let tx = match self.conn.transaction() {
             Ok(t) => t,

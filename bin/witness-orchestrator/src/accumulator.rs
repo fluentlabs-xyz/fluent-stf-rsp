@@ -48,7 +48,7 @@ pub(crate) struct DispatchedBatch {
 
 #[derive(Debug)]
 pub(crate) struct BatchAccumulator {
-    batches: BTreeMap<u64, PendingBatch>,
+    pub(crate) batches: BTreeMap<u64, PendingBatch>,
     responses: HashMap<u64, EthExecutionResponse>,
     /// BatchSubmitted events that arrived before the batch was registered via set_batch.
     /// Applied when the batch is later registered.
@@ -56,7 +56,7 @@ pub(crate) struct BatchAccumulator {
     db: Option<Arc<Mutex<Db>>>,
     /// In-memory cache of batch signatures: batch_index → SubmitBatchResponse.
     /// Mirrors the `batch_signatures` DB table. Eliminates sync SQL on the hot path.
-    signatures: HashMap<u64, SubmitBatchResponse>,
+    pub(crate) signatures: HashMap<u64, SubmitBatchResponse>,
     /// Batches submitted to L1 awaiting finalization.
     pub(crate) dispatched: BTreeMap<u64, DispatchedBatch>,
 }

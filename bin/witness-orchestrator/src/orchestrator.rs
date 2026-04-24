@@ -492,6 +492,28 @@ pub(crate) async fn run(
             .expect("startup accumulator load panicked")
     };
 
+    // Single-writer window — runs before any background task that could emit.
+    {
+        let checkpoint = db.lock().unwrap_or_else(|e| e.into_inner()).get_checkpoint();
+        let dispatched_max: Option<(u64, u64, u64)> =
+            accumulator.dispatched.iter().next_back().map(|(&i, d)| (i, d.from_block, d.to_block));
+        // A dispatched batch was signed before dispatch, so it counts toward
+        // `signed_max`. Take the higher batch_index across pending-signed and
+        // dispatched.
+        let pending_signed = accumulator
+            .batches
+            .iter()
+            .rev()
+            .find(|(i, _)| accumulator.signatures.contains_key(i))
+            .map(|(&i, b)| (i, b.from_block, b.to_block));
+        let signed_max = match (pending_signed, dispatched_max) {
+            (Some(s), Some(d)) if d.0 > s.0 => Some(d),
+            (None, d) => d,
+            (s, _) => s,
+        };
+        crate::metrics::seed_gauges_on_startup(checkpoint, dispatched_max, signed_max);
+    }
+
     let mut last_batch_end: Option<u64> =
         db.lock().unwrap_or_else(|e| e.into_inner()).get_last_batch_end();
 
@@ -806,8 +828,10 @@ impl OrchestratorState {
         info!(block_number, "Block execution response received");
         accumulator.insert_response(result.response).await;
 
+        // `LAST_BLOCK_SIGNED` advances in `on_sign_done` (batch-level), not here.
+        // The resulting `executed − signed` gap surfaces blocks already executed
+        // but not yet included in a signed batch.
         metrics::gauge!(crate::metrics::LAST_BLOCK_EXECUTED).set(block_number as f64);
-        metrics::gauge!(crate::metrics::LAST_BLOCK_SIGNED).set(block_number as f64);
 
         self.known_responses.write().unwrap_or_else(|e| e.into_inner()).insert(block_number);
 
@@ -850,6 +874,13 @@ impl OrchestratorState {
                 // poll cycle (receipt → Submitted → on_dispatch_done just
                 // patches l1_block via record_dispatched_l1_block).
                 accumulator.mark_dispatched_external(batch_index, tx_hash, l1_block).await;
+                if let Some(batch) = accumulator.dispatched.get(&batch_index) {
+                    crate::metrics::set_last_batch_dispatched(
+                        batch_index,
+                        batch.from_block,
+                        batch.to_block,
+                    );
+                }
                 self.global_dispatch_attempts = 0;
                 self.global_next_dispatch_allowed = None;
                 info!(
@@ -1006,6 +1037,7 @@ impl OrchestratorState {
                         .set(batch.from_block as f64);
                     metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_TO_BLOCK)
                         .set(batch.to_block as f64);
+                    metrics::gauge!(crate::metrics::LAST_BLOCK_SIGNED).set(batch.to_block as f64);
 
                     let blocks: Vec<u64> = (batch.from_block..=batch.to_block).collect();
                     accumulator.purge_responses(&blocks).await;
@@ -1187,12 +1219,14 @@ impl OrchestratorState {
 
                 accumulator.record_dispatched_l1_block(batch_index, l1_block).await;
 
-                if let Some(batch) = accumulator.get(batch_index) {
-                    metrics::gauge!(crate::metrics::LAST_BATCH_DISPATCHED).set(batch_index as f64);
-                    metrics::gauge!(crate::metrics::LAST_BATCH_DISPATCHED_FROM_BLOCK)
-                        .set(batch.from_block as f64);
-                    metrics::gauge!(crate::metrics::LAST_BATCH_DISPATCHED_TO_BLOCK)
-                        .set(batch.to_block as f64);
+                // `mark_dispatched` (fired on `InitialBroadcast` earlier) moved
+                // the entry out of `batches` into `dispatched` — read from there.
+                if let Some(batch) = accumulator.dispatched.get(&batch_index) {
+                    crate::metrics::set_last_batch_dispatched(
+                        batch_index,
+                        batch.from_block,
+                        batch.to_block,
+                    );
                 }
 
                 info!(
@@ -1226,6 +1260,13 @@ impl OrchestratorState {
                     "Batch already preconfirmed on L1 — seeding dispatched state from on-chain event"
                 );
                 accumulator.mark_dispatched_external(batch_index, tx_hash, l1_block).await;
+                if let Some(batch) = accumulator.dispatched.get(&batch_index) {
+                    crate::metrics::set_last_batch_dispatched(
+                        batch_index,
+                        batch.from_block,
+                        batch.to_block,
+                    );
+                }
                 self.try_dispatch_next_batch(accumulator);
             }
 
@@ -1394,9 +1435,9 @@ impl OrchestratorState {
 // L1 finality helpers
 // ============================================================================
 
-/// Narrow RPC surface used by [`check_finalized_batches`]. The blanket impl
-/// for any `alloy` [`Provider`] lets production code pass `&l1_provider` as-is,
-/// while tests substitute a hand-rolled stub.
+/// Narrow RPC surface for finalized-batch checks. The blanket impl for any
+/// `alloy` [`Provider`] lets production code pass `&l1_provider` as-is, while
+/// tests substitute a hand-rolled stub.
 #[async_trait::async_trait]
 pub(crate) trait FinalityRpc: Send + Sync {
     async fn finalized_block_number(&self) -> Option<u64>;
