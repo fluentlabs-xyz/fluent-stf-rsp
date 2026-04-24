@@ -417,8 +417,27 @@ impl BatchAccumulator {
         Some(dispatched)
     }
 
-    /// Move a dispatched batch back to pending (reorg recovery).
+    /// Move a dispatched batch back to pending (reorg / dispatch retry).
+    ///
+    /// Guard: rows with `nonce == None` were seeded by `mark_dispatched_external`
+    /// from a `BatchPreconfirmed` L1 event (someone else preconfirmed the batch).
+    /// A concurrent pre-flight Failed/Reverted on our side must NOT wipe that
+    /// external state — its finalization is owned by the external submitter and
+    /// the finalization ticker will clean up once the receipt lands. Only our
+    /// own dispatches (nonce = Some) may be unwound here.
     pub(crate) async fn undispatch(&mut self, batch_index: u64) -> bool {
+        if let Some(d) = self.dispatched.get(&batch_index) {
+            if d.nonce.is_none() {
+                info!(
+                    batch_index,
+                    "Skip undispatch: external dispatch (nonce=None) — leaving for finalization"
+                );
+                return false;
+            }
+        } else {
+            return false;
+        }
+
         let Some(dispatched) = self.dispatched.remove(&batch_index) else {
             return false;
         };
@@ -714,6 +733,28 @@ mod tests {
         assert_eq!(batch.from_block, 10);
         assert_eq!(batch.to_block, 11);
         assert!(batch.blobs_accepted);
+    }
+
+    #[tokio::test]
+    async fn undispatch_skips_external_dispatch() {
+        // Simulates the race: we signed a batch, a concurrent BatchPreconfirmed
+        // live event moved it to dispatched via mark_dispatched_external
+        // (nonce = None), and our in-flight pre-flight then returned Failed.
+        // The Failed-branch undispatch MUST NOT wipe the external state.
+        let mut acc = BatchAccumulator::new();
+        acc.set_batch(1, 10, 11).await;
+        acc.insert_response(mock_response(10)).await;
+        acc.insert_response(mock_response(11)).await;
+        acc.mark_batch_submitted(1).await;
+
+        acc.mark_dispatched_external(1, B256::from([0xAB; 32]), 42).await;
+        assert!(acc.dispatched.contains_key(&1));
+        assert!(acc.get(1).is_none());
+
+        let ok = acc.undispatch(1).await;
+        assert!(!ok, "undispatch must be a no-op for external dispatch");
+        assert!(acc.dispatched.contains_key(&1), "external row preserved");
+        assert!(acc.get(1).is_none(), "no resurrection into pending");
     }
 
     #[tokio::test]
