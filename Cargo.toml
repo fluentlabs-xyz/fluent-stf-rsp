@@ -59,6 +59,10 @@ redb = "2.1"
 vsock = "0.5.2"
 derive_more = { version = "2.0.1", features = ["full"] }
 
+# --- observability ---
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+
 # --- gRPC ---
 tonic = "0.14.5"
 tonic-prost = "0.14.5"
@@ -109,6 +113,7 @@ reth-optimism-consensus = { git = "https://github.com/fluentlabs-xyz/reth", defa
 reth-consensus-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-evm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-evm-ethereum = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-storage-api = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-storage-errors = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-trie = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-chainspec = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v1.11-patched" }

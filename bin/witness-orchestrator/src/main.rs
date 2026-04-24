@@ -35,17 +35,49 @@
 //! | `L1_ROLLUP_DEPLOY_BLOCK` | `0` | L1 block where Rollup contract was deployed (lower bound for event scans) |
 //! | `API_KEY` | — | API key forwarded to the proxy |
 //! | `PRUNE_FULL` | `false` | If `true`, prune MDBX/static-files using the same defaults as `reth --full` (sender_recovery=Full, receipts/account_history/storage_history distance=10064 blocks, bodies_history=Before(Paris)) |
+//! | `FLUENT_METRICS_ADDR` | `0.0.0.0:9090` | HTTP listen address for the Prometheus `/metrics` endpoint. |
+//!
+//! # Metrics
+//!
+//! Mirrors the Go sequencer metric shape (see
+//! `rollup-bridge-services/internal/services/sequencer/metrics.go`).
+//! Scraped from `FLUENT_METRICS_ADDR` on `/metrics`.
+//!
+//! | Metric | Type | Description |
+//! |--------|------|-------------|
+//! | `orchestrator_last_block_witness_built` | **gauge** | Latest L2 block number for which a witness is available (built fresh or reused from cold store). |
+//! | `orchestrator_last_block_executed` | **gauge** | Latest L2 block number executed by the proxy/enclave. |
+//! | `orchestrator_last_block_signed` | **gauge** | Latest L2 block number with a signed `/sign-block-execution` response. |
+//! | `orchestrator_last_batch_signed` | **gauge** | Index of the most recently signed L1 batch (`/sign-batch-root`). |
+//! | `orchestrator_last_batch_signed_from_block` | **gauge** | `from_block` of the most recently signed batch. |
+//! | `orchestrator_last_batch_signed_to_block` | **gauge** | `to_block` of the most recently signed batch. |
+//! | `orchestrator_last_batch_dispatched` | **gauge** | Index of the most recently L1-included `preconfirmBatch` (status=1). |
+//! | `orchestrator_last_batch_dispatched_from_block` | **gauge** | `from_block` of the most recently L1-included batch. |
+//! | `orchestrator_last_batch_dispatched_to_block` | **gauge** | `to_block` of the most recently L1-included batch. |
+//! | `orchestrator_sign_block_execution_duration_seconds` | **histogram** | Per-attempt duration of `/sign-block-execution` HTTP call (seconds). |
+//! | `orchestrator_sign_batch_root_duration_seconds` | **histogram** | Per-attempt duration of `/sign-batch-root` HTTP call (seconds). |
+//! | `orchestrator_sign_failures_total` | **counter** | Sign-endpoint failures. Labels: `stage=block|batch`, `kind=enclave_busy|other`. |
+//! | `orchestrator_l1_dispatch_rejected_total` | **counter** | `preconfirmBatch` txs that were mined with status=0 (on-chain revert). |
+//! | `orchestrator_l1_broadcast_failures_total` | **counter** | `preconfirmBatch` broadcast attempts rejected by the L1 RPC before mempool admission. Labels: `kind=nonce_too_low|stuck_at_cap|other`. |
+//! | `orchestrator_l1_dispatch_cost_eth_total` | **counter** | Cumulative ETH spent on L1 `preconfirmBatch` gas. |
+//! | `orchestrator_l1_dispatch_cost_eth` | **histogram** | Per-tx ETH cost of L1 `preconfirmBatch` (`gas_used` × `effective_gas_price` / 1e18). |
 
 mod accumulator;
 mod db;
 mod driver;
 mod hub;
 mod l1_listener;
+mod metrics;
 mod orchestrator;
 mod types;
 mod witness_server;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use crate::hub::{WitnessHub, DEFAULT_COLD_BATCH_SIZE};
 use alloy_network::{Ethereum, EthereumWallet};
@@ -53,10 +85,8 @@ use alloy_primitives::Address;
 use alloy_provider::{ProviderBuilder, RootProvider};
 use alloy_signer_local::PrivateKeySigner;
 use fluent_stf_primitives::fluent_chainspec;
-use reth_chainspec::{ChainSpec, EthereumHardfork, EthereumHardforks};
-use reth_config::PruneConfig;
-use reth_prune::PrunerBuilder;
-use reth_prune_types::{PruneMode, PruneModes, MINIMUM_UNWIND_SAFE_DISTANCE};
+use reth_chainspec::ChainSpec;
+use reth_provider::BlockNumReader;
 use reth_tasks::Runtime;
 use rsp_host_executor::EthHostExecutor;
 use tokio::runtime::Handle;
@@ -78,15 +108,23 @@ const DEFAULT_MDBX_MAX_SIZE: u64 = 512 * 1024 * 1024 * 1024;
 const DEFAULT_WITNESS_RETENTION_BLOCKS: u64 = 172_800;
 /// Default listen address for the witness HTTP server.
 const DEFAULT_WITNESS_HUB_LISTEN_ADDR: &str = "127.0.0.1:8090";
+/// Default listen address for the Prometheus `/metrics` HTTP server.
+const DEFAULT_METRICS_LISTEN_ADDR: &str = "0.0.0.0:9090";
 
 #[tokio::main]
-async fn main() {
+async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Install Prometheus recorder before any spawn so early metric writes are
+    // not lost to the noop recorder.
+    let metrics_handle = Arc::new(metrics::install()?);
+    let metrics_listen_addr =
+        std::env::var("FLUENT_METRICS_ADDR").unwrap_or_else(|_| DEFAULT_METRICS_LISTEN_ADDR.into());
 
     let rpc_url = std::env::var("RPC_URL").expect("RPC_URL is required");
     let datadir =
@@ -125,11 +163,37 @@ async fn main() {
         .expect("Invalid L1_ROLLUP_ADDR");
     let l1_submitter_key = std::env::var("L1_SUBMITTER_KEY").expect("L1_SUBMITTER_KEY is required");
     let nitro_verifier_addr: Address = fluent_stf_primitives::NITRO_VERIFIER_ADDR;
-    let start_batch_id: Option<u64> =
+    let env_start_batch_id: Option<u64> =
         std::env::var("L1_START_BATCH_ID").ok().and_then(|s| s.parse().ok());
     let l1_deploy_block: u64 =
         std::env::var("L1_ROLLUP_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let api_key = std::env::var("API_KEY").expect("API_KEY is required");
+
+    // RBF dispatch tuning: 15s cycle, +20% bump (safely above EIP-1559's
+    // +12.5% minimum), 500 gwei cap.
+    let rbf_bump_interval = Duration::from_secs(
+        std::env::var("RBF_BUMP_INTERVAL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
+    );
+    let rbf_bump_percent: u32 =
+        std::env::var("RBF_BUMP_PERCENT").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let rbf_max_fee_per_gas_wei: u128 = std::env::var("RBF_MAX_FEE_PER_GAS_WEI")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500_000_000_000u128);
+
+    let l1_poll_interval_secs: u64 =
+        std::env::var("L1_POLL_INTERVAL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+    let l1_safe_blocks: u64 =
+        std::env::var("L1_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+    let l2_safe_blocks: u64 =
+        std::env::var("L2_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+
+    // Optional destructive knob. Hard error on malformed value so a typo does
+    // not silently skip the unwind (operator would then believe it ran).
+    let unwind_to_block: Option<u64> = match std::env::var("UNWIND_TO_BLOCK") {
+        Ok(s) => Some(s.parse().map_err(|e| eyre::eyre!("UNWIND_TO_BLOCK must be a u64: {e}"))?),
+        Err(_) => None,
+    };
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(http_timeout_secs))
@@ -139,20 +203,33 @@ async fn main() {
 
     // Build L1 provider for reading (events) — with retry layer for 429/5xx
     let l1_rpc_url_parsed: url::Url = l1_rpc_url.parse().expect("Invalid L1_RPC_URL");
-    let l1_read_provider: RootProvider = rsp_provider::create_provider(l1_rpc_url_parsed.clone());
+    let l1_read_provider: RootProvider = rsp_provider::create_provider(l1_rpc_url_parsed.clone())
+        .expect("failed to build L1 read provider");
 
     // L2 provider — used by the startup resolver (for `lastBlockHash` lookup)
     // AND later by the embedded driver + blob builder.
     let l2_rpc_parsed: url::Url = rpc_url.parse().expect("Invalid RPC_URL");
-    let l2_provider: RootProvider = rsp_provider::create_provider(l2_rpc_parsed);
+    let l2_provider =
+        rsp_provider::create_provider(l2_rpc_parsed).expect("failed to build L2 provider");
 
     // ── Startup: resolve L2 checkpoint from START_BATCH_ID ───────────────────────
     let (listener_from_block, witness_from_block, orchestrator_checkpoint): (u64, u64, u64) = {
         let db_startup = crate::db::Db::open(&db_path).expect("Failed to open DB for startup");
 
+        // DB-persisted start batch id takes precedence over the env var.
+        // It is written by the BatchReverted handler after wiping all state,
+        // so a restart re-resolves the L2 checkpoint from the reverted batch
+        // instead of the stale env value that bootstrapped the deployment.
+        let db_start_batch_id = db_startup.get_start_batch_id();
+        let start_batch_id: Option<u64> = db_start_batch_id.or(env_start_batch_id);
+
         if let Some(batch_id) = start_batch_id {
             if db_startup.get_checkpoint() == 0 {
-                info!(batch_id, "L1_START_BATCH_ID set — resolving L2 start checkpoint from L1");
+                info!(
+                    batch_id,
+                    from_db = db_start_batch_id.is_some(),
+                    "Resolving L2 start checkpoint from L1"
+                );
                 let (l2_from_block, l1_event_block, _num_blocks) =
                     l1_rollup_client::resolve_l2_start_checkpoint(
                         &l1_read_provider,
@@ -166,10 +243,22 @@ async fn main() {
 
                 let l2_checkpoint = l2_from_block.saturating_sub(1);
                 db_startup.save_checkpoint(l2_checkpoint);
-                db_startup.save_l1_checkpoint(l1_event_block.saturating_sub(1));
+                // For env-var bootstrap we rewind l1_checkpoint one block
+                // behind the committing event so the listener re-observes it.
+                // For BatchReverted recovery the DB already holds the event
+                // block — keep whichever is later.
+                if db_start_batch_id.is_none() {
+                    db_startup.save_l1_checkpoint(l1_event_block.saturating_sub(1));
+                }
 
                 if db_startup.get_last_batch_end().is_none() {
                     db_startup.save_last_batch_end(l2_checkpoint);
+                }
+
+                // Clear the one-shot revert anchor so a manual env-var
+                // restart later is not shadowed by a stale DB entry.
+                if db_start_batch_id.is_some() {
+                    db_startup.clear_start_batch_id();
                 }
 
                 info!(
@@ -188,58 +277,32 @@ async fn main() {
             }
         }
 
-        // ── Startup: recover from re-execution result gaps ──────────────────────
-        //
-        // If a previous run lost re-execution results (e.g. enclave key rotation
-        // followed by orchestrator restart), some pending batches may have gaps
-        // in their block_responses coverage. Roll the checkpoint back to
-        // `earliest_gap - 1` so the driver re-feeds the missing blocks on this
-        // run.
+        // ── Startup checkpoint normalisation ───────────────────────────────────
         {
             let pending = db_startup.load_batches();
-            let dispatched_ranges = db_startup.load_dispatched_block_ranges();
-            let response_blocks: std::collections::HashSet<u64> =
+            let response_blocks: HashSet<u64> =
                 db_startup.get_all_response_block_numbers().into_iter().collect();
+            let signed_batch_indexes: HashSet<u64> =
+                db_startup.load_batch_signature_indexes().into_iter().collect();
+            let current_ckpt = db_startup.get_checkpoint();
 
-            let dispatched_set: std::collections::HashSet<u64> =
-                dispatched_ranges.iter().flat_map(|&(f, t)| f..=t).collect();
+            let result = normalize_startup_checkpoint(
+                current_ckpt,
+                &pending,
+                &response_blocks,
+                &signed_batch_indexes,
+            );
 
-            let mut earliest_gap: Option<u64> = None;
-            let mut gapped_batches: Vec<u64> = Vec::new();
-
-            for batch in &pending {
-                let mut batch_has_gap = false;
-                for b in batch.from_block..=batch.to_block {
-                    if dispatched_set.contains(&b) {
-                        continue;
-                    }
-                    if response_blocks.contains(&b) {
-                        continue;
-                    }
-                    batch_has_gap = true;
-                    earliest_gap = Some(match earliest_gap {
-                        Some(current) => current.min(b),
-                        None => b,
-                    });
-                }
-                if batch_has_gap {
-                    gapped_batches.push(batch.batch_index);
-                }
-            }
-
-            if let Some(gap) = earliest_gap {
-                let current_ckpt = db_startup.get_checkpoint();
-                let new_ckpt = gap.saturating_sub(1);
-                if new_ckpt < current_ckpt {
+            if let Some(gap) = result.earliest_gap {
+                if !result.stale_signature_indexes.is_empty() {
                     info!(
                         current_ckpt,
                         earliest_gap = gap,
-                        new_ckpt,
-                        gapped_batches = ?gapped_batches,
+                        new_ckpt = result.new_ckpt,
+                        gapped_batches = ?result.stale_signature_indexes,
                         "Startup gap recovery: rolling back checkpoint"
                     );
-                    db_startup.save_checkpoint(new_ckpt);
-                    for idx in &gapped_batches {
+                    for idx in &result.stale_signature_indexes {
                         db_startup.delete_batch_signature(*idx);
                     }
                 } else {
@@ -252,44 +315,12 @@ async fn main() {
             } else {
                 info!("Startup gap scan: no gaps detected");
             }
-        }
 
-        // ── Startup: advance checkpoint past already-finalized batches ─────────
-        //
-        // `finalize_dispatched_batch` stores `last_batch_end` but does not touch
-        // the checkpoint. If the L1-finalization path advanced past the
-        // checkpoint while the orchestrator was restarting, the checkpoint can
-        // end up stuck below `last_batch_end` — with the corresponding pending
-        // batches already deleted, `on_block_result`'s pending-gap path has no
-        // way to move it forward, and the driver re-witnesses those blocks on
-        // every restart. `last_batch_end` is monotonic (set only by L1
-        // finalization), so blocks up to it are definitively committed; we can
-        // safely jump to it here, then walk forward across any contiguous
-        // already-computed responses.
-        {
-            let current_ckpt = db_startup.get_checkpoint();
-            let last_batch_end = db_startup.get_last_batch_end();
-            let response_blocks: std::collections::HashSet<u64> =
-                db_startup.get_all_response_block_numbers().into_iter().collect();
-
-            let mut new_ckpt = current_ckpt;
-            if let Some(lbe) = last_batch_end {
-                if lbe > new_ckpt {
-                    new_ckpt = lbe;
-                }
-            }
-            while response_blocks.contains(&(new_ckpt + 1)) {
-                new_ckpt += 1;
-            }
-
-            if new_ckpt > current_ckpt {
-                info!(
-                    current_ckpt,
-                    last_batch_end,
-                    new_ckpt,
-                    "Startup forward-advance: jumping checkpoint past finalized batches"
-                );
-                db_startup.save_checkpoint(new_ckpt);
+            if result.new_ckpt != current_ckpt {
+                info!(current_ckpt, new_ckpt = result.new_ckpt, "Startup checkpoint normalised");
+                db_startup.save_checkpoint(result.new_ckpt);
+            } else {
+                info!(current_ckpt, "Startup checkpoint unchanged");
             }
         }
 
@@ -319,14 +350,21 @@ async fn main() {
         %l1_rollup_addr,
         %nitro_verifier_addr,
         listener_from_block,
-        start_batch_id,
+        env_start_batch_id,
         l1_deploy_block,
         witness_from_block,
+        l2_safe_blocks,
+        unwind_to_block,
         "Starting witness orchestrator"
     );
 
-    // Build L1 provider for writing (preconfirmBatch)
+    // Build L1 provider for writing (preconfirmBatch). Keep the signer as a
+    // separate Arc'd handle so the RBF worker can sign bumped txs with an
+    // explicit nonce + fees, bypassing alloy's NonceFiller / GasFiller.
     let signer: PrivateKeySigner = l1_submitter_key.parse().expect("Invalid L1_SUBMITTER_KEY");
+    let l1_signer_address = signer.address();
+    let l1_signer: Arc<dyn alloy_network::TxSigner<alloy_primitives::Signature> + Send + Sync> =
+        Arc::new(signer.clone());
     let wallet = EthereumWallet::from(signer);
     let l1_write_provider: orchestrator::L1WriteProvider =
         ProviderBuilder::new().wallet(wallet).connect_http(l1_rpc_url_parsed);
@@ -339,7 +377,9 @@ async fn main() {
     let mut tasks: tokio::task::JoinSet<(&'static str, eyre::Result<()>)> =
         tokio::task::JoinSet::new();
 
-    // Signal handler
+    // Signal handler. Also watches the shutdown token so an internal cancel
+    // (e.g. BatchReverted handling) lets this task exit cleanly instead of
+    // blocking the final JoinSet drain forever.
     {
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
@@ -348,16 +388,37 @@ async fn main() {
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                         .map_err(|e| eyre::eyre!("install SIGTERM: {e}"))?;
                 tokio::select! {
-                    _ = sigterm.recv() => info!("SIGTERM received — graceful shutdown"),
-                    _ = tokio::signal::ctrl_c() => info!("SIGINT received — graceful shutdown"),
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received — graceful shutdown");
+                        shutdown.cancel();
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("SIGINT received — graceful shutdown");
+                        shutdown.cancel();
+                    }
+                    _ = shutdown.cancelled() => {
+                        info!("Internal shutdown observed — exiting signal handler");
+                    }
                 }
-                shutdown.cancel();
                 Ok::<(), eyre::Report>(())
             }
             .await;
             ("signal", r)
         });
     }
+
+    // Metrics HTTP server — exposes `/metrics` on `FLUENT_METRICS_ADDR`.
+    {
+        let shutdown = shutdown.clone();
+        let addr = metrics_listen_addr.clone();
+        let handle = Arc::clone(&metrics_handle);
+        tasks.spawn(async move {
+            let r = metrics::run_server(addr, handle, shutdown).await;
+            ("metrics_server", r)
+        });
+    }
+
+    let l1_listened_l2_provider = l2_provider.clone();
 
     // Start L1 event listener
     let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(64);
@@ -366,8 +427,11 @@ async fn main() {
         tasks.spawn(async move {
             let r = l1_listener::run(
                 l1_read_provider,
+                l1_listened_l2_provider,
                 l1_rollup_addr,
                 listener_from_block,
+                l1_poll_interval_secs,
+                l1_safe_blocks,
                 l1_tx,
                 shutdown,
             )
@@ -385,7 +449,7 @@ async fn main() {
         max_cold_bytes,
         witness_retention_blocks,
         DEFAULT_COLD_BATCH_SIZE,
-    ));
+    )?);
 
     // ── Embedded forward-sync driver ─────────────────────────────────────────────
     let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
@@ -399,34 +463,64 @@ async fn main() {
         runtime,
     )
     .expect("failed to open writable ProviderFactory");
-    let host_executor = Arc::new(EthHostExecutor::eth(chain_spec.clone(), None));
 
-    // Optional pruner: mirror `reth --full` semantics exactly.
-    let prune_full: bool = std::env::var("PRUNE_FULL")
-        .ok()
-        .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    let pruner = if prune_full {
-        let segments = PruneModes {
-            sender_recovery: Some(PruneMode::Full),
-            transaction_lookup: None,
-            receipts: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
-            account_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
-            storage_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
-            bodies_history: chain_spec
-                .ethereum_fork_activation(EthereumHardfork::Paris)
-                .block_number()
-                .map(PruneMode::Before),
-            receipts_log_filter: Default::default(),
-        };
-        let prune_config =
-            PruneConfig { block_interval: PruneConfig::default().block_interval, segments };
-        info!(?prune_config, "Pruning enabled (reth --full equivalent)");
-        Some(PrunerBuilder::new(prune_config).build_with_provider_factory(factory.clone()))
+    // One-shot unwind, if requested. Must run AFTER heal_static_files_if_needed
+    // (performed inside open_writable_factory) and BEFORE Driver::new, since
+    // Driver::new snapshots `start_tip` once and never re-reads it. SQLite is
+    // NOT reconciled here — operator's responsibility.
+    //
+    // Priority:
+    //   1. Explicit `UNWIND_TO_BLOCK` env — operator override, always wins.
+    //   2. Auto-align to SQLite checkpoint — triggered when `orchestrator_checkpoint < mdbx_tip`,
+    //   so MDBX never retains blocks past the last orchestrator-confirmed watermark. Rolls MDBX
+    //   back to `orchestrator_checkpoint` (reth-CLI semantic: target is `orchestrator_checkpoint
+    //   + 1`, so the checkpoint block itself is kept and everything above is dropped).
+    let unwind_target: Option<u64> = if let Some(t) = unwind_to_block {
+        Some(t)
+    } else if orchestrator_checkpoint > 0 {
+        let mdbx_tip = factory
+            .best_block_number()
+            .map_err(|e| eyre::eyre!("startup best_block_number: {e}"))?;
+        if orchestrator_checkpoint < mdbx_tip {
+            info!(
+                orchestrator_checkpoint,
+                mdbx_tip, "MDBX ahead of SQLite checkpoint — auto-unwind to checkpoint"
+            );
+            Some(orchestrator_checkpoint)
+        } else {
+            None
+        }
     } else {
-        info!("Pruning disabled — archive mode");
         None
     };
+
+    if let Some(target) = unwind_target {
+        if target < orchestrator_checkpoint {
+            tracing::warn!(
+                target,
+                orchestrator_checkpoint,
+                "UNWIND_TO_BLOCK below orchestrator SQLite checkpoint — SQLite state is \
+                 NOT reconciled by this unwind; operator must manually reset the \
+                 orchestrator DB if stale batch/response rows matter for recovery"
+            );
+        }
+        driver::unwind_to(factory.clone(), Arc::clone(&hub), target).await?;
+    }
+
+    let host_executor = Arc::new(EthHostExecutor::eth(chain_spec.clone(), None));
+
+    // TODO: re-enable pruner after adding runtime coupling between MDBX
+    // prune floor and WITNESS_RETENTION_BLOCKS. The risk scenario: driver
+    // runs far ahead while L1 is stalled (low ETH on submitter, rollup
+    // contract frozen, etc.); pruner drops state for blocks that still
+    // need re-witnessing on key rotation; re-exec fails with silent None
+    // from `get_or_build_witness` and retries forever. Re-enabling needs:
+    // (a) a runtime guard that stops the pruner when dispatch is lagging,
+    // (b) an explicit StateAtBlockNotAvailable error instead of Ok(None)
+    // from the driver's witness rebuild path. Until then — archive mode.
+    let _ = std::env::var("PRUNE_FULL"); // swallow env so misconfig doesn't silently fail
+    info!("Pruning disabled — archive mode");
+    let pruner: Option<driver::DriverPruner> = None;
 
     let hub_for_shutdown = Arc::clone(&hub);
     let driver = Arc::new(
@@ -439,6 +533,7 @@ async fn main() {
             pruner,
             witness_from_block,
             orchestrator_checkpoint,
+            l2_safe_blocks,
         })
         .expect("Driver::new failed"),
     );
@@ -490,16 +585,49 @@ async fn main() {
         l1_provider: l1_write_provider,
         api_key,
         l2_provider,
+        l1_signer,
+        l1_signer_address,
+        rbf_bump_interval,
+        rbf_bump_percent,
+        rbf_max_fee_per_gas_wei,
     };
+
+    // Shared channel + dedup set between the feeder (driver pull) and the
+    // orchestrator (worker pool consumer). Owned at the top level so the
+    // feeder can be supervised via `tasks`.
+    let (normal_tx, normal_rx) =
+        async_channel::bounded::<orchestrator::ExecutionTask>(orchestrator::EXECUTION_WORKERS * 2);
+    let known_responses: orchestrator::KnownResponses = Arc::new(RwLock::new(HashSet::new()));
+
+    // Spawn the feeder into the top-level JoinSet so a feeder crash (driver
+    // fatal, panic) cancels the root token via the `tasks.join_next()` race
+    // below and shuts down the whole process cleanly.
+    {
+        let driver = Arc::clone(&driver);
+        let normal_tx = normal_tx.clone();
+        let known_responses = Arc::clone(&known_responses);
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            let r = orchestrator::feeder_loop(driver, normal_tx, known_responses, shutdown).await;
+            ("feeder", r)
+        });
+    }
 
     // Orchestrator runs in the foreground. Race it against `tasks.join_next()`
     // so that ANY background task exiting first (signal handler, L1 listener,
-    // witness server) immediately cancels the root token. Catch-up is tracked
-    // separately via `catchup_handle` because its successful completion is
-    // expected and must not trigger shutdown.
+    // witness server, feeder) immediately cancels the root token. Catch-up is
+    // tracked separately via `catchup_handle` because its successful completion
+    // is expected and must not trigger shutdown.
     let mut exit_code = 0;
-    let mut orchestrator_fut =
-        std::pin::pin!(orchestrator::run(config, driver, l1_rx, shutdown.clone()));
+    let mut orchestrator_fut = std::pin::pin!(orchestrator::run(
+        config,
+        driver,
+        l1_rx,
+        shutdown.clone(),
+        normal_rx,
+        Arc::clone(&known_responses),
+    ));
+    drop(normal_tx);
 
     tokio::select! {
         () = orchestrator_fut.as_mut() => {
@@ -522,19 +650,28 @@ async fn main() {
         }
     }
 
-    // Drain any remaining background tasks.
-    while let Some(join) = tasks.join_next().await {
-        match join {
-            Ok((name, Ok(()))) => info!(task = name, "background task exited cleanly"),
-            Ok((name, Err(e))) => {
-                tracing::error!(task = name, err = %e, "background task exited with error");
-                exit_code = 1;
-            }
-            Err(e) => {
-                tracing::error!(err = %e, "background task join failed");
-                exit_code = 1;
+    // Drain any remaining background tasks with a hard ceiling. Axum
+    // `with_graceful_shutdown` will wait for in-flight requests to finish,
+    // and a stuck TCP peer can hold that forever. Cap the drain so the
+    // process exits even if a server hangs.
+    let drain_fut = async {
+        while let Some(join) = tasks.join_next().await {
+            match join {
+                Ok((name, Ok(()))) => info!(task = name, "background task exited cleanly"),
+                Ok((name, Err(e))) => {
+                    tracing::error!(task = name, err = %e, "background task exited with error");
+                    exit_code = 1;
+                }
+                Err(e) => {
+                    tracing::error!(err = %e, "background task join failed");
+                    exit_code = 1;
+                }
             }
         }
+    };
+    if tokio::time::timeout(Duration::from_secs(300), drain_fut).await.is_err() {
+        tracing::error!("Background tasks drain timed out after 15s — forcing shutdown");
+        exit_code = 1;
     }
 
     // Wait for catch-up to observe shutdown and exit. Aborts only if it's still
@@ -556,5 +693,267 @@ async fn main() {
 
     if exit_code != 0 {
         std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+/// Pure result of the startup checkpoint walk.
+///
+/// Single pass over `pending` (ordered by `batch_index`):
+/// - Signed batch: advance `new_ckpt` to its `to_block`.
+/// - Unsigned batch: scan blocks in its range against `response_blocks`. On first missing block
+///   `b`, set `new_ckpt = b - 1`, `earliest_gap = Some(b)`, mark signatures of later batches as
+///   stale, and stop.
+pub(crate) struct StartupCheckpointResult {
+    pub(crate) new_ckpt: u64,
+    pub(crate) stale_signature_indexes: Vec<u64>,
+    /// First missing block number in an unsigned pending batch, if any.
+    pub(crate) earliest_gap: Option<u64>,
+}
+
+pub(crate) fn normalize_startup_checkpoint(
+    current_ckpt: u64,
+    pending: &[accumulator::PendingBatch],
+    response_blocks: &HashSet<u64>,
+    signed_batch_indexes: &HashSet<u64>,
+) -> StartupCheckpointResult {
+    let mut new_ckpt = current_ckpt;
+    let mut earliest_gap = None;
+    let mut stale_signature_indexes = Vec::new();
+
+    for (i, batch) in pending.iter().enumerate() {
+        if signed_batch_indexes.contains(&batch.batch_index) {
+            new_ckpt = batch.to_block;
+            continue;
+        }
+
+        let mut batch_has_gap = false;
+        for b in batch.from_block..=batch.to_block {
+            if response_blocks.contains(&b) {
+                new_ckpt = b;
+                continue;
+            }
+            earliest_gap = Some(b);
+            new_ckpt = b.saturating_sub(1);
+            batch_has_gap = true;
+            break;
+        }
+
+        if batch_has_gap {
+            stale_signature_indexes = pending[i..]
+                .iter()
+                .filter(|b| signed_batch_indexes.contains(&b.batch_index))
+                .map(|b| b.batch_index)
+                .collect();
+            break;
+        }
+    }
+
+    StartupCheckpointResult { new_ckpt, stale_signature_indexes, earliest_gap }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accumulator::PendingBatch;
+
+    fn batch(batch_index: u64, from: u64, to: u64) -> PendingBatch {
+        PendingBatch { batch_index, from_block: from, to_block: to, blobs_accepted: true }
+    }
+
+    #[test]
+    fn fallback_rolls_back_on_block_gap_below_current_ckpt() {
+        // Fallback path (no signed batches): gap at block 50, ckpt=100.
+        let pending = [batch(5, 40, 60)];
+        let mut response_blocks = HashSet::new();
+        for b in 40..=49 {
+            response_blocks.insert(b);
+        }
+        let signed = HashSet::new();
+
+        let r = normalize_startup_checkpoint(100, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.earliest_gap, Some(50));
+        assert_eq!(r.new_ckpt, 49);
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn fallback_walk_forward_advances_over_contiguous_responses() {
+        // All blocks 11..=20 are in responses; ckpt starts at 10.
+        let pending = [batch(1, 11, 20)];
+        let mut response_blocks = HashSet::new();
+        for b in 11..=20 {
+            response_blocks.insert(b);
+        }
+        let signed = HashSet::new();
+
+        let r = normalize_startup_checkpoint(10, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 20);
+        assert!(r.earliest_gap.is_none());
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn fallback_no_gap_keeps_current_ckpt() {
+        let pending = [batch(1, 5, 10)];
+        let mut response_blocks = HashSet::new();
+        for b in 5..=10 {
+            response_blocks.insert(b);
+        }
+        let signed = HashSet::new();
+
+        let r = normalize_startup_checkpoint(10, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 10);
+        assert!(r.earliest_gap.is_none());
+    }
+
+    #[test]
+    fn fallback_gap_above_current_ckpt_advances_ckpt_to_gap_minus_one() {
+        let pending = [batch(3, 40, 60)];
+        let mut response_blocks = HashSet::new();
+        for b in 40..=49 {
+            response_blocks.insert(b);
+        }
+        let signed = HashSet::new();
+
+        let r = normalize_startup_checkpoint(30, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.earliest_gap, Some(50));
+        assert_eq!(r.new_ckpt, 49);
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn fallback_walk_forward_after_rollback_does_not_jump_past_gap() {
+        let pending = [batch(1, 10, 20), batch(2, 21, 30)];
+        let mut response_blocks = HashSet::new();
+        for b in 10..=14 {
+            response_blocks.insert(b);
+        }
+        let signed = HashSet::new();
+
+        let r = normalize_startup_checkpoint(25, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.earliest_gap, Some(15));
+        assert_eq!(r.new_ckpt, 14);
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn signed_single_batch_anchors_at_its_to_block() {
+        let pending = [batch(7, 100, 110)];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [7].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(99, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 110);
+        assert!(r.earliest_gap.is_none());
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn signed_reports_block_gap_inside_next_pending_batch() {
+        // Signed 7 (100..=110) + unsigned 8 (111..=120), no responses for 8.
+        // Anchor at 110; earliest_gap = first missing block in batch 8 = 111.
+        let pending = [batch(7, 100, 110), batch(8, 111, 120)];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [7].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(115, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 110);
+        assert_eq!(r.earliest_gap, Some(111), "first missing block in batch N+1");
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn signed_next_batch_fully_present_walks_through_responses() {
+        // Signed 7 (100..=110), unsigned 8 (111..=120) fully in responses.
+        // Walk-forward advances ckpt through batch 8's response blocks.
+        let pending = [batch(7, 100, 110), batch(8, 111, 120)];
+        let mut response_blocks = HashSet::new();
+        for b in 111..=120 {
+            response_blocks.insert(b);
+        }
+        let signed: HashSet<u64> = [7].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(105, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 120);
+        assert!(r.earliest_gap.is_none());
+    }
+
+    #[test]
+    fn signed_batch_index_gap_in_pending_is_not_detected() {
+        // batch_signatures = {101, 102, 104}; batch 103 missing from pending.
+        // Simple single-pass walk advances through all signed batches without
+        // cross-checking batch-index contiguity — ckpt reaches last signed
+        // batch's to_block, no gap reported.
+        let pending = [batch(101, 100, 110), batch(102, 111, 120), batch(104, 131, 140)];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [101, 102, 104].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(140, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 140);
+        assert!(r.stale_signature_indexes.is_empty());
+        assert!(r.earliest_gap.is_none());
+    }
+
+    #[test]
+    fn unsigned_batch_between_signed_reports_block_gap_and_marks_later_signed_stale() {
+        // Signed {101, 102, 104}, unsigned 103 in pending with partial
+        // responses 121..=125. Walk anchors to 102.to_block=120, advances
+        // through 103's responses to 125, stops at missing 126. Signature of
+        // 104 is stale since it sits past the gap.
+        let pending = [
+            batch(101, 100, 110),
+            batch(102, 111, 120),
+            batch(103, 121, 130),
+            batch(104, 131, 140),
+        ];
+        let mut response_blocks = HashSet::new();
+        for b in 121..=125 {
+            response_blocks.insert(b);
+        }
+        let signed: HashSet<u64> = [101, 102, 104].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(140, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 125);
+        assert_eq!(r.stale_signature_indexes, vec![104]);
+        assert_eq!(r.earliest_gap, Some(126), "first missing block in batch 103");
+    }
+
+    #[test]
+    fn signed_all_contiguous_anchors_at_max_no_gap() {
+        let pending = [batch(101, 100, 110), batch(102, 111, 120), batch(103, 121, 130)];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [101, 102, 103].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(50, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 130);
+        assert!(r.earliest_gap.is_none());
+        assert!(r.stale_signature_indexes.is_empty());
+    }
+
+    #[test]
+    fn signed_anchor_missing_from_pending_falls_through_to_fallback() {
+        // Signed = {101} but batch 101 is not in pending (dispatched+removed).
+        // Signed-first path can't anchor → fallback takes over.
+        let pending: Vec<PendingBatch> = vec![];
+        let response_blocks = HashSet::new();
+        let signed: HashSet<u64> = [101].into_iter().collect();
+
+        let r = normalize_startup_checkpoint(77, &pending, &response_blocks, &signed);
+
+        assert_eq!(r.new_ckpt, 77, "fallback has no pending to scan, ckpt unchanged");
+        assert!(r.earliest_gap.is_none());
+        assert!(r.stale_signature_indexes.is_empty());
     }
 }

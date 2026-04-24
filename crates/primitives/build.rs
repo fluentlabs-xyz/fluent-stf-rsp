@@ -217,7 +217,7 @@ fn emit_account(network: &str, addr_clean: &str, account: &Value, bin_dir: &Path
             } else {
                 write_bin_if_changed(&bin_dir.join(&fname), &bytes);
                 format!(
-                    r#"Some(Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fluent_genesis_bin/{fname}"))))"#
+                    r#"Some(Bytes::from_static(include_bytes!(concat!(env!("OUT_DIR"), "/fluent_genesis_bin/{fname}"))))"#
                 )
             }
         }
@@ -527,16 +527,14 @@ fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardforks {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let src_dir = manifest_dir.join("src");
-    let bin_dir = src_dir.join("fluent_genesis_bin");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let bin_dir = out_dir.join("fluent_genesis_bin");
     fs::create_dir_all(&bin_dir).unwrap();
 
     let networks = network_defs();
 
     let mut out = String::new();
     out.push_str("// @generated — do not edit manually\n");
-    out.push_str("#![allow(clippy::all, unused_imports)]\n");
 
     out.push_str("use alloy_primitives::{address, b256, U256, Bytes, Address, Bloom};\n");
     out.push_str("use alloy_genesis::{Genesis, GenesisAccount, ChainConfig};\n");
@@ -639,5 +637,5 @@ pub fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardfor
         }
     }
 
-    write_if_changed(&src_dir.join("fluent_genesis.rs"), out.as_bytes());
+    write_if_changed(&out_dir.join("fluent_genesis.rs"), out.as_bytes());
 }

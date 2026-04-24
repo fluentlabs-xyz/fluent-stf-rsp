@@ -3,6 +3,8 @@
 //! proxy at L1 boundaries — but its `sol!` block is kept separate because
 //! it targets a different deployed contract.
 
+use std::time::Duration;
+
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionRequest;
@@ -58,7 +60,18 @@ pub async fn is_key_registered(
         input: Bytes::from(call.abi_encode()).into(),
         ..Default::default()
     };
-    let result = provider.call(tx).await.map_err(|e| eyre!("verifiedPubkeys call failed: {e}"))?;
+    const KEY_CHECK_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let result = match tokio::time::timeout(KEY_CHECK_CALL_TIMEOUT, provider.call(tx)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(eyre!("verifiedPubkeys call failed: {e}")),
+        Err(_) => {
+            return Err(eyre!(
+                "verifiedPubkeys call timeout after {}s",
+                KEY_CHECK_CALL_TIMEOUT.as_secs()
+            ));
+        }
+    };
     let registered = verifiedPubkeysCall::abi_decode_returns(&result)
         .map_err(|e| eyre!("Failed to decode verifiedPubkeys result: {e}"))?;
     Ok(registered)

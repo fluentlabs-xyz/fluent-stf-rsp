@@ -6,6 +6,8 @@
 //!   `lastBlockHash` is also matched for historical logs)
 //! - `BatchSubmitted(batchIndex)` — all blobs submitted for the batch
 //! - `BatchPreconfirmed(batchIndex, verifierContract, verifier)` — preconfirmation accepted
+//! - `BatchReverted(fromBatchIndex)` — admin force-revert: orchestrator wipes state and restarts
+//!   from the reverted batch index.
 //!
 //! Events are sent to the orchestrator via an mpsc channel.
 //!
@@ -16,7 +18,7 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::Filter;
 use alloy_sol_types::SolEvent;
 use eyre::{eyre, Result};
-use l1_rollup_client::{v0, BatchCommitted, BatchPreconfirmed, BatchSubmitted};
+use l1_rollup_client::{BatchCommitted, BatchPreconfirmed, BatchReverted, BatchSubmitted};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -31,15 +33,17 @@ use tracing::{info, warn};
 #[derive(Debug)]
 pub(crate) enum L1Event {
     /// `BatchCommitted` — a new batch has been declared on L1.
-    BatchCommitted {
-        batch_index: u64,
-        /// Number of L2 block headers in the batch (`numberOfBlocks` from the event).
-        num_blocks: u64,
-    },
+    BatchCommitted { batch_index: u64, from: u64, to: u64 },
     /// `BatchSubmitted` — all blobs for the batch have been submitted.
     BatchSubmitted { batch_index: u64 },
     /// `BatchPreconfirmed` — carries the real tx_hash and l1_block.
     BatchPreconfirmed { batch_index: u64, tx_hash: B256, l1_block: u64 },
+    /// `BatchReverted` — admin force-reverted batches from `from_batch_index`
+    /// onward. Orchestrator wipes its DB, persists `from_batch_index` as the
+    /// next start batch and `l1_block` as the L1 checkpoint, then triggers a
+    /// graceful shutdown so the startup path re-resolves the L2 checkpoint
+    /// from L1.
+    BatchReverted { from_batch_index: u64, l1_block: u64 },
     /// All events up to this L1 block have been sent.
     /// Orchestrator persists this as the L1 checkpoint.
     Checkpoint(u64),
@@ -49,7 +53,6 @@ pub(crate) enum L1Event {
 // Listener loop
 // ---------------------------------------------------------------------------
 
-const POLL_INTERVAL_SECS: u64 = 6;
 const MAX_POLL_BACKOFF_SECS: u64 = 120;
 
 const MIN_PAGE: u64 = 100;
@@ -67,9 +70,6 @@ fn is_too_many_results(err_msg: &str) -> bool {
         s.contains("range is too large")
 }
 
-/// Number of blocks to lag behind `latest` to avoid L1 reorgs.
-const L1_SAFE_BLOCKS: u64 = 3;
-
 /// Result of a single poll iteration.
 enum PollOutcome {
     /// All pages processed successfully up to this block.
@@ -82,20 +82,26 @@ enum PollOutcome {
 ///
 /// Polls L1 logs starting from `from_block` and sends parsed events to `tx`.
 /// This function runs forever.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     l1_provider: RootProvider,
+    l2_provider: RootProvider,
     contract_addr: Address,
     mut from_block: u64,
+    poll_interval_secs: u64,
+    safe_blocks: u64,
     tx: mpsc::Sender<L1Event>,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
     info!(
         %contract_addr,
         from_block,
+        poll_interval_secs,
+        safe_blocks,
         "L1 listener started"
     );
 
-    let mut backoff_secs = POLL_INTERVAL_SECS;
+    let mut backoff_secs = poll_interval_secs;
     let mut page_size: u64 = INITIAL_PAGE;
 
     loop {
@@ -111,8 +117,17 @@ pub(crate) async fn run(
             break;
         }
 
-        match poll_once(&l1_provider, contract_addr, from_block, &mut page_size, &tx, &shutdown)
-            .await
+        match poll_once(
+            &l1_provider,
+            &l2_provider,
+            contract_addr,
+            from_block,
+            safe_blocks,
+            &mut page_size,
+            &tx,
+            &shutdown,
+        )
+        .await
         {
             Ok(PollOutcome::Complete(latest)) => {
                 if tx.send(L1Event::Checkpoint(latest)).await.is_err() {
@@ -120,7 +135,7 @@ pub(crate) async fn run(
                     break;
                 }
                 from_block = latest + 1;
-                backoff_secs = POLL_INTERVAL_SECS; // reset on full success
+                backoff_secs = poll_interval_secs; // reset on full success
             }
             Ok(PollOutcome::Partial(last_ok)) => {
                 if tx.send(L1Event::Checkpoint(last_ok)).await.is_err() {
@@ -153,17 +168,20 @@ pub(crate) async fn run(
 
 /// Single poll iteration: fetch logs from `from_block` to latest, paginated.
 /// Returns `Complete` on full success, `Partial` on page failure with progress saved.
+#[allow(clippy::too_many_arguments)]
 async fn poll_once(
     provider: &RootProvider,
+    l2_provider: &RootProvider,
     contract_addr: Address,
     from_block: u64,
+    safe_blocks: u64,
     page_size: &mut u64,
     tx: &mpsc::Sender<L1Event>,
     shutdown: &CancellationToken,
 ) -> Result<PollOutcome> {
     let raw_latest =
         provider.get_block_number().await.map_err(|e| eyre!("Failed to get latest block: {e}"))?;
-    let latest_block = raw_latest.saturating_sub(L1_SAFE_BLOCKS);
+    let latest_block = raw_latest.saturating_sub(safe_blocks);
 
     if from_block > latest_block {
         return Ok(PollOutcome::Complete(from_block.saturating_sub(1)));
@@ -175,7 +193,7 @@ async fn poll_once(
     while current <= latest_block {
         let page_end = (current + *page_size - 1).min(latest_block);
 
-        match process_page(provider, contract_addr, current, page_end, tx).await {
+        match process_page(provider, l2_provider, contract_addr, current, page_end, tx).await {
             Ok(()) => {
                 last_ok = page_end;
                 current = page_end + 1;
@@ -213,6 +231,7 @@ async fn poll_once(
 /// Process a single page of blocks: fetch and emit all event types in one query.
 async fn process_page(
     provider: &RootProvider,
+    l2_provider: &RootProvider,
     contract_addr: Address,
     from: u64,
     to: u64,
@@ -222,9 +241,9 @@ async fn process_page(
         .address(contract_addr)
         .event_signature(vec![
             BatchCommitted::SIGNATURE_HASH,
-            v0::BatchCommitted::SIGNATURE_HASH,
             BatchSubmitted::SIGNATURE_HASH,
             BatchPreconfirmed::SIGNATURE_HASH,
+            BatchReverted::SIGNATURE_HASH,
         ])
         .from_block(from)
         .to_block(to);
@@ -237,54 +256,45 @@ async fn process_page(
     for log in &logs {
         let topic0 = log.topic0().copied().unwrap_or_default();
 
-        if topic0 == BatchCommitted::SIGNATURE_HASH || topic0 == v0::BatchCommitted::SIGNATURE_HASH
-        {
-            // Both ABI variants carry the same (batch_index, numberOfBlocks)
-            // pair — everything downstream needs. Decode per topic0 and drop
-            // the version-specific extras.
-            let (batch_index, num_blocks): (u64, u64) =
-                if topic0 == BatchCommitted::SIGNATURE_HASH {
-                    let event = BatchCommitted::decode_log_data(&log.inner.data).map_err(|e| {
-                        eyre!(
-                            "Failed to decode BatchCommitted v1 at L1 block {:?}: {e}",
-                            log.block_number
-                        )
-                    })?;
-                    (
-                        event
-                            .batchIndex
-                            .try_into()
-                            .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?,
-                        event.numberOfBlocks.try_into().map_err(|_| {
-                            eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks)
-                        })?,
-                    )
-                } else {
-                    let event =
-                        v0::BatchCommitted::decode_log_data(&log.inner.data).map_err(|e| {
-                            eyre!(
-                                "Failed to decode BatchCommitted v0 at L1 block {:?}: {e}",
-                                log.block_number
-                            )
-                        })?;
-                    (
-                        event
-                            .batchIndex
-                            .try_into()
-                            .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?,
-                        event.numberOfBlocks.try_into().map_err(|_| {
-                            eyre!("numberOfBlocks overflow: {}", event.numberOfBlocks)
-                        })?,
-                    )
-                };
-            if num_blocks == 0 {
-                return Err(eyre!(
-                    "BatchCommitted with num_blocks=0 (batch_index={batch_index}) — refusing to advance checkpoint"
-                ));
-            }
-            info!(batch_index, num_blocks, "BatchCommitted event");
+        if topic0 == BatchCommitted::SIGNATURE_HASH {
+            let event = BatchCommitted::decode_log_data(&log.inner.data).map_err(|e| {
+                eyre!("Failed to decode BatchCommitted v1 at L1 block {:?}: {e}", log.block_number)
+            })?;
 
-            if tx.send(L1Event::BatchCommitted { batch_index, num_blocks }).await.is_err() {
+            let batch_index = event
+                .batchIndex
+                .try_into()
+                .map_err(|_| eyre!("batchIndex to big: {}", event.batchIndex))?;
+            let from_hash = event.fromBlockHash;
+            let to_hash = event.toBlockHash;
+
+            let from_block = l2_provider
+                .get_block_by_hash(from_hash)
+                .await
+                .map_err(|e| eyre!("L2 RPC failed to fetch fromBlockHash ({}): {}", from_hash, e))?
+                .ok_or_else(|| eyre!("Block {} not found on L2 Node", from_hash))?;
+
+            let from_block_number = from_block.header.number + 1;
+
+            let to_block = l2_provider
+                .get_block_by_hash(to_hash)
+                .await
+                .map_err(|e| eyre!("L2 RPC failed to fetch toBlockHash ({}): {}", to_hash, e))?
+                .ok_or_else(|| eyre!("Block {} not found on L2 Node", to_hash))?;
+
+            let to_block_number = to_block.header.number;
+
+            info!(batch_index, from_block_number, to_block_number, "BatchCommitted event");
+
+            if tx
+                .send(L1Event::BatchCommitted {
+                    batch_index,
+                    from: from_block_number,
+                    to: to_block_number,
+                })
+                .await
+                .is_err()
+            {
                 return Err(eyre!("L1 event channel closed"));
             }
         } else if topic0 == BatchSubmitted::SIGNATURE_HASH {
@@ -316,6 +326,20 @@ async fn process_page(
             info!(batch_index, %tx_hash, l1_block, "BatchPreconfirmed event");
             if tx.send(L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block }).await.is_err()
             {
+                return Err(eyre!("L1 event channel closed"));
+            }
+        } else if topic0 == BatchReverted::SIGNATURE_HASH {
+            let event = BatchReverted::decode_log_data(&log.inner.data).map_err(|e| {
+                eyre!("Failed to decode BatchReverted at L1 block {:?}: {e}", log.block_number)
+            })?;
+            let from_batch_index: u64 = event
+                .fromBatchIndex
+                .try_into()
+                .map_err(|_| eyre!("fromBatchIndex overflow: {}", event.fromBatchIndex))?;
+            let l1_block =
+                log.block_number.ok_or_else(|| eyre!("BatchReverted log missing block_number"))?;
+            info!(from_batch_index, l1_block, "BatchReverted event");
+            if tx.send(L1Event::BatchReverted { from_batch_index, l1_block }).await.is_err() {
                 return Err(eyre!("L1 event channel closed"));
             }
         }

@@ -261,7 +261,8 @@ async fn fetch_challenge_blobs(
     batch_index: u64,
 ) -> Result<Vec<Vec<u8>>, HandlerError> {
     let l2_url = Url::parse(&rpc_url()).map_err(|e| internal(format!("Invalid rpc_url: {e}")))?;
-    let l2_provider: RootProvider = create_provider(l2_url);
+    let l2_provider: RootProvider = create_provider(l2_url)
+        .map_err(|e| internal(format!("Failed to build L2 provider: {e}")))?;
 
     let (from_block, to_block) = l1_rollup_client::fetch_batch_range(
         &l1.l1_provider,
@@ -287,7 +288,8 @@ async fn build_client_input(
     chain: &ChainContext,
 ) -> Result<EthClientExecutorInput, HandlerError> {
     let url = Url::parse(&rpc_url()).map_err(|e| bad_request(format!("Invalid rpc_url: {e}")))?;
-    let provider: RootProvider = create_provider(url);
+    let provider: RootProvider =
+        create_provider(url).map_err(|e| internal(format!("Failed to build provider: {e}")))?;
 
     let block_number = match (block_number, block_hash) {
         (_, Some(hash)) => {
@@ -699,7 +701,7 @@ async fn main() -> eyre::Result<()> {
     let l1 = match (env::var("L1_RPC_URL"), env::var("L1_ROLLUP_ADDR")) {
         (Ok(l1_rpc), Ok(l1_addr)) => {
             let l1_url = Url::parse(&l1_rpc).map_err(|e| eyre::eyre!("Invalid L1_RPC_URL: {e}"))?;
-            let l1_provider: RootProvider = create_provider(l1_url);
+            let l1_provider: RootProvider = create_provider(l1_url)?;
             let contract_addr: Address =
                 l1_addr.parse().map_err(|e| eyre::eyre!("Invalid L1_ROLLUP_ADDR: {e}"))?;
             let deploy_block: u64 =

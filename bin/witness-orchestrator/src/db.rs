@@ -61,7 +61,10 @@ impl Db {
                 from_block  INTEGER NOT NULL,
                 to_block    INTEGER NOT NULL,
                 tx_hash     BLOB NOT NULL,
-                l1_block    INTEGER NOT NULL
+                l1_block    INTEGER NOT NULL,
+                nonce       INTEGER,
+                max_fee_per_gas          TEXT,
+                max_priority_fee_per_gas TEXT
             );
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
@@ -69,6 +72,27 @@ impl Db {
             );
         ",
         )?;
+
+        // Migration: add RBF columns to pre-existing dispatched_batches tables.
+        // SQLite has no IF NOT EXISTS for ADD COLUMN; we check PRAGMA first.
+        let existing_cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(dispatched_batches)")?;
+            let iter = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            iter.filter_map(|r| r.ok()).collect()
+        };
+        for (col, ddl) in [
+            ("nonce", "ALTER TABLE dispatched_batches ADD COLUMN nonce INTEGER"),
+            ("max_fee_per_gas", "ALTER TABLE dispatched_batches ADD COLUMN max_fee_per_gas TEXT"),
+            (
+                "max_priority_fee_per_gas",
+                "ALTER TABLE dispatched_batches ADD COLUMN max_priority_fee_per_gas TEXT",
+            ),
+        ] {
+            if !existing_cols.contains(col) {
+                conn.execute_batch(ddl)?;
+            }
+        }
+
         Ok(Self { conn })
     }
 
@@ -114,6 +138,78 @@ impl Db {
             params![block_number.to_string()],
         ) {
             error!(err = %e, "Failed to persist l1_checkpoint");
+        }
+    }
+
+    // ── Pending start batch id (BatchReverted recovery) ─────────────────────────
+    //
+    // On `BatchReverted`, the orchestrator wipes its DB and persists the
+    // reverted batch index here. The startup path prefers this over the
+    // `L1_START_BATCH_ID` env var so the next restart resolves the L2
+    // checkpoint from the reverted batch, not the stale env value.
+
+    pub(crate) fn get_start_batch_id(&self) -> Option<u64> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = 'start_batch_id'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+            .and_then(|s| s.parse().ok())
+    }
+
+    pub(crate) fn clear_start_batch_id(&self) {
+        if let Err(e) = self.conn.execute("DELETE FROM meta WHERE key = 'start_batch_id'", []) {
+            error!(err = %e, "Failed to clear start_batch_id");
+        }
+    }
+
+    /// Atomically wipe all orchestrator state and persist the recovery
+    /// anchors for the next startup: `start_batch_id` (reverted batch index)
+    /// and `l1_checkpoint` (L1 block of the `BatchReverted` event).
+    ///
+    /// Wipes every data table — `block_responses`, `pending_batches`,
+    /// `pending_blobs_accepted`, `batch_signatures`, `dispatched_batches`,
+    /// and the entire `meta` table — before writing the two new meta rows.
+    pub(crate) fn wipe_for_revert(&mut self, start_batch_id: u64, l1_block: u64) {
+        let tx = match self.conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!(err = %e, "wipe_for_revert: begin tx failed");
+                return;
+            }
+        };
+        let res = tx
+            .execute_batch(
+                "DELETE FROM block_responses;
+                 DELETE FROM pending_batches;
+                 DELETE FROM pending_blobs_accepted;
+                 DELETE FROM batch_signatures;
+                 DELETE FROM dispatched_batches;
+                 DELETE FROM meta;",
+            )
+            .and_then(|()| {
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES('start_batch_id', ?1)",
+                    params![start_batch_id.to_string()],
+                )
+                .map(|_| ())
+            })
+            .and_then(|()| {
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES('l1_checkpoint', ?1)",
+                    params![l1_block.to_string()],
+                )
+                .map(|_| ())
+            });
+        match res {
+            Ok(()) => {
+                if let Err(e) = tx.commit() {
+                    error!(err = %e, "wipe_for_revert: commit failed");
+                }
+            }
+            Err(e) => {
+                error!(err = %e, "wipe_for_revert: statement failed — rolling back");
+            }
         }
     }
 
@@ -230,46 +326,6 @@ impl Db {
         }
     }
 
-    /// Atomically purge stale state after a batch is re-emitted with a different
-    /// range (L1 reorg at `threshold`): drops all `pending_batches > threshold`,
-    /// all `batch_signatures >= threshold` (signature for `threshold` itself is
-    /// stale because its range changed), and all `pending_blobs_accepted > threshold`.
-    /// The `threshold` row in `pending_batches` is preserved for the caller's
-    /// subsequent `save_batch` (INSERT OR REPLACE) to overwrite.
-    pub(crate) fn purge_batches_after(&mut self, threshold: u64) {
-        let tx = match self.conn.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                error!(err = %e, threshold, "purge_batches_after: begin tx failed");
-                return;
-            }
-        };
-        let ok = tx
-            .execute("DELETE FROM pending_batches WHERE batch_index > ?1", params![threshold])
-            .and_then(|_| {
-                tx.execute(
-                    "DELETE FROM batch_signatures WHERE batch_index >= ?1",
-                    params![threshold],
-                )
-            })
-            .and_then(|_| {
-                tx.execute(
-                    "DELETE FROM pending_blobs_accepted WHERE batch_index > ?1",
-                    params![threshold],
-                )
-            });
-        match ok {
-            Ok(_) => {
-                if let Err(e) = tx.commit() {
-                    error!(err = %e, threshold, "purge_batches_after: commit failed");
-                }
-            }
-            Err(e) => {
-                error!(err = %e, threshold, "purge_batches_after: delete failed — rolling back");
-            }
-        }
-    }
-
     pub(crate) fn load_batches(&self) -> Vec<PendingBatch> {
         let mut stmt = match self.conn.prepare(
             "SELECT batch_index, from_block, to_block, blobs_accepted FROM pending_batches ORDER BY batch_index",
@@ -331,6 +387,71 @@ impl Db {
         }
     }
 
+    /// Return every `batch_index` currently present in `batch_signatures`.
+    /// Used at startup to detect orphan signature rows (rows whose matching
+    /// `pending_batches` / `dispatched_batches` row was lost to a mid-commit
+    /// crash).
+    pub(crate) fn load_batch_signature_indexes(&self) -> Vec<u64> {
+        let mut stmt = match self.conn.prepare("SELECT batch_index FROM batch_signatures") {
+            Ok(s) => s,
+            Err(e) => {
+                error!(err = %e, "Failed to prepare batch_signatures index scan");
+                return Vec::new();
+            }
+        };
+        let iter = match stmt.query_map([], |row| row.get::<_, u64>(0)) {
+            Ok(i) => i,
+            Err(e) => {
+                error!(err = %e, "Failed to query batch_signatures rows");
+                return Vec::new();
+            }
+        };
+        iter.collect::<Result<Vec<_>>>().unwrap_or_else(|e| {
+            error!(err = %e, "Failed to read batch_signatures rows");
+            Vec::new()
+        })
+    }
+
+    /// Load every `(batch_index, SubmitBatchResponse)` row from
+    /// `batch_signatures` in a single query. Used at startup to rebuild the
+    /// in-memory signature map.
+    pub(crate) fn load_all_batch_signatures(&self) -> Vec<(u64, SubmitBatchResponse)> {
+        let mut stmt = match self.conn.prepare("SELECT batch_index, response FROM batch_signatures")
+        {
+            Ok(s) => s,
+            Err(e) => {
+                error!(err = %e, "Failed to prepare batch_signatures scan");
+                return Vec::new();
+            }
+        };
+        let iter = match stmt.query_map([], |row| {
+            let idx: u64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((idx, blob))
+        }) {
+            Ok(i) => i,
+            Err(e) => {
+                error!(err = %e, "Failed to query batch_signatures rows");
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for row in iter {
+            match row {
+                Ok((idx, blob)) => match bincode::deserialize::<SubmitBatchResponse>(&blob) {
+                    Ok(resp) => out.push((idx, resp)),
+                    Err(e) => {
+                        error!(err = %e, batch_index = idx, "Failed to deserialize batch signature");
+                    }
+                },
+                Err(e) => {
+                    error!(err = %e, "Failed to read batch_signatures row");
+                }
+            }
+        }
+        out
+    }
+
     // ── Pending blobs accepted ───────────────────────────────────────────────
 
     pub(crate) fn save_pending_blobs_accepted(&self, batch_index: u64) {
@@ -363,9 +484,66 @@ impl Db {
 
     // ── Dispatched batches ──────────────────────────────────────────────────
 
-    /// Atomically move a batch from pending to dispatched.
+    /// Atomically move a batch from pending to dispatched, persisting initial
+    /// RBF state (nonce + fees) alongside the transition.
     /// Single transaction: DELETE from pending + INSERT into dispatched.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn move_to_dispatched(
+        &mut self,
+        batch_index: u64,
+        from_block: u64,
+        to_block: u64,
+        tx_hash: &[u8],
+        l1_block: u64,
+        nonce: u64,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    ) {
+        let tx = match self.conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!(err = %e, batch_index, "Failed to begin move_to_dispatched tx");
+                return;
+            }
+        };
+        let ok = tx
+            .execute("DELETE FROM pending_batches WHERE batch_index = ?1", params![batch_index])
+            .and_then(|_| {
+                tx.execute(
+                    "INSERT OR REPLACE INTO dispatched_batches(
+                batch_index, from_block, to_block, tx_hash, l1_block,
+                nonce, max_fee_per_gas, max_priority_fee_per_gas
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        batch_index,
+                        from_block,
+                        to_block,
+                        tx_hash,
+                        l1_block,
+                        nonce,
+                        max_fee_per_gas.to_string(),
+                        max_priority_fee_per_gas.to_string(),
+                    ],
+                )
+            });
+        match ok {
+            Ok(_) => {
+                if let Err(e) = tx.commit() {
+                    error!(err = %e, batch_index, "Failed to commit move_to_dispatched");
+                }
+            }
+            Err(e) => {
+                error!(err = %e, batch_index, "Failed to move batch to dispatched — rolling back");
+            }
+        }
+    }
+
+    /// Atomically move a batch from pending to dispatched WITHOUT RBF state.
+    /// Used for externally-preconfirmed batches (observed via L1 event) where
+    /// we are not the submitter and therefore have no local nonce or fees.
+    /// Single transaction: DELETE from pending + INSERT into dispatched with
+    /// NULL RBF columns.
+    pub(crate) fn move_to_dispatched_external(
         &mut self,
         batch_index: u64,
         from_block: u64,
@@ -376,7 +554,7 @@ impl Db {
         let tx = match self.conn.transaction() {
             Ok(tx) => tx,
             Err(e) => {
-                error!(err = %e, batch_index, "Failed to begin move_to_dispatched tx");
+                error!(err = %e, batch_index, "Failed to begin move_to_dispatched_external tx");
                 return;
             }
         };
@@ -391,12 +569,47 @@ impl Db {
         match ok {
             Ok(_) => {
                 if let Err(e) = tx.commit() {
-                    error!(err = %e, batch_index, "Failed to commit move_to_dispatched");
+                    error!(err = %e, batch_index, "Failed to commit move_to_dispatched_external");
                 }
             }
             Err(e) => {
-                error!(err = %e, batch_index, "Failed to move batch to dispatched — rolling back");
+                error!(err = %e, batch_index, "Failed to move external batch to dispatched — rolling back");
             }
+        }
+    }
+
+    /// Update the RBF state of a dispatched batch after a fee bump + rebroadcast.
+    /// Atomic: updates tx_hash, max_fee_per_gas, max_priority_fee_per_gas.
+    pub(crate) fn update_rbf_state(
+        &mut self,
+        batch_index: u64,
+        tx_hash: &[u8],
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    ) {
+        if let Err(e) = self.conn.execute(
+            "UPDATE dispatched_batches
+             SET tx_hash = ?2, max_fee_per_gas = ?3, max_priority_fee_per_gas = ?4
+             WHERE batch_index = ?1",
+            params![
+                batch_index,
+                tx_hash,
+                max_fee_per_gas.to_string(),
+                max_priority_fee_per_gas.to_string(),
+            ],
+        ) {
+            error!(err = %e, batch_index, "Failed to update RBF state");
+        }
+    }
+
+    /// Update l1_block once the tx lands. Separate from `update_rbf_state`
+    /// because RBF bumps happen many times, but l1_block updates exactly once.
+    pub(crate) fn update_dispatched_l1_block(&mut self, batch_index: u64, l1_block: u64) {
+        if let Err(e) = self.conn.execute(
+            "UPDATE dispatched_batches SET l1_block = ?2 WHERE batch_index = ?1",
+            params![batch_index, l1_block],
+        ) {
+            error!(err = %e, batch_index, "Failed to update dispatched l1_block");
         }
     }
 
@@ -471,9 +684,16 @@ impl Db {
         }
     }
 
-    pub(crate) fn load_dispatched_batches(&self) -> Vec<(u64, u64, u64, Vec<u8>, u64)> {
+    /// Returns per-row: (batch_index, from_block, to_block, tx_hash, l1_block,
+    /// nonce, max_fee_per_gas, max_priority_fee_per_gas). The last three are
+    /// `Option` because legacy rows (pre-migration) have NULL in those columns.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn load_dispatched_batches(
+        &self,
+    ) -> Vec<(u64, u64, u64, Vec<u8>, u64, Option<u64>, Option<u128>, Option<u128>)> {
         let mut stmt = match self.conn.prepare(
-            "SELECT batch_index, from_block, to_block, tx_hash, l1_block
+            "SELECT batch_index, from_block, to_block, tx_hash, l1_block,
+                    nonce, max_fee_per_gas, max_priority_fee_per_gas
              FROM dispatched_batches ORDER BY batch_index",
         ) {
             Ok(s) => s,
@@ -489,25 +709,12 @@ impl Db {
                 row.get::<_, i64>(2)? as u64,
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, i64>(4)? as u64,
+                row.get::<_, Option<i64>>(5)?.map(|n| n as u64),
+                row.get::<_, Option<String>>(6)?.and_then(|s| s.parse::<u128>().ok()),
+                row.get::<_, Option<String>>(7)?.and_then(|s| s.parse::<u128>().ok()),
             ))
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
-    }
-
-    /// Return `(from_block, to_block)` for every dispatched batch — needed
-    /// by startup gap recovery to exclude these ranges from gap detection.
-    pub(crate) fn load_dispatched_block_ranges(&self) -> Vec<(u64, u64)> {
-        let mut stmt =
-            match self.conn.prepare("SELECT from_block, to_block FROM dispatched_batches") {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(err = %e, "load_dispatched_block_ranges prepare failed");
-                    return vec![];
-                }
-            };
-        stmt.query_map([], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)))
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
     }
 }

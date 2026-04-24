@@ -30,13 +30,20 @@ pub(crate) struct PendingBatch {
     pub blobs_accepted: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DispatchedBatch {
     pub batch_index: u64,
     pub from_block: u64,
     pub to_block: u64,
     pub tx_hash: B256,
     pub l1_block: u64,
+    /// RBF state: nonce used to sign the pending tx. `None` for legacy
+    /// (pre-migration) dispatched rows that predate RBF.
+    pub nonce: Option<u64>,
+    /// RBF state: last broadcast `maxFeePerGas`. `None` for legacy rows.
+    pub max_fee_per_gas: Option<u128>,
+    /// RBF state: last broadcast `maxPriorityFeePerGas`. `None` for legacy rows.
+    pub max_priority_fee_per_gas: Option<u128>,
 }
 
 #[derive(Debug)]
@@ -92,19 +99,10 @@ impl BatchAccumulator {
             guard.load_batches().into_iter().map(|b| (b.batch_index, b)).collect();
         let pending_blobs_accepted: HashSet<u64> =
             guard.load_pending_blobs_accepted().into_iter().collect();
-        let signatures: HashMap<u64, SubmitBatchResponse> = {
-            let mut map = HashMap::new();
-            for batch in batches.values() {
-                if let Some(sig) = guard.get_batch_signature(batch.batch_index) {
-                    map.insert(batch.batch_index, sig);
-                }
-            }
-            map
-        };
         let dispatched: BTreeMap<u64, DispatchedBatch> = guard
             .load_dispatched_batches()
             .into_iter()
-            .filter_map(|(bi, fb, tb, tx_hash_bytes, l1b)| {
+            .filter_map(|(bi, fb, tb, tx_hash_bytes, l1b, nonce, mfpg, mpfpg)| {
                 let tx_hash = B256::try_from(tx_hash_bytes.as_slice()).ok().or_else(|| {
                     error!(
                         batch_index = bi,
@@ -121,54 +119,49 @@ impl BatchAccumulator {
                         to_block: tb,
                         tx_hash,
                         l1_block: l1b,
+                        nonce,
+                        max_fee_per_gas: mfpg,
+                        max_priority_fee_per_gas: mpfpg,
                     },
                 ))
             })
             .collect();
+        let mut signatures: HashMap<u64, SubmitBatchResponse> = HashMap::new();
+        let mut stale_sigs: Vec<u64> = Vec::new();
+        for (idx, resp) in guard.load_all_batch_signatures() {
+            if batches.contains_key(&idx) || dispatched.contains_key(&idx) {
+                signatures.insert(idx, resp);
+            } else {
+                stale_sigs.push(idx);
+            }
+        }
+        if !stale_sigs.is_empty() {
+            warn!(
+                count = stale_sigs.len(),
+                indexes = ?stale_sigs,
+                "Startup: dropping orphan batch_signatures rows (no matching batch)"
+            );
+            for idx in &stale_sigs {
+                guard.delete_batch_signature(*idx);
+            }
+        }
         drop(guard);
 
         Self { batches, responses, pending_blobs_accepted, db: Some(db), signatures, dispatched }
     }
 
     /// Register a new batch from a `BatchCommitted` event.
+    ///
+    /// Idempotent: a listener re-emission of the same `BatchCommitted`
+    /// returns early without clobbering accumulated state (especially
+    /// `blobs_accepted`). A range-mismatched re-emission is impossible by
+    /// L1 contract invariant: the contract emits `BatchReverted` before
+    /// any re-commit with a different range, which triggers a full DB
+    /// wipe + restart via `wipe_for_revert`. A fresh process therefore
+    /// never sees a range mismatch for an already-registered batch.
     pub(crate) async fn set_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
-        // Idempotent under listener re-emission: if the batch is already
-        // registered and the range matches, do nothing (re-emission must
-        // NOT clobber accumulated state, especially `blobs_accepted`).
-        // A range mismatch means an L1 reorg re-committed this batch with
-        // different contents; every higher-indexed batch is now stale and
-        // will be re-emitted on the new canonical chain. Purge pending
-        // state for indices > batch_index, plus the stale signature for
-        // batch_index itself, and fall through to re-register with the
-        // new range. Dispatched batches are not touched here — the
-        // receipt-missing reorg path in `check_finalized_batches` handles them.
-        let existing_range = self.batches.get(&batch_index).map(|b| (b.from_block, b.to_block));
-        if let Some((existing_from, existing_to)) = existing_range {
-            if existing_from == from_block && existing_to == to_block {
-                return;
-            }
-            warn!(
-                batch_index,
-                existing_from,
-                existing_to,
-                new_from = from_block,
-                new_to = to_block,
-                "set_batch: range mismatch on re-registration — purging stale batches >= batch_index"
-            );
-
-            let stale: Vec<u64> =
-                self.batches.range((batch_index + 1)..).map(|(&k, _)| k).collect();
-            for idx in &stale {
-                self.batches.remove(idx);
-                self.signatures.remove(idx);
-            }
-            // Buffered BatchSubmitted events for any index > batch_index are
-            // also stale — they may not be in `batches` yet, so purge by range.
-            self.pending_blobs_accepted.retain(|&idx| idx <= batch_index);
-            // Signature for `batch_index` itself is tied to the old range — drop it.
-            self.signatures.remove(&batch_index);
-
-            self.persist(move |db| db.purge_batches_after(batch_index)).await;
+        if self.dispatched.contains_key(&batch_index) || self.batches.contains_key(&batch_index) {
+            return;
         }
 
         // Consume any buffered BatchSubmitted for this batch
@@ -221,26 +214,6 @@ impl BatchAccumulator {
             (batch.from_block..=batch.to_block).all(|b| self.responses.contains_key(&b))
     }
 
-    /// True iff `block` falls inside the range of some pending (non-dispatched)
-    /// batch AND no response is currently stored for it.
-    ///
-    /// Used by `on_block_result` to decide whether to accept a block execution
-    /// result or discard it as stale/duplicate. A result is accepted only when
-    /// it fills an actual gap in a pending batch.
-    pub(crate) fn block_is_in_pending_gap(&self, block: u64) -> bool {
-        if self.responses.contains_key(&block) {
-            return false;
-        }
-        self.batches.values().any(|b| b.from_block <= block && block <= b.to_block)
-    }
-
-    /// Iterator over every block number with a stored response.
-    /// Used at orchestrator startup to seed the shared `known_responses`
-    /// dedup set.
-    pub(crate) fn response_block_numbers(&self) -> impl Iterator<Item = u64> + '_ {
-        self.responses.keys().copied()
-    }
-
     #[cfg(test)]
     pub(crate) fn first_ready(&self) -> Option<u64> {
         self.batches.values().find(|b| self.is_batch_ready(b)).map(|b| b.batch_index)
@@ -271,7 +244,8 @@ impl BatchAccumulator {
     }
 
     /// Returns the highest `to_block` across all pending and dispatched batches, or `None` if
-    /// empty. Used on restart to recover `next_batch_from_block` without reading a DB key.
+    /// empty.
+    #[cfg(test)]
     pub(crate) fn max_to_block(&self) -> Option<u64> {
         let pending_max = self.batches.values().map(|b| b.to_block).max();
         let dispatched_max = self.dispatched.values().map(|d| d.to_block).max();
@@ -279,15 +253,18 @@ impl BatchAccumulator {
     }
 
     /// Purge responses for specific blocks (key rotation recovery).
-    /// Clears responses so they can be re-populated with freshly signed ones.
-    /// Batches are preserved — only responses are removed.
+    /// Clears responses from memory + SQLite. Called on key rotation
+    /// recovery (drop stale responses so they can be re-populated by freshly
+    /// signed ones) and on post-sign cleanup (once a batch's signature is
+    /// cached, its block responses are unreachable). Batches are preserved —
+    /// only responses are removed.
     pub(crate) async fn purge_responses(&mut self, blocks: &[u64]) {
         for &block in blocks {
             self.responses.remove(&block);
         }
         let owned = blocks.to_vec();
         self.persist(move |db| db.delete_responses_batch(&owned)).await;
-        info!(count = blocks.len(), "Purged stale responses for key rotation recovery");
+        info!(count = blocks.len(), "Purged responses");
     }
 
     /// Cache a signature in memory (called after successful signing).
@@ -306,9 +283,64 @@ impl BatchAccumulator {
         (from..=to).filter_map(|b| self.responses.get(&b).cloned()).collect()
     }
 
-    /// Move a batch from pending to dispatched state.
+    /// Move a batch from pending to dispatched state, persisting initial RBF
+    /// state atomically with the transition.
     /// Removes from `batches` and `signatures`, inserts into `dispatched`.
-    pub(crate) async fn mark_dispatched(&mut self, batch_index: u64, tx_hash: B256, l1_block: u64) {
+    pub(crate) async fn mark_dispatched(
+        &mut self,
+        batch_index: u64,
+        tx_hash: B256,
+        l1_block: u64,
+        nonce: u64,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    ) {
+        let Some(batch) = self.batches.remove(&batch_index) else { return };
+        // Keep the signature cached in-memory through the dispatched state
+        // so that an `undispatch` (reorg / RBF Failed / Reverted) can restore
+        // the batch to pending without needing a DB round-trip to reload it.
+        // The DB row in `batch_signatures` is preserved by `move_to_dispatched`
+        // and is only deleted by `finalize_dispatched_batch`.
+
+        let dispatched = DispatchedBatch {
+            batch_index,
+            from_block: batch.from_block,
+            to_block: batch.to_block,
+            tx_hash,
+            l1_block,
+            nonce: Some(nonce),
+            max_fee_per_gas: Some(max_fee_per_gas),
+            max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
+        };
+
+        let fb = batch.from_block;
+        let tb = batch.to_block;
+        let tx_h = tx_hash.0.to_vec();
+        self.persist(move |db| {
+            db.move_to_dispatched(
+                batch_index,
+                fb,
+                tb,
+                &tx_h,
+                l1_block,
+                nonce,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            )
+        })
+        .await;
+
+        self.dispatched.insert(batch_index, dispatched);
+    }
+
+    /// Mark a batch as dispatched by an EXTERNAL actor (observed via
+    /// `BatchPreconfirmed` L1 event). No RBF state — we are not the submitter.
+    pub(crate) async fn mark_dispatched_external(
+        &mut self,
+        batch_index: u64,
+        tx_hash: B256,
+        l1_block: u64,
+    ) {
         let Some(batch) = self.batches.remove(&batch_index) else { return };
         self.signatures.remove(&batch_index);
 
@@ -318,14 +350,52 @@ impl BatchAccumulator {
             to_block: batch.to_block,
             tx_hash,
             l1_block,
+            nonce: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
         };
 
         let fb = batch.from_block;
         let tb = batch.to_block;
         let tx_h = tx_hash.0.to_vec();
-        self.persist(move |db| db.move_to_dispatched(batch_index, fb, tb, &tx_h, l1_block)).await;
+        self.persist(move |db| {
+            db.move_to_dispatched_external(batch_index, fb, tb, &tx_h, l1_block)
+        })
+        .await;
 
         self.dispatched.insert(batch_index, dispatched);
+    }
+
+    /// Called by the main loop after an RBF worker signals a successful
+    /// rebroadcast with bumped fees. Persists new tx_hash + fees atomically
+    /// and mirrors them in memory.
+    pub(crate) async fn record_rbf_bump(
+        &mut self,
+        batch_index: u64,
+        new_tx_hash: B256,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    ) {
+        if let Some(d) = self.dispatched.get_mut(&batch_index) {
+            d.tx_hash = new_tx_hash;
+            d.max_fee_per_gas = Some(max_fee_per_gas);
+            d.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
+        }
+        let tx_h = new_tx_hash.0.to_vec();
+        self.persist(move |db| {
+            db.update_rbf_state(batch_index, &tx_h, max_fee_per_gas, max_priority_fee_per_gas)
+        })
+        .await;
+    }
+
+    /// Called once when the RBF worker finds a receipt for the landed tx.
+    /// Updates the placeholder `l1_block` (set to 0 at dispatch time) to the
+    /// actual landed L1 block number, in DB and memory.
+    pub(crate) async fn record_dispatched_l1_block(&mut self, batch_index: u64, l1_block: u64) {
+        if let Some(d) = self.dispatched.get_mut(&batch_index) {
+            d.l1_block = l1_block;
+        }
+        self.persist(move |db| db.update_dispatched_l1_block(batch_index, l1_block)).await;
     }
 
     /// Finalize a dispatched batch: delete all associated data from DB + memory.
@@ -342,12 +412,32 @@ impl BatchAccumulator {
         for b in fb..=tb {
             self.responses.remove(&b);
         }
+        self.signatures.remove(&batch_index);
 
         Some(dispatched)
     }
 
-    /// Move a dispatched batch back to pending (reorg recovery).
+    /// Move a dispatched batch back to pending (reorg / dispatch retry).
+    ///
+    /// Guard: rows with `nonce == None` were seeded by `mark_dispatched_external`
+    /// from a `BatchPreconfirmed` L1 event (someone else preconfirmed the batch).
+    /// A concurrent pre-flight Failed/Reverted on our side must NOT wipe that
+    /// external state — its finalization is owned by the external submitter and
+    /// the finalization ticker will clean up once the receipt lands. Only our
+    /// own dispatches (nonce = Some) may be unwound here.
     pub(crate) async fn undispatch(&mut self, batch_index: u64) -> bool {
+        if let Some(d) = self.dispatched.get(&batch_index) {
+            if d.nonce.is_none() {
+                info!(
+                    batch_index,
+                    "Skip undispatch: external dispatch (nonce=None) — leaving for finalization"
+                );
+                return false;
+            }
+        } else {
+            return false;
+        }
+
         let Some(dispatched) = self.dispatched.remove(&batch_index) else {
             return false;
         };
@@ -367,23 +457,16 @@ impl BatchAccumulator {
         true
     }
 
-    /// Returns dispatched batch indices where l1_block <= finalized.
-    pub(crate) fn dispatched_finalization_candidates(&self, finalized_block: u64) -> Vec<u64> {
-        self.dispatched
-            .values()
-            .filter(|d| d.l1_block <= finalized_block)
-            .map(|d| d.batch_index)
-            .collect()
+    /// Snapshot of dispatched batches (batch_index, tx_hash, l1_block) for
+    /// off-main-loop finalization work. Clones each row so the caller can
+    /// move it across a task boundary without holding a reference.
+    pub(crate) fn dispatched_snapshot(&self) -> Vec<(u64, B256, u64)> {
+        self.dispatched.values().map(|d| (d.batch_index, d.tx_hash, d.l1_block)).collect()
     }
 
     /// Check if any dispatched batches exist.
     pub(crate) fn has_dispatched(&self) -> bool {
         !self.dispatched.is_empty()
-    }
-
-    /// Get the tx_hash of a dispatched batch.
-    pub(crate) fn dispatched_tx_hash(&self, batch_index: u64) -> Option<B256> {
-        self.dispatched.get(&batch_index).map(|d| d.tx_hash)
     }
 }
 
@@ -411,56 +494,6 @@ mod tests {
         // Re-emission of the same BatchCommitted log must NOT clear the flag.
         acc.set_batch(1, 100, 199).await;
         assert!(acc.batches.get(&1).unwrap().blobs_accepted);
-    }
-
-    #[tokio::test]
-    async fn set_batch_range_mismatch_purges_higher_batches() {
-        let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
-
-        acc.set_batch(1, 10, 19).await;
-        acc.set_batch(2, 20, 29).await;
-        acc.set_batch(3, 30, 39).await;
-        acc.mark_batch_submitted(1).await;
-        acc.mark_batch_submitted(2).await;
-        acc.mark_batch_submitted(3).await;
-
-        let sig = crate::types::SubmitBatchResponse {
-            batch_root: vec![0u8; 32],
-            versioned_hashes: vec![],
-            signature: vec![0xAA],
-        };
-        acc.cache_signature(1, sig.clone());
-        acc.cache_signature(2, sig.clone());
-        acc.cache_signature(3, sig);
-        // Buffered BatchSubmitted for a not-yet-committed higher batch.
-        acc.mark_batch_submitted(5).await;
-        assert!(acc.pending_blobs_accepted.contains(&5));
-
-        // Re-emission of batch 1 with a different range — L1 reorg.
-        acc.set_batch(1, 10, 24).await;
-
-        // Batch 1 re-registered with new range, blobs_accepted reset, signature dropped.
-        let b1 = acc.batches.get(&1).unwrap();
-        assert_eq!(b1.from_block, 10);
-        assert_eq!(b1.to_block, 24);
-        assert!(!b1.blobs_accepted);
-        assert!(!acc.signatures.contains_key(&1));
-
-        // Batches 2, 3 purged from memory and DB.
-        assert!(!acc.batches.contains_key(&2));
-        assert!(!acc.batches.contains_key(&3));
-        assert!(!acc.signatures.contains_key(&2));
-        assert!(!acc.signatures.contains_key(&3));
-        // Buffered BatchSubmitted for index 5 purged.
-        assert!(!acc.pending_blobs_accepted.contains(&5));
-
-        // Cross-check DB state survives a reload.
-        let reloaded = BatchAccumulator::with_db(Arc::clone(&db));
-        assert!(reloaded.batches.contains_key(&1));
-        assert!(!reloaded.batches.contains_key(&2));
-        assert!(!reloaded.batches.contains_key(&3));
-        assert!(!reloaded.signatures.contains_key(&1));
     }
 
     #[tokio::test]
@@ -505,7 +538,7 @@ mod tests {
         acc.insert_response(mock_response(13)).await;
         acc.mark_batch_submitted(2).await;
 
-        acc.mark_dispatched(1, B256::ZERO, 1).await;
+        acc.mark_dispatched(1, B256::ZERO, 1, 0, 0, 0).await;
         acc.finalize_dispatched(1).await;
         assert_eq!(acc.first_ready(), Some(2));
     }
@@ -649,7 +682,7 @@ mod tests {
         acc.mark_batch_submitted(1).await;
 
         let tx_hash = B256::from([0xAA; 32]);
-        acc.mark_dispatched(1, tx_hash, 100).await;
+        acc.mark_dispatched(1, tx_hash, 100, 0, 0, 0).await;
 
         assert!(acc.get(1).is_none());
         assert!(acc.dispatched.contains_key(&1));
@@ -671,7 +704,7 @@ mod tests {
         // Also insert a response for a different batch to verify it's not removed
         acc.insert_response(mock_response(12)).await;
 
-        acc.mark_dispatched(1, B256::from([0xBB; 32]), 50).await;
+        acc.mark_dispatched(1, B256::from([0xBB; 32]), 50, 0, 0, 0).await;
 
         let dispatched = acc.finalize_dispatched(1).await.unwrap();
         assert_eq!(dispatched.batch_index, 1);
@@ -690,7 +723,7 @@ mod tests {
         acc.insert_response(mock_response(11)).await;
         acc.mark_batch_submitted(1).await;
 
-        acc.mark_dispatched(1, B256::from([0xCC; 32]), 60).await;
+        acc.mark_dispatched(1, B256::from([0xCC; 32]), 60, 0, 0, 0).await;
         assert!(acc.get(1).is_none());
 
         let ok = acc.undispatch(1).await;
@@ -703,6 +736,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn undispatch_skips_external_dispatch() {
+        // Simulates the race: we signed a batch, a concurrent BatchPreconfirmed
+        // live event moved it to dispatched via mark_dispatched_external
+        // (nonce = None), and our in-flight pre-flight then returned Failed.
+        // The Failed-branch undispatch MUST NOT wipe the external state.
+        let mut acc = BatchAccumulator::new();
+        acc.set_batch(1, 10, 11).await;
+        acc.insert_response(mock_response(10)).await;
+        acc.insert_response(mock_response(11)).await;
+        acc.mark_batch_submitted(1).await;
+
+        acc.mark_dispatched_external(1, B256::from([0xAB; 32]), 42).await;
+        assert!(acc.dispatched.contains_key(&1));
+        assert!(acc.get(1).is_none());
+
+        let ok = acc.undispatch(1).await;
+        assert!(!ok, "undispatch must be a no-op for external dispatch");
+        assert!(acc.dispatched.contains_key(&1), "external row preserved");
+        assert!(acc.get(1).is_none(), "no resurrection into pending");
+    }
+
+    #[tokio::test]
     async fn max_to_block_considers_dispatched() {
         let mut acc = BatchAccumulator::new();
         acc.set_batch(1, 10, 20).await;
@@ -711,7 +766,7 @@ mod tests {
 
         assert_eq!(acc.max_to_block(), Some(20));
 
-        acc.mark_dispatched(1, B256::from([0xDD; 32]), 70).await;
+        acc.mark_dispatched(1, B256::from([0xDD; 32]), 70, 0, 0, 0).await;
 
         // After dispatch, pending is empty but dispatched has it
         assert!(acc.batches.is_empty());
@@ -730,7 +785,7 @@ mod tests {
         acc.mark_batch_submitted(1).await;
 
         let tx_hash = B256::from([0xEE; 32]);
-        acc.mark_dispatched(1, tx_hash, 80).await;
+        acc.mark_dispatched(1, tx_hash, 80, 0, 0, 0).await;
 
         // Reload from DB
         let acc2 = BatchAccumulator::with_db(Arc::clone(&db));
@@ -742,5 +797,61 @@ mod tests {
         assert_eq!(d.l1_block, 80);
         // Pending batch should be gone (moved to dispatched)
         assert!(acc2.get(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn set_batch_same_range_on_dispatched_batch_is_noop() {
+        let db = temp_db();
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        acc.set_batch(1, 10, 20).await;
+        for b in 10..=20u64 {
+            acc.insert_response(mock_response(b)).await;
+        }
+        acc.mark_batch_submitted(1).await;
+        let tx_hash = B256::from([0xCC; 32]);
+        acc.mark_dispatched(1, tx_hash, 50, 0, 0, 0).await;
+
+        // Same range — idempotent re-emission, no state change.
+        acc.set_batch(1, 10, 20).await;
+
+        assert!(acc.dispatched.contains_key(&1));
+        assert!(!acc.batches.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn startup_drops_orphan_signature_rows_keeps_valid_ones() {
+        let db = temp_db();
+
+        // Seed state directly on the DB: batch 1 has a pending row + signature
+        // (valid), batch 7 has ONLY a signature row (orphan — simulates the
+        // crash-mid-commit scenario where the pending row was lost).
+        {
+            let guard = db.lock().unwrap();
+            guard.save_batch(&PendingBatch {
+                batch_index: 1,
+                from_block: 10,
+                to_block: 15,
+                blobs_accepted: true,
+            });
+            let sig = crate::types::SubmitBatchResponse {
+                batch_root: vec![0u8; 32],
+                versioned_hashes: vec![],
+                signature: vec![0xAA],
+            };
+            guard.save_batch_signature(1, &sig);
+            guard.save_batch_signature(7, &sig);
+        }
+
+        // with_db must drop the orphan sig (7) and keep the valid one (1).
+        let acc = BatchAccumulator::with_db(Arc::clone(&db));
+
+        assert!(acc.batches.contains_key(&1), "batch 1 pending row preserved");
+        assert!(acc.signatures.contains_key(&1), "batch 1 signature preserved");
+        assert!(!acc.signatures.contains_key(&7), "batch 7 orphan signature not loaded");
+
+        // DB-level check: orphan row is gone; valid row remains.
+        let guard = db.lock().unwrap();
+        let remaining = guard.load_batch_signature_indexes();
+        assert_eq!(remaining, vec![1u64]);
     }
 }

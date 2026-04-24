@@ -22,6 +22,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
 axum = { workspace = true }
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 url.workspace = true
 rusqlite.workspace = true
@@ -64,6 +66,7 @@ reth-trie = { workspace = true }
 reth-evm = { workspace = true }
 reth-revm = { workspace = true }
 reth-primitives-traits = { workspace = true }
+reth-storage-api = { workspace = true }
 
 # reth — pruning
 reth-prune = { workspace = true }

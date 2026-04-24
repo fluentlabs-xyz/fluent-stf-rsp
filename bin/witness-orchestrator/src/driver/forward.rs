@@ -34,11 +34,13 @@ use reth_provider::{
     },
     static_file::StaticFileSegment,
     BlockBodyIndicesProvider, BlockNumReader, DatabaseProviderFactory, HeaderProvider,
-    SaveBlocksMode, StaticFileProviderFactory, StaticFileWriter,
+    LatestStateProviderRef, SaveBlocksMode, StateRootProvider, StaticFileProviderFactory,
+    StaticFileWriter,
 };
 use reth_prune::Pruner;
 use reth_prune_types::MINIMUM_UNWIND_SAFE_DISTANCE;
 use reth_revm::database::StateProviderDatabase;
+use reth_storage_api::BlockExecutionWriter;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
 use rsp_client_executor::{evm::FluentEvmConfig, IntoPrimitives};
 use rsp_host_executor::EthHostExecutor;
@@ -71,7 +73,7 @@ const RPC_ERROR_BACKOFF: Duration = Duration::from_secs(5);
 /// Number of blocks per JSON-RPC batch during the commit-only catch-up path.
 /// One HTTP POST carries `CATCHUP_BATCH_SIZE` `eth_getBlockByNumber` calls,
 /// cutting per-block HTTP overhead and reducing load on the remote node.
-const CATCHUP_BATCH_SIZE: u64 = 800;
+const CATCHUP_BATCH_SIZE: u64 = 128;
 
 /// Number of batch fetches kept in flight. With `CATCHUP_BATCH_SIZE = 64`
 /// and `CATCHUP_BATCH_PIPELINE = 2` the driver prefetches up to 128 blocks
@@ -257,6 +259,10 @@ pub(crate) struct DriverConfig {
     /// Pipeline-confirmed watermark from the orchestrator's SQLite store.
     /// The driver's resume cursor is `max(orchestrator_checkpoint + 1, witness_from_block)`.
     pub orchestrator_checkpoint: u64,
+    /// Safety lag behind the remote L2 tip (reorg protection). Applied in
+    /// `advance_to_witness_from_block` and `try_take_new_block` as
+    /// `remote_tip.saturating_sub(l2_safe_blocks)`.
+    pub l2_safe_blocks: u64,
 }
 
 /// A block fetched from RPC together with the time it took to pull.
@@ -298,6 +304,7 @@ pub(crate) struct Driver {
     /// Mutable cursor + pruner. Held only during actual work; callers wait
     /// here while another call is in flight (MDBX writable txn is single-writer).
     state: AsyncMutex<DriverState>,
+    l2_safe_blocks: u64,
 }
 
 struct DriverState {
@@ -388,6 +395,7 @@ impl Driver {
             start_tip,
             ready: AtomicBool::new(false),
             state: AsyncMutex::new(DriverState { next, pruner: cfg.pruner }),
+            l2_safe_blocks: cfg.l2_safe_blocks,
         })
     }
 
@@ -425,7 +433,8 @@ impl Driver {
                 }
             };
 
-            let catchup_upper = remote_tip.min(self.witness_from_block - 1);
+            let catchup_upper =
+                remote_tip.saturating_sub(self.l2_safe_blocks).min(self.witness_from_block - 1);
             if state.next > catchup_upper {
                 tokio::select! {
                     _ = shutdown.cancelled() => return Ok(()),
@@ -486,40 +495,45 @@ impl Driver {
                     }
                 };
 
-                for fetched in fetched_batch {
-                    if shutdown.is_cancelled() {
-                        info!("Shutdown requested mid-catch-up — driver exiting");
-                        return Ok(());
-                    }
-                    let bn = fetched.block_number;
-
-                    let factory_clone = self.factory.clone();
-                    let chain_spec_clone = Arc::clone(&self.chain_spec);
-                    tokio::task::spawn_blocking(move || {
-                        commit_phase(&factory_clone, &chain_spec_clone, fetched)
-                    })
-                    .await
-                    .map_err(|e| eyre!("commit_phase join: {e}"))??;
-
-                    if bn.is_multiple_of(1000) {
-                        info!(
-                            block_number = bn,
-                            witness_from_block = self.witness_from_block,
-                            "Catch-up: committed block (no witness)"
-                        );
-                    }
-                    if bn + 1 == self.witness_from_block {
-                        info!(
-                            block_number = bn,
-                            witness_from_block = self.witness_from_block,
-                            "Catch-up complete — switching to full witness mode"
-                        );
-                    }
-
-                    run_pruner_if_needed(&mut state.pruner, bn).await;
-
-                    state.next = bn + 1;
+                if shutdown.is_cancelled() {
+                    info!("Shutdown requested mid-catch-up — driver exiting");
+                    return Ok(());
                 }
+
+                // Commit the whole [s..=e] range inside ONE MDBX transaction:
+                // each block is executed against `LatestStateProviderRef(&provider_rw)`
+                // which reads via the RW txn's cursors and therefore sees prior
+                // blocks' uncommitted writes within the same batch. One
+                // `provider_rw.commit()` at the end turns CATCHUP_BATCH_SIZE fsyncs
+                // into a single fsync.
+                let factory_clone = self.factory.clone();
+                let chain_spec_clone = Arc::clone(&self.chain_spec);
+                let t_commit = Instant::now();
+                tokio::task::spawn_blocking(move || {
+                    commit_batch(&factory_clone, &chain_spec_clone, fetched_batch)
+                })
+                .await
+                .map_err(|e| eyre!("commit_batch join: {e}"))??;
+
+                info!(
+                    range_start = s,
+                    range_end = e,
+                    witness_from_block = self.witness_from_block,
+                    commit_ms = t_commit.elapsed().as_millis() as u64,
+                    "Catch-up: committed batch (no witness)"
+                );
+                if e + 1 == self.witness_from_block {
+                    info!(
+                        block_number = e,
+                        witness_from_block = self.witness_from_block,
+                        "Catch-up complete — switching to full witness mode"
+                    );
+                }
+
+                // Pruner reads committed state; must run after `commit_batch`.
+                run_pruner_if_needed(&mut state.pruner, e).await;
+
+                state.next = e + 1;
             }
 
             if fetch_failed {
@@ -612,6 +626,7 @@ impl Driver {
                     payload_bytes = cached.payload.len() as u64,
                     "Re-witness served from cold store (skipped rebuild + re-push)"
                 );
+                metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
                 state.next = block_number + 1;
                 return Ok(Some(ProveRequest { block_number, payload: cached.payload }));
             }
@@ -661,7 +676,7 @@ impl Driver {
                 return Ok(None);
             }
         };
-        if block_number > remote_tip {
+        if block_number > remote_tip.saturating_sub(self.l2_safe_blocks) {
             return Ok(None);
         }
 
@@ -872,6 +887,76 @@ fn commit_phase(
     })
 }
 
+/// Catch-up commit phase: MDBX-commit a consecutive range of blocks in ONE
+/// transaction, verifying each block's state root against its header.
+///
+/// The key trick is `LatestStateProviderRef::new(&*provider_rw)`: it reads
+/// through the RW txn's own cursors, so writes from prior `save_blocks` calls
+/// in this batch are visible to subsequent blocks' execution and state-root
+/// recomputation even though MDBX has not been committed. Static-file writes
+/// are done eagerly inside `save_blocks`; a mid-batch failure drops the
+/// provider_rw without commit and relies on `heal_static_files_if_needed` at
+/// the next startup to re-sync static files to the MDBX tip.
+///
+/// Produces no `WitnessJob` — the catch-up path does not produce witnesses.
+fn commit_batch(
+    factory: &ProviderFactory<DriverNode>,
+    chain_spec: &Arc<ChainSpec>,
+    fetched_batch: Vec<FetchedBlock>,
+) -> eyre::Result<()> {
+    if fetched_batch.is_empty() {
+        return Ok(());
+    }
+
+    let provider_rw = factory.provider_rw().map_err(|e| eyre!("provider_rw: {e}"))?;
+
+    for fetched in fetched_batch {
+        let FetchedBlock { block_number, alloy_block, .. } = fetched;
+
+        let prim_block =
+            <reth_ethereum_primitives::EthPrimitives as IntoPrimitives<Ethereum>>::into_primitive_block(
+                alloy_block,
+            );
+        let recovered = prim_block
+            .try_into_recovered()
+            .map_err(|_| eyre!("recover_senders failed for block {block_number}"))?;
+
+        let db = StateProviderDatabase::new(LatestStateProviderRef::new(&*provider_rw));
+        let evm_config = FluentEvmConfig::new_with_default_factory(chain_spec.clone());
+        let executor = BasicBlockExecutor::new(evm_config, db);
+        let exec_output: BlockExecutionOutput<_> =
+            executor.execute(&recovered).map_err(|e| eyre!("execute at {block_number}: {e}"))?;
+
+        let hashed_state =
+            HashedPostState::from_bundle_state::<KeccakKeyHasher>(exec_output.state.state());
+        let state_provider = LatestStateProviderRef::new(&*provider_rw);
+        let (state_root, trie_updates) = state_provider
+            .state_root_with_updates(hashed_state.clone())
+            .map_err(|e| eyre!("state_root_with_updates at {block_number}: {e}"))?;
+
+        if state_root != recovered.header().state_root {
+            eyre::bail!(
+                "state_root mismatch at block {block_number}: computed {state_root:?}, header {:?}",
+                recovered.header().state_root,
+            );
+        }
+
+        let trie_data = ComputedTrieData {
+            hashed_state: Arc::new(hashed_state.into_sorted()),
+            trie_updates: Arc::new(trie_updates.into_sorted()),
+            anchored_trie_input: None,
+        };
+        let executed = ExecutedBlock::new(Arc::new(recovered), Arc::new(exec_output), trie_data);
+
+        provider_rw
+            .save_blocks(vec![executed], SaveBlocksMode::Full)
+            .map_err(|e| eyre!("save_blocks at {block_number}: {e}"))?;
+    }
+
+    provider_rw.commit().map_err(|e| eyre!("commit: {e}"))?;
+    Ok(())
+}
+
 /// Witness phase: execute_exex_with_block + bincode (on blocking pool).
 /// Returns the serialized payload, leaving storage/channel side-effects to
 /// the caller.
@@ -933,6 +1018,7 @@ async fn witness_phase(
         payload_bytes,
         "Block witness built"
     );
+    metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
 
     Ok(payload)
 }
@@ -1018,4 +1104,72 @@ async fn rewitness_phase(
     );
 
     Ok(payload)
+}
+
+/// Boot-time unwind entry. `target` is interpreted with reth-CLI semantic:
+/// `UNWIND_TO_BLOCK=N` removes N and everything above (new MDBX tip = N-1).
+/// Bounds checks short-circuit (warn/info + skip, never error) for:
+///   - `target == 0`       — would underflow `N-1`.
+///   - `target > mdbx_tip` — likely typo; silent no-op with warn.
+///   - `target == mdbx_tip` — already aligned.
+///
+/// Must be called exactly once, between `open_writable_factory` and
+/// `Driver::new`. Fatal on MDBX or cold-store failure — operator restarts
+/// with env still set and the next boot retries.
+pub(crate) async fn unwind_to(
+    factory: ProviderFactory<DriverNode>,
+    hub: Arc<WitnessHub>,
+    target: u64,
+) -> eyre::Result<()> {
+    let mdbx_tip_before =
+        factory.best_block_number().map_err(|e| eyre!("unwind: best_block_number: {e}"))?;
+
+    if target == 0 {
+        warn!(target, "UNWIND_TO_BLOCK=0 is not supported (minimum is 1) — skipping");
+        return Ok(());
+    }
+    if target > mdbx_tip_before {
+        warn!(target, mdbx_tip_before, "UNWIND_TO_BLOCK above current tip — skipping");
+        return Ok(());
+    }
+    if target == mdbx_tip_before {
+        info!(target, "UNWIND_TO_BLOCK matches current tip — skipping");
+        return Ok(());
+    }
+
+    // reth-CLI semantic: `UNWIND_TO_BLOCK=N` means N is REMOVED along with
+    // everything above. The provider API keeps the argument block, so we pass
+    // N-1 to get the intended "strictly below N" retention.
+    let keep = target - 1;
+    info!(target, keep, mdbx_tip_before, "UNWIND_TO_BLOCK — starting MDBX + static_files unwind");
+
+    let factory_clone = factory.clone();
+    tokio::task::spawn_blocking(move || -> eyre::Result<()> {
+        let provider_rw =
+            factory_clone.provider_rw().map_err(|e| eyre!("unwind: provider_rw: {e}"))?;
+        provider_rw
+            .remove_block_and_execution_above(keep)
+            .map_err(|e| eyre!("unwind: remove_block_and_execution_above({keep}): {e}"))?;
+        provider_rw.commit().map_err(|e| eyre!("unwind: provider_rw.commit: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| eyre!("unwind: spawn_blocking join: {e}"))??;
+
+    let mdbx_tip_after = factory
+        .best_block_number()
+        .map_err(|e| eyre!("unwind: best_block_number post-commit: {e}"))?;
+
+    let (cold_removed_count, cold_bytes_freed) =
+        hub.unwind_above(keep).await.map_err(|e| eyre!("unwind: cold: {e}"))?;
+
+    info!(
+        target,
+        mdbx_tip_before,
+        mdbx_tip_after,
+        cold_removed_count,
+        cold_bytes_freed,
+        "Unwind complete — remember to UNSET UNWIND_TO_BLOCK before next restart"
+    );
+    Ok(())
 }

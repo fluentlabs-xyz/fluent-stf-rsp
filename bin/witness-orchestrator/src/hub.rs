@@ -21,7 +21,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
 use crate::types::ProveRequest;
-
 const COLD_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("cold_witnesses");
 const META_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("cold_meta");
 const TOTAL_BYTES_KEY: &str = "total_bytes";
@@ -29,7 +28,7 @@ const TOTAL_BYTES_KEY: &str = "total_bytes";
 /// Default batch size for tip-following cold writes. 128 blocks amortizes one
 /// `redb` fsync across ~2 minutes of L2 production at 1 s/block, which on the
 /// observed hardware removes redb from the per-block critical path.
-pub(crate) const DEFAULT_COLD_BATCH_SIZE: usize = 128;
+pub(crate) const DEFAULT_COLD_BATCH_SIZE: usize = 32;
 
 pub(crate) struct WitnessHub {
     db: Arc<Database>,
@@ -64,31 +63,32 @@ impl WitnessHub {
         max_cold_bytes: u64,
         retention_blocks: u64,
         batch_size: usize,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
         if let Some(parent) = cold_file.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .expect("failed to create cold witness parent directory");
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    eyre::eyre!("failed to create cold witness dir {parent:?}: {e}")
+                })?;
             }
         }
         let db = Database::create(&cold_file)
-            .unwrap_or_else(|e| panic!("failed to open cold redb at {cold_file:?}: {e}"));
+            .map_err(|e| eyre::eyre!("failed to open cold redb at {cold_file:?}: {e}"))?;
 
-        // Ensure both tables exist on a fresh file.
         {
-            let write_txn = db.begin_write().expect("begin_write on fresh cold db");
-            write_txn.open_table(COLD_TABLE).expect("open COLD_TABLE");
-            write_txn.open_table(META_TABLE).expect("open META_TABLE");
-            write_txn.commit().expect("commit fresh cold schema");
+            let write_txn =
+                db.begin_write().map_err(|e| eyre::eyre!("begin_write on fresh cold db: {e}"))?;
+            write_txn.open_table(COLD_TABLE).map_err(|e| eyre::eyre!("open COLD_TABLE: {e}"))?;
+            write_txn.open_table(META_TABLE).map_err(|e| eyre::eyre!("open META_TABLE: {e}"))?;
+            write_txn.commit().map_err(|e| eyre::eyre!("commit fresh cold schema: {e}"))?;
         }
 
-        Self {
+        Ok(Self {
             db: Arc::new(db),
             max_cold_bytes,
             retention_blocks,
             batch_size: batch_size.max(1),
             buffer: AsyncMutex::new(Vec::new()),
-        }
+        })
     }
 
     /// Persist a single witness payload immediately. Returns after the redb
@@ -133,6 +133,43 @@ impl WitnessHub {
             std::mem::take(&mut *buf)
         };
         self.commit_entries(entries).await
+    }
+
+    /// Remove every cold entry with key strictly greater than `target`. Returns
+    /// `(removed_count, bytes_freed)`. Expected to be called at boot time
+    /// before any `push` / `push_batched` activity — buffered entries are not
+    /// considered. Updates `total_bytes` in the same redb transaction.
+    pub(crate) async fn unwind_above(&self, target: u64) -> eyre::Result<(u64, u64)> {
+        let db = Arc::clone(&self.db);
+        let join = tokio::task::spawn_blocking(move || -> Result<(u64, u64), redb::Error> {
+            let write_txn = db.begin_write()?;
+            let (count, bytes) = {
+                let mut cold = write_txn.open_table(COLD_TABLE)?;
+                let mut meta = write_txn.open_table(META_TABLE)?;
+                let stale: Vec<(u64, u64)> = cold
+                    .range((target + 1)..)?
+                    .filter_map(|r| r.ok().map(|(k, v)| (k.value(), v.value().len() as u64)))
+                    .collect();
+                let mut total_bytes = read_total_bytes(&meta)?;
+                let mut bytes_freed = 0u64;
+                for (k, size) in &stale {
+                    cold.remove(*k)?;
+                    total_bytes = total_bytes.saturating_sub(*size);
+                    bytes_freed = bytes_freed.saturating_add(*size);
+                }
+                meta.insert(TOTAL_BYTES_KEY, total_bytes)?;
+                (stale.len() as u64, bytes_freed)
+            };
+            write_txn.commit()?;
+            Ok((count, bytes))
+        })
+        .await;
+
+        match join {
+            Ok(Ok(pair)) => Ok(pair),
+            Ok(Err(e)) => Err(eyre::eyre!("cold unwind: {e}")),
+            Err(e) => Err(eyre::eyre!("cold unwind spawn_blocking join: {e}")),
+        }
     }
 
     /// Highest block number currently persisted to cold. Does NOT include
@@ -315,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn push_get_roundtrip() {
         let file = unique_cold_file("roundtrip");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1).unwrap();
 
         hub.push(42, &vec![7u8; 1024]).await.unwrap();
 
@@ -331,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn push_overwrite_preserves_total_bytes() {
         let file = unique_cold_file("overwrite");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1).unwrap();
 
         hub.push(1, &vec![7u8; 100_000]).await.unwrap();
         let total1 = {
@@ -355,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn last_committed_block_tracks_highest_push() {
         let file = unique_cold_file("last_committed");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1).unwrap();
 
         assert_eq!(hub.last_committed_block().unwrap(), None);
 
@@ -373,13 +410,13 @@ mod tests {
     async fn survives_hub_drop_and_reopen() {
         let file = unique_cold_file("reopen");
         {
-            let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
+            let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1).unwrap();
             for i in 1..=5u64 {
                 hub.push(i, &vec![i as u8; 300 * 1024]).await.unwrap();
             }
         }
 
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1).unwrap();
         let got = hub.get_witness(3).await.expect("block 3 in cold");
         assert_eq!(got.payload.len(), 300 * 1024);
         assert_eq!(got.payload[0], 3u8);
@@ -392,7 +429,7 @@ mod tests {
     async fn push_prunes_blocks_below_retention_window() {
         let file = unique_cold_file("retention");
         // retention = 3: push(N) removes entries with key < N - 3.
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3, 1);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3, 1).unwrap();
 
         for i in 1..=10u64 {
             hub.push(i, &vec![i as u8; 1024]).await.unwrap();
@@ -416,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn retention_zero_keeps_all() {
         let file = unique_cold_file("archive");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1).unwrap();
 
         for i in 1..=20u64 {
             hub.push(i, &vec![i as u8; 256]).await.unwrap();
@@ -436,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn push_prune_updates_total_bytes() {
         let file = unique_cold_file("prune_meta");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3, 1);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3, 1).unwrap();
 
         for i in 1..=10u64 {
             hub.push(i, &vec![i as u8; 300 * 1024]).await.unwrap();
@@ -458,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn push_batched_buffers_until_full_then_flushes() {
         let file = unique_cold_file("batched_flush");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 4);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 4).unwrap();
 
         // First 3 buffer only — cold store stays empty on disk.
         for i in 1..=3u64 {
@@ -483,7 +520,7 @@ mod tests {
     #[tokio::test]
     async fn push_batched_buffered_entries_visible_via_get_witness() {
         let file = unique_cold_file("batched_read_own_writes");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 128);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 128).unwrap();
 
         hub.push_batched(77, &vec![0xAB; 1024]).await.unwrap();
         // Not yet persisted.
@@ -501,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn flush_pending_commits_buffered_entries() {
         let file = unique_cold_file("flush_pending");
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1024);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 0, 1024).unwrap();
 
         for i in 1..=5u64 {
             hub.push_batched(i, &vec![i as u8; 256]).await.unwrap();
@@ -522,7 +559,7 @@ mod tests {
     async fn push_batched_retention_prune_runs_once_per_batch() {
         let file = unique_cold_file("batched_retention");
         // retention = 3, batch = 5 → after flush at highest=10 keep 7..=10.
-        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3, 5);
+        let hub = WitnessHub::new(file.clone(), 10 * 1024 * 1024, 3, 5).unwrap();
 
         // Seed with some earlier persisted entries.
         for i in 1..=5u64 {

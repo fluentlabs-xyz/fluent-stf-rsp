@@ -38,7 +38,7 @@ services:
     devices:
       - /dev/vsock:/dev/vsock
     volumes:
-      - ./data/proxy:/var/lib/proxy
+      - ${PROXY_DATA_DIR:-./data/proxy}:/var/lib/proxy
     # NOTE: secrets below are visible via `docker inspect fluent-proxy` to
     # anyone with access to the docker socket. This is acceptable on a
     # dedicated EC2 host where the only docker user is root, but must be
@@ -118,7 +118,7 @@ services:
     stop_grace_period: 30s
     network_mode: host
     volumes:
-      - ./data/witness:/var/lib/witness
+      - ${WITNESS_DATA_DIR:-./data/witness}:/var/lib/witness
     environment:
       RUST_LOG: ${RUST_LOG}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
@@ -138,11 +138,17 @@ services:
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
       L1_START_BATCH_ID: ${L1_START_BATCH_ID}
       L1_ROLLUP_DEPLOY_BLOCK: ${L1_ROLLUP_DEPLOY_BLOCK}
+      FLUENT_METRICS_ADDR: ${FLUENT_METRICS_ADDR}
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "5"
+#    logging:
+#      driver: gelf
+#      options:
+#        gelf-address: ${GRAYLOG_ADDRESS}
+#        tag: "{{.ImageName}}/{{.Name}}"
     ulimits:
       nofile:
         soft: 65536
@@ -154,4 +160,9 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777
-
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "-", "http://${FLUENT_METRICS_ADDR}/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

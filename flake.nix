@@ -88,11 +88,18 @@
             # for cargo; the sibling crates/ stays reachable via relative paths.
             #
             # The filter is scoped to bin/client + crates/ only — unrelated
-            # subtrees (bin/aws-nitro-validator, bin/proxy, bin/witness-*)
-            # must NOT influence the source hash, otherwise mutating their
-            # files (e.g. scripts/update_expected_pcr0.py rewriting
-            # EXPECTED_PCR0 in aws-nitro-validator/src/lib.rs after each
-            # build) would cascade into a different PCR0 on every rebuild.
+            # subtrees (bin/aws-nitro-validator, bin/proxy, bin/witness-*,
+            # scripts/, Makefile, Dockerfile, README*.md, docs/) MUST NOT
+            # influence the source hash, otherwise mutating their files
+            # (e.g. scripts/update_expected_pcr0.py rewriting EXPECTED_PCR0
+            # in aws-nitro-validator/src/lib.rs after each build, or
+            # scripts/update_readme_vkeys.py rewriting README.md after
+            # each ELF build) would cascade into a different PCR0 on every
+            # rebuild. This filter is an ALLOWLIST: anything not explicitly
+            # matched by `inWanted` below is excluded. Do NOT broaden
+            # `inWanted` without understanding this contract — in particular,
+            # never add README.md, scripts/, or any of the host-side
+            # crates here.
             src = pkgs.lib.cleanSourceWith {
               src = ./.;
               filter = path: type:
@@ -104,19 +111,8 @@
                     || rel == "crates"   || pkgs.lib.hasPrefix "crates/" rel
                     || rel == "Cargo.toml" || rel == "Cargo.lock";
                   isAncestor = rel == "" || rel == "bin";
-                  # crates/primitives/build.rs generates fluent_genesis.rs +
-                  # fluent_genesis_bin/ into the working tree (both are
-                  # .gitignored). If present from a prior non-Nix build, they
-                  # would be hashed into the source derivation and break PCR0
-                  # reproducibility — exclude them explicitly so Nix always
-                  # regenerates them fresh inside the sandbox.
-                  isGenerated =
-                    rel == "crates/primitives/src/fluent_genesis.rs"
-                    || rel == "crates/primitives/src/fluent_genesis_bin"
-                    || pkgs.lib.hasPrefix "crates/primitives/src/fluent_genesis_bin/" rel;
                 in
                   (inWanted || isAncestor)
-                  && !isGenerated
                   && (type == "directory"
                       || craneLib.filterCargoSources path type
                       || builtins.match ".*/bin/client/trusted_setup\\.txt$" path != null);
