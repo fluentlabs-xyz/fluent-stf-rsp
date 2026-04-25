@@ -200,6 +200,33 @@ enum SignOutcome {
     TaskFailed,
 }
 
+/// Cheap classification of a reverted preconfirmBatch tx based on the
+/// gasUsed/gasLimit ratio. A deepest-CALL out-of-gas burns ~all forwarded
+/// gas and leaves only the EIP-150 1/64 reserve at the outer frame, so
+/// `gasUsed` lands within ~5% of `gasLimit`. Anything well below that ratio
+/// is a logic-revert (require failure with custom error data).
+///
+/// Used to decide retry policy: `Oog` → re-dispatch with inflated gas buffer
+/// (estimate was too tight); `Logic` → undispatch + backoff (contract state
+/// is in an unexpected shape, operator should inspect).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevertKind {
+    Oog,
+    Logic,
+}
+
+/// `gas_used / gas_limit >= 0.95` → Oog. Pulled out for unit testing.
+pub(crate) fn classify_revert(gas_used: u64, gas_limit: u64) -> RevertKind {
+    if gas_limit == 0 {
+        return RevertKind::Logic;
+    }
+    if gas_used.saturating_mul(100) >= gas_limit.saturating_mul(95) {
+        RevertKind::Oog
+    } else {
+        RevertKind::Logic
+    }
+}
+
 /// Result of an L1 dispatch attempt.
 #[derive(Debug)]
 enum DispatchOutcome {
@@ -207,10 +234,10 @@ enum DispatchOutcome {
     Submitted { tx_hash: B256, l1_block: u64 },
     /// L1 transaction failed — will retry with backoff.
     Failed,
-    /// TX mined but reverted on-chain — e.g. auth failure or already
-    /// preconfirmed. Typically permanent; caller undispatches and applies
-    /// backoff to give operators time to inspect before retrying.
-    Reverted { tx_hash: B256 },
+    /// TX mined but reverted on-chain. `kind` decides retry policy:
+    /// `Oog` → re-dispatch with inflated gas buffer; `Logic` → undispatch +
+    /// backoff (give operators time to inspect before retrying).
+    Reverted { tx_hash: B256, kind: RevertKind },
     /// Pre-flight L1 view-call revealed the batch is already `Preconfirmed`
     /// (or `Finalized`) — almost certainly by a previous instance of this
     /// orchestrator that crashed between broadcast and the `mark_dispatched`
@@ -251,8 +278,12 @@ enum RbfBumpEvent {
 /// query task. The main loop turns these into `finalize_dispatched` /
 /// `undispatch` mutations once it has access to `missing_receipt_first_seen`.
 enum ReceiptCheck {
-    /// `get_transaction_receipt` returned `Some(..)` — batch is finalized.
+    /// `get_transaction_receipt` returned `Some(..)` with `status = true` —
+    /// batch is finalized.
     Found,
+    /// `get_transaction_receipt` returned `Some(..)` with `status = false` —
+    /// classified by [`classify_revert`] using `gas_used / gas_limit`.
+    Reverted { kind: RevertKind },
     /// `get_transaction_receipt` returned `None` — receipt absent.
     Missing,
     /// The RPC itself errored — main loop leaves state untouched and lets
@@ -503,7 +534,7 @@ pub(crate) async fn run(
         info!("Checking dispatched batches from previous run...");
         let snapshot = accumulator.dispatched_snapshot();
         let done = check_finalized_batches_query(&config.l1_provider, snapshot).await;
-        let _ = apply_finalization_changes(
+        let _outcome = apply_finalization_changes(
             done,
             &mut accumulator,
             &db,
@@ -1205,15 +1236,31 @@ impl OrchestratorState {
                 self.try_dispatch_next_batch(accumulator);
             }
 
-            DispatchOutcome::Reverted { tx_hash } => {
-                metrics::counter!(crate::metrics::L1_DISPATCH_REJECTED_TOTAL).increment(1);
+            DispatchOutcome::Reverted { tx_hash, kind } => {
+                metrics::counter!(
+                    crate::metrics::L1_DISPATCH_REJECTED_TOTAL,
+                    "kind" => crate::metrics::revert_kind_label(kind),
+                )
+                .increment(1);
                 error!(
                     batch_index,
                     %tx_hash,
-                    "preconfirmBatch REVERTED on L1 — undispatching and backing off"
+                    ?kind,
+                    "preconfirmBatch REVERTED on L1 — undispatching"
                 );
                 accumulator.undispatch(batch_index).await;
-                self.apply_dispatch_backoff("Dispatch reverted");
+                match kind {
+                    RevertKind::Oog => {
+                        // Skip backoff — retry immediately. The retry rebuilds
+                        // the template, calling `estimate_gas` afresh, so the
+                        // new gas_limit reflects the latest state with the
+                        // standard +20% buffer applied.
+                        self.try_dispatch_next_batch(accumulator);
+                    }
+                    RevertKind::Logic => {
+                        self.apply_dispatch_backoff("Dispatch reverted (logic)");
+                    }
+                }
             }
 
             DispatchOutcome::AlreadyPreconfirmed { tx_hash, l1_block } => {
@@ -1374,7 +1421,7 @@ impl OrchestratorState {
         missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
     ) {
         self.finalization_in_flight = false;
-        let changed = apply_finalization_changes(
+        let outcome = apply_finalization_changes(
             done,
             accumulator,
             &self.db,
@@ -1383,7 +1430,10 @@ impl OrchestratorState {
             &mut self.last_batch_end,
         )
         .await;
-        if changed {
+        if outcome.backoff_logic {
+            self.apply_dispatch_backoff("Finalization-ticker observed logic-revert");
+        }
+        if outcome.changed {
             self.try_sign_next_batch(accumulator);
             self.try_dispatch_next_batch(accumulator);
         }
@@ -1394,13 +1444,18 @@ impl OrchestratorState {
 // L1 finality helpers
 // ============================================================================
 
-/// Narrow RPC surface used by [`check_finalized_batches`]. The blanket impl
-/// for any `alloy` [`Provider`] lets production code pass `&l1_provider` as-is,
-/// while tests substitute a hand-rolled stub.
+/// Narrow RPC surface used by [`check_finalized_batches_query`]. The blanket
+/// impl for any `alloy` [`Provider`] lets production code pass `&l1_provider`
+/// as-is, while tests substitute a hand-rolled stub.
 #[async_trait::async_trait]
 pub(crate) trait FinalityRpc: Send + Sync {
     async fn finalized_block_number(&self) -> Option<u64>;
-    async fn receipt_exists(&self, tx_hash: B256) -> Result<bool, String>;
+    /// `Ok(Some((success, gas_used)))` if a receipt is present; `Ok(None)` if
+    /// the tx is not yet mined; `Err` on RPC failure.
+    async fn receipt_status(&self, tx_hash: B256) -> Result<Option<(bool, u64)>, String>;
+    /// Fetch tx body to read `gas_limit` for revert classification. Returns
+    /// `Ok(None)` if tx body unavailable; caller treats unknown as Logic.
+    async fn tx_gas_limit(&self, tx_hash: B256) -> Result<Option<u64>, String>;
 }
 
 #[async_trait::async_trait]
@@ -1419,10 +1474,19 @@ impl<P: Provider + Send + Sync> FinalityRpc for P {
         }
     }
 
-    async fn receipt_exists(&self, tx_hash: B256) -> Result<bool, String> {
+    async fn receipt_status(&self, tx_hash: B256) -> Result<Option<(bool, u64)>, String> {
         match self.get_transaction_receipt(tx_hash).await {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => Ok(false),
+            Ok(Some(r)) => Ok(Some((r.status(), r.gas_used))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn tx_gas_limit(&self, tx_hash: B256) -> Result<Option<u64>, String> {
+        use alloy_consensus::Transaction as TransactionTrait;
+        match self.get_transaction_by_hash(tx_hash).await {
+            Ok(Some(tx)) => Ok(Some(tx.gas_limit())),
+            Ok(None) => Ok(None),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -1454,9 +1518,25 @@ async fn check_finalized_batches_query(
     }
     let mut observations = Vec::with_capacity(candidates.len());
     for (batch_index, tx_hash) in candidates {
-        let check = match provider.receipt_exists(tx_hash).await {
-            Ok(true) => ReceiptCheck::Found,
-            Ok(false) => ReceiptCheck::Missing,
+        let check = match provider.receipt_status(tx_hash).await {
+            Ok(Some((true, _))) => ReceiptCheck::Found,
+            Ok(Some((false, gas_used))) => {
+                let gas_limit = match provider.tx_gas_limit(tx_hash).await {
+                    Ok(Some(g)) => g,
+                    Ok(None) | Err(_) => 0,
+                };
+                let kind = classify_revert(gas_used, gas_limit);
+                warn!(
+                    batch_index,
+                    %tx_hash,
+                    ?kind,
+                    gas_used,
+                    gas_limit,
+                    "Finalization-ticker observed REVERTED preconfirmBatch"
+                );
+                ReceiptCheck::Reverted { kind }
+            }
+            Ok(None) => ReceiptCheck::Missing,
             Err(e) => {
                 warn!(batch_index, %tx_hash, err = %e, "Receipt check failed — will retry");
                 ReceiptCheck::CheckFailed
@@ -1467,9 +1547,21 @@ async fn check_finalized_batches_query(
     FinalizationDone::Observed { observations }
 }
 
+/// Aggregated outcome of [`apply_finalization_changes`]. `changed` triggers a
+/// follow-up `try_dispatch_next_batch` (so OOG-reverted batches that were
+/// undispatched here are immediately re-dispatched with a fresh estimate).
+/// `backoff_logic` triggers a single `apply_dispatch_backoff` (Logic reverts
+/// indicate the contract is in an unexpected state — operator should inspect
+/// before we burn more gas retrying).
+#[derive(Debug, Default)]
+struct FinalizationApplyOutcome {
+    changed: bool,
+    backoff_logic: bool,
+}
+
 /// Main-loop half: merges RPC observations with `missing_receipt_first_seen`
-/// and applies accumulator/DB mutations. Returns `true` if any mutation ran
-/// so the caller can re-drive the sign/dispatch pipelines.
+/// and applies accumulator/DB mutations. Returns the aggregated outcome so the
+/// caller can drive `oog_attempts` + backoff + re-dispatch.
 async fn apply_finalization_changes(
     done: FinalizationDone,
     accumulator: &mut BatchAccumulator,
@@ -1477,11 +1569,11 @@ async fn apply_finalization_changes(
     known_responses: &KnownResponses,
     missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
     last_batch_end: &mut Option<u64>,
-) -> bool {
+) -> FinalizationApplyOutcome {
     let FinalizationDone::Observed { observations } = done else {
-        return false;
+        return FinalizationApplyOutcome::default();
     };
-    let mut changed = false;
+    let mut out = FinalizationApplyOutcome::default();
     for (batch_index, tx_hash, check) in observations {
         match check {
             ReceiptCheck::Found => {
@@ -1511,7 +1603,41 @@ async fn apply_finalization_changes(
                     });
                 }
                 info!(batch_index, %tx_hash, to_block = dispatched.to_block, "Batch finalized on L1 — cleaned up");
-                changed = true;
+                out.changed = true;
+            }
+            ReceiptCheck::Reverted { kind } => {
+                missing_receipt_first_seen.remove(&batch_index);
+                // Stale-observation guard: ticker snapshot may have captured a
+                // tx_hash that is no longer the current dispatched tx (worker
+                // already processed the revert and main spawned a fresh
+                // dispatch). Skip without action — the new dispatch is
+                // healthy and will be observed on its own merits.
+                if accumulator.dispatched_tx_hash(batch_index) != Some(tx_hash) {
+                    info!(
+                        batch_index,
+                        observed = %tx_hash,
+                        "Stale ticker observation: dispatched tx_hash changed — skip"
+                    );
+                    continue;
+                }
+                metrics::counter!(
+                    crate::metrics::L1_DISPATCH_REJECTED_TOTAL,
+                    "kind" => crate::metrics::revert_kind_label(kind),
+                )
+                .increment(1);
+                error!(
+                    batch_index,
+                    %tx_hash,
+                    ?kind,
+                    "Finalization-ticker undispatching reverted batch"
+                );
+                let did = accumulator.undispatch(batch_index).await;
+                if did {
+                    if matches!(kind, RevertKind::Logic) {
+                        out.backoff_logic = true;
+                    }
+                    out.changed = true;
+                }
             }
             ReceiptCheck::Missing => {
                 let now = tokio::time::Instant::now();
@@ -1553,7 +1679,7 @@ async fn apply_finalization_changes(
             }
         }
     }
-    changed
+    out
 }
 
 // ============================================================================
@@ -2125,13 +2251,17 @@ async fn run_rbf_dispatch(
                     continue;
                 };
                 if !receipt.status() {
+                    let kind = classify_revert(receipt.gas_used, template.gas_limit);
                     warn!(
                         batch_index,
                         %current_hash,
                         l1_block,
+                        ?kind,
+                        gas_used = receipt.gas_used,
+                        gas_limit = template.gas_limit,
                         "preconfirmBatch REVERTED on L1"
                     );
-                    return Ok(DispatchOutcome::Reverted { tx_hash: current_hash });
+                    return Ok(DispatchOutcome::Reverted { tx_hash: current_hash, kind });
                 }
                 info!(
                     batch_index,
@@ -2261,7 +2391,17 @@ async fn run_rbf_dispatch(
                                     l1_block,
                                 });
                             }
-                            return Ok(DispatchOutcome::Reverted { tx_hash: current_hash });
+                            let kind = classify_revert(receipt.gas_used, template.gas_limit);
+                            warn!(
+                                batch_index,
+                                %current_hash,
+                                l1_block,
+                                ?kind,
+                                gas_used = receipt.gas_used,
+                                gas_limit = template.gas_limit,
+                                "RBF: nonce-too-low fallback found REVERTED receipt"
+                            );
+                            return Ok(DispatchOutcome::Reverted { tx_hash: current_hash, kind });
                         }
                         Ok(None) | Err(_) => {
                             warn!(
@@ -2317,11 +2457,12 @@ mod tests {
         Arc::new(StdMutex::new(db))
     }
 
-    /// Hand-rolled stub implementing only the two RPC methods
-    /// [`check_finalized_batches`] actually touches.
+    /// Hand-rolled stub implementing the RPC methods
+    /// [`check_finalized_batches_query`] actually touches.
     struct StubFinality {
         finalized: Option<u64>,
-        receipts: HashMap<B256, Result<bool, String>>,
+        receipt_statuses: HashMap<B256, Result<Option<(bool, u64)>, String>>,
+        tx_gas_limits: HashMap<B256, Result<Option<u64>, String>>,
     }
 
     #[async_trait::async_trait]
@@ -2329,8 +2470,11 @@ mod tests {
         async fn finalized_block_number(&self) -> Option<u64> {
             self.finalized
         }
-        async fn receipt_exists(&self, tx_hash: B256) -> Result<bool, String> {
-            self.receipts.get(&tx_hash).cloned().unwrap_or(Ok(false))
+        async fn receipt_status(&self, tx_hash: B256) -> Result<Option<(bool, u64)>, String> {
+            self.receipt_statuses.get(&tx_hash).cloned().unwrap_or(Ok(None))
+        }
+        async fn tx_gas_limit(&self, tx_hash: B256) -> Result<Option<u64>, String> {
+            self.tx_gas_limits.get(&tx_hash).cloned().unwrap_or(Ok(None))
         }
     }
 
@@ -2371,6 +2515,7 @@ mod tests {
             last_batch_end,
         )
         .await
+        .changed
     }
 
     /// With RBF in place, the missing-receipt window is log-only — the RBF
@@ -2385,7 +2530,11 @@ mod tests {
         let tx_hash = B256::repeat_byte(0xAA);
         register_dispatched(&mut acc, 1, 100, 110, tx_hash, 500).await;
 
-        let provider = StubFinality { finalized: Some(1000), receipts: HashMap::new() };
+        let provider = StubFinality {
+            finalized: Some(1000),
+            receipt_statuses: HashMap::new(),
+            tx_gas_limits: HashMap::new(),
+        };
         let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
 
         let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
@@ -2461,11 +2610,12 @@ mod tests {
         register_dispatched(&mut acc, 1, 100, 110, tx_a, 500).await;
         register_dispatched(&mut acc, 2, 111, 120, tx_b, 501).await;
 
-        let mut receipts = HashMap::new();
-        receipts.insert(tx_a, Ok(false));
-        receipts.insert(tx_b, Ok(true));
+        let mut receipt_statuses = HashMap::new();
+        receipt_statuses.insert(tx_a, Ok(None));
+        receipt_statuses.insert(tx_b, Ok(Some((true, 50_000u64))));
 
-        let provider = StubFinality { finalized: Some(1000), receipts };
+        let provider =
+            StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits: HashMap::new() };
         let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
 
         let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
@@ -2487,6 +2637,144 @@ mod tests {
             !acc.dispatched.contains_key(&2),
             "batch 2 must be removed from dispatched after finalization"
         );
+    }
+
+    #[test]
+    fn classify_revert_above_95pct_is_oog() {
+        assert_eq!(classify_revert(95_000, 100_000), RevertKind::Oog);
+        // Real on-chain numbers from batch 553 failed tx 0xc09798…cbbd.
+        assert_eq!(classify_revert(85_591, 86_476), RevertKind::Oog);
+    }
+
+    #[test]
+    fn classify_revert_below_95pct_is_logic() {
+        assert_eq!(classify_revert(50_000, 100_000), RevertKind::Logic);
+        assert_eq!(classify_revert(30_000, 100_000), RevertKind::Logic);
+        assert_eq!(classify_revert(94_999, 100_000), RevertKind::Logic);
+    }
+
+    #[test]
+    fn classify_revert_zero_limit_is_logic() {
+        assert_eq!(classify_revert(0, 0), RevertKind::Logic);
+    }
+
+    /// Reverted receipt with `gasUsed/gasLimit ≥ 95%` → OOG. Apply must
+    /// undispatch and NOT signal `backoff_logic` (so the caller retries
+    /// immediately with a fresh estimate).
+    #[tokio::test(start_paused = true)]
+    async fn finalization_ticker_oog_revert_undispatches_and_signals_retry() {
+        let db = temp_db();
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let tx_hash = B256::repeat_byte(0xCC);
+        register_dispatched(&mut acc, 1, 100, 110, tx_hash, 500).await;
+
+        let mut receipt_statuses = HashMap::new();
+        receipt_statuses.insert(tx_hash, Ok(Some((false, 95_000u64))));
+        let mut tx_gas_limits = HashMap::new();
+        tx_gas_limits.insert(tx_hash, Ok(Some(100_000u64)));
+        let provider = StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits };
+
+        let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
+        let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
+        let mut last_batch_end: Option<u64> = None;
+
+        let snapshot = acc.dispatched_snapshot();
+        let done = check_finalized_batches_query(&provider, snapshot).await;
+        let outcome = apply_finalization_changes(
+            done,
+            &mut acc,
+            &db,
+            &known_responses,
+            &mut first_seen,
+            &mut last_batch_end,
+        )
+        .await;
+
+        assert!(outcome.changed);
+        assert!(!outcome.backoff_logic, "OOG must not trigger backoff");
+        assert!(!acc.has_dispatched(), "batch must be undispatched");
+        assert!(acc.get(1).is_some(), "batch must be back in pending after undispatch");
+    }
+
+    /// Reverted receipt with `gasUsed/gasLimit < 95%` → Logic. Apply must
+    /// undispatch and signal `backoff_logic`.
+    #[tokio::test(start_paused = true)]
+    async fn finalization_ticker_logic_revert_undispatches_and_signals_backoff() {
+        let db = temp_db();
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let tx_hash = B256::repeat_byte(0xDD);
+        register_dispatched(&mut acc, 1, 100, 110, tx_hash, 500).await;
+
+        let mut receipt_statuses = HashMap::new();
+        receipt_statuses.insert(tx_hash, Ok(Some((false, 50_000u64))));
+        let mut tx_gas_limits = HashMap::new();
+        tx_gas_limits.insert(tx_hash, Ok(Some(100_000u64)));
+        let provider = StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits };
+
+        let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
+        let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
+        let mut last_batch_end: Option<u64> = None;
+
+        let snapshot = acc.dispatched_snapshot();
+        let done = check_finalized_batches_query(&provider, snapshot).await;
+        let outcome = apply_finalization_changes(
+            done,
+            &mut acc,
+            &db,
+            &known_responses,
+            &mut first_seen,
+            &mut last_batch_end,
+        )
+        .await;
+
+        assert!(outcome.changed);
+        assert!(outcome.backoff_logic, "Logic revert must trigger backoff");
+        assert!(!acc.has_dispatched(), "batch must be undispatched");
+    }
+
+    /// Stale ticker observation (snapshot tx_hash differs from current
+    /// dispatched tx_hash) MUST NOT undispatch the live dispatch.
+    #[tokio::test(start_paused = true)]
+    async fn finalization_ticker_skips_stale_tx_hash() {
+        let db = temp_db();
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let stale_hash = B256::repeat_byte(0xAA);
+        let live_hash = B256::repeat_byte(0xBB);
+
+        // Register dispatch with stale_hash, then re-mark with live_hash via
+        // record_rbf_bump so accumulator's dispatched.tx_hash = live_hash.
+        register_dispatched(&mut acc, 1, 100, 110, stale_hash, 500).await;
+        acc.record_rbf_bump(1, live_hash, 0, 0).await;
+
+        // Provider returns reverted for stale_hash (the snapshot value).
+        let mut receipt_statuses = HashMap::new();
+        receipt_statuses.insert(stale_hash, Ok(Some((false, 95_000u64))));
+        let mut tx_gas_limits = HashMap::new();
+        tx_gas_limits.insert(stale_hash, Ok(Some(100_000u64)));
+        let provider = StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits };
+
+        let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
+        let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
+        let mut last_batch_end: Option<u64> = None;
+
+        // Build the stale snapshot manually (mimics the production flow where
+        // the snapshot is taken at try_start_finalization time and may go
+        // stale before apply runs).
+        let stale_snapshot = vec![(1u64, stale_hash, 500u64)];
+        let done = check_finalized_batches_query(&provider, stale_snapshot).await;
+        let outcome = apply_finalization_changes(
+            done,
+            &mut acc,
+            &db,
+            &known_responses,
+            &mut first_seen,
+            &mut last_batch_end,
+        )
+        .await;
+
+        assert!(!outcome.changed, "stale-hash observation must skip mutation");
+        assert!(!outcome.backoff_logic);
+        assert!(acc.has_dispatched(), "live dispatch must remain untouched");
     }
 
     #[test]

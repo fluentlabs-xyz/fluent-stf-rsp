@@ -464,6 +464,13 @@ impl BatchAccumulator {
         self.dispatched.values().map(|d| (d.batch_index, d.tx_hash, d.l1_block)).collect()
     }
 
+    /// Current `tx_hash` for a dispatched batch, if any. Used by the
+    /// finalization-ticker apply path to skip stale observations whose
+    /// snapshot's `tx_hash` no longer matches the current dispatch.
+    pub(crate) fn dispatched_tx_hash(&self, batch_index: u64) -> Option<B256> {
+        self.dispatched.get(&batch_index).map(|d| d.tx_hash)
+    }
+
     /// Check if any dispatched batches exist.
     pub(crate) fn has_dispatched(&self) -> bool {
         !self.dispatched.is_empty()

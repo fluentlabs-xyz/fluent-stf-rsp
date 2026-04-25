@@ -228,6 +228,15 @@ pub(crate) fn broadcast_failure_kind(err: &str) -> &'static str {
     }
 }
 
+/// Stable string label for [`crate::orchestrator::RevertKind`] — used as the
+/// `kind` field of [`L1_DISPATCH_REJECTED_TOTAL`].
+pub(crate) fn revert_kind_label(kind: crate::orchestrator::RevertKind) -> &'static str {
+    match kind {
+        crate::orchestrator::RevertKind::Oog => "oog",
+        crate::orchestrator::RevertKind::Logic => "logic",
+    }
+}
+
 /// Best-effort conversion of a wei U256 to ETH as f64.
 fn wei_to_eth_f64(wei: U256) -> f64 {
     let wei_u128 = u128::try_from(wei).unwrap_or(u128::MAX);
