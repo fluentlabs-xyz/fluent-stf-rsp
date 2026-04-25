@@ -439,6 +439,14 @@ pub struct PreconfirmTxTemplate {
     pub batch_index: u64,
 }
 
+/// `estimate * 1.2` — industry-standard +20% padding over `eth_estimateGas`.
+/// See `~/.claude/standards/solidity/gotchas.md` "Never use raw eth_estimateGas
+/// as gas_limit". Saturating: Rust's `f64 as u64` cast saturates on `+inf`
+/// since 1.45. Pulled out for unit testing.
+pub fn apply_gas_buffer(estimate: u64) -> u64 {
+    (estimate as f64 * 1.2) as u64
+}
+
 /// Build the calldata + gas-limit for a `preconfirmBatch` dispatch using an
 /// explicit `nonce` supplied by the caller.
 ///
@@ -471,8 +479,9 @@ pub async fn build_preconfirm_tx(
         input: input.clone().into(),
         ..Default::default()
     };
-    let gas_limit =
+    let estimate =
         provider.estimate_gas(est_req).await.map_err(|e| eyre!("estimate_gas failed: {e}"))?;
+    let gas_limit = apply_gas_buffer(estimate);
 
     Ok(PreconfirmTxTemplate { to: contract_addr, input, nonce, gas_limit, chain_id, batch_index })
 }
@@ -677,6 +686,17 @@ mod tests {
         alloc.release(n);
         assert_eq!(alloc.peek(), 10, "tail release must rewind");
         assert_eq!(alloc.allocate(), 10);
+    }
+
+    #[test]
+    fn apply_gas_buffer_is_plus_20pct() {
+        assert_eq!(apply_gas_buffer(100_000), 120_000);
+        assert_eq!(apply_gas_buffer(86476), 103771);
+    }
+
+    #[test]
+    fn apply_gas_buffer_saturates() {
+        assert_eq!(apply_gas_buffer(u64::MAX), u64::MAX);
     }
 
     #[test]

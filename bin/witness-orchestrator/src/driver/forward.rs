@@ -660,6 +660,7 @@ impl Driver {
             // churn without purpose.
 
             self.hub.push(block_number, &payload).await?;
+            metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
             state.next = block_number + 1;
             return Ok(Some(ProveRequest { block_number, payload }));
         }

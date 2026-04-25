@@ -48,7 +48,7 @@ pub(crate) struct DispatchedBatch {
 
 #[derive(Debug)]
 pub(crate) struct BatchAccumulator {
-    batches: BTreeMap<u64, PendingBatch>,
+    pub(crate) batches: BTreeMap<u64, PendingBatch>,
     responses: HashMap<u64, EthExecutionResponse>,
     /// BatchSubmitted events that arrived before the batch was registered via set_batch.
     /// Applied when the batch is later registered.
@@ -56,7 +56,7 @@ pub(crate) struct BatchAccumulator {
     db: Option<Arc<Mutex<Db>>>,
     /// In-memory cache of batch signatures: batch_index → SubmitBatchResponse.
     /// Mirrors the `batch_signatures` DB table. Eliminates sync SQL on the hot path.
-    signatures: HashMap<u64, SubmitBatchResponse>,
+    pub(crate) signatures: HashMap<u64, SubmitBatchResponse>,
     /// Batches submitted to L1 awaiting finalization.
     pub(crate) dispatched: BTreeMap<u64, DispatchedBatch>,
 }
@@ -462,6 +462,13 @@ impl BatchAccumulator {
     /// move it across a task boundary without holding a reference.
     pub(crate) fn dispatched_snapshot(&self) -> Vec<(u64, B256, u64)> {
         self.dispatched.values().map(|d| (d.batch_index, d.tx_hash, d.l1_block)).collect()
+    }
+
+    /// Current `tx_hash` for a dispatched batch, if any. Used by the
+    /// finalization-ticker apply path to skip stale observations whose
+    /// snapshot's `tx_hash` no longer matches the current dispatch.
+    pub(crate) fn dispatched_tx_hash(&self, batch_index: u64) -> Option<B256> {
+        self.dispatched.get(&batch_index).map(|d| d.tx_hash)
     }
 
     /// Check if any dispatched batches exist.
