@@ -163,6 +163,22 @@ where
     let txs_tip = sf.get_highest_static_file_block(StaticFileSegment::Transactions).unwrap_or(0);
     let receipts_tip = sf.get_highest_static_file_block(StaticFileSegment::Receipts).unwrap_or(0);
 
+    // Inverse case (static_files behind MDBX) is impossible under reth's current
+    // `save_blocks` ordering — static_files are committed BEFORE MDBX. Surface
+    // loudly in dev/test if the invariant breaks.
+    debug_assert!(
+        headers_tip >= mdbx_tip,
+        "static_files Headers tip {headers_tip} < mdbx_tip {mdbx_tip} — invariant broken"
+    );
+    debug_assert!(
+        txs_tip >= mdbx_tip,
+        "static_files Transactions tip {txs_tip} < mdbx_tip {mdbx_tip} — invariant broken"
+    );
+    debug_assert!(
+        receipts_tip >= mdbx_tip,
+        "static_files Receipts tip {receipts_tip} < mdbx_tip {mdbx_tip} — invariant broken"
+    );
+
     if headers_tip <= mdbx_tip && txs_tip <= mdbx_tip && receipts_tip <= mdbx_tip {
         return Ok(());
     }

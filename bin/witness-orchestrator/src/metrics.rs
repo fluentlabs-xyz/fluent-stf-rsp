@@ -49,6 +49,11 @@ pub(crate) const L1_DISPATCH_REJECTED_TOTAL: &str = "orchestrator_l1_dispatch_re
 /// exact race that `NonceAllocator` prevents.
 pub(crate) const L1_BROADCAST_FAILURES_TOTAL: &str = "orchestrator_l1_broadcast_failures_total";
 
+/// Counter for accumulator mutations dropped because the DB writer channel
+/// was closed (e.g. writer actor exited, typically during shutdown). Indicates
+/// in-memory state ahead of DB; recoverable on restart but worth alerting.
+pub(crate) const DB_WRITER_DROPPED_TOTAL: &str = "orchestrator_db_writer_dropped_total";
+
 // Cost — histogram only. A `u64` counter cannot represent sub-ETH amounts
 // (`0.002 as u64 == 0`); cumulative spend is read from the histogram's `_sum`.
 pub(crate) const L1_DISPATCH_COST_ETH: &str = "orchestrator_l1_dispatch_cost_eth";
@@ -147,6 +152,12 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
         L1_BROADCAST_FAILURES_TOTAL,
         "preconfirmBatch broadcast attempts rejected by the L1 RPC before mempool \
          admission. Labels: kind=nonce_too_low|stuck_at_cap|other"
+    );
+    metrics::describe_counter!(
+        DB_WRITER_DROPPED_TOTAL,
+        "Accumulator mutations dropped because the DB writer channel was closed \
+         (typically during shutdown). In-memory state may be ahead of DB; restart \
+         resyncs via normalize_startup_checkpoint."
     );
 
     metrics::describe_histogram!(

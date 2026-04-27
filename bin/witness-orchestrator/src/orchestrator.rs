@@ -864,18 +864,28 @@ impl OrchestratorState {
             return;
         }
 
-        // Drop results for blocks already L1-finalized: the batch's
-        // `block_responses` rows were purged by `finalize_dispatched_batch`,
-        // so re-inserting would leak state that no path will clean up.
-        if let Some(lbe) = self.last_batch_end {
-            if block_number <= lbe {
-                warn!(
-                    block_number,
-                    last_batch_end = lbe,
-                    "Ignoring block result: already finalized"
-                );
-                return;
-            }
+        // Drop results for blocks not covered by any active (pending or
+        // dispatched) batch. Their `block_responses` rows were either never
+        // tracked (below start) or already purged by `finalize_dispatched_batch`,
+        // and re-inserting would leak rows that no path will clean up. The
+        // simpler `<= last_batch_end` check is wrong when batches finalize
+        // out of order (e.g. an external operator preconfirms a later batch
+        // ahead of an unsigned earlier one), so we require active coverage.
+        let belongs_to_active = accumulator
+            .batches
+            .values()
+            .any(|b| (b.from_block..=b.to_block).contains(&block_number))
+            || accumulator
+                .dispatched
+                .values()
+                .any(|d| (d.from_block..=d.to_block).contains(&block_number));
+        if !belongs_to_active {
+            warn!(
+                block_number,
+                last_batch_end = ?self.last_batch_end,
+                "Ignoring block result: not covered by any active batch"
+            );
+            return;
         }
 
         info!(block_number, "Block execution response received");
@@ -959,7 +969,11 @@ impl OrchestratorState {
                     .db_tx
                     .send(DbCommand::WipeForRevert {
                         start_batch_id: from_batch_index,
-                        l1_block: l1_block + 1,
+                        // Persist the revert event's exact L1 block. Startup
+                        // resumes the listener at `saved + 1`, so the
+                        // BatchReverted event itself is not replayed but other
+                        // events emitted in `l1_block + 1` are not skipped.
+                        l1_block,
                     })
                     .await
                     .is_err()
@@ -979,28 +993,49 @@ impl OrchestratorState {
     fn spawn_re_execution(&self, block_number: u64) {
         let h_tx = self.high_tx.clone();
         let driver = Arc::clone(&self.driver);
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            match driver.get_or_build_witness(block_number).await {
-                Ok(Some(payload)) => {
-                    if h_tx.send(ExecutionTask { block_number, payload }).await.is_err() {
-                        warn!(block_number, "High-priority channel closed during re-execution");
+            let mut backoff = Duration::from_secs(1);
+            let mut attempts: u64 = 0;
+            loop {
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                match driver.get_or_build_witness(block_number).await {
+                    Ok(Some(payload)) => {
+                        if h_tx.send(ExecutionTask { block_number, payload }).await.is_err() {
+                            warn!(block_number, "High-priority channel closed during re-execution");
+                        }
+                        return;
+                    }
+                    Ok(None) => {
+                        attempts += 1;
+                        if is_log_worthy(attempts) {
+                            warn!(
+                                block_number,
+                                attempts,
+                                "Re-execution: block not yet in MDBX and not cached — \
+                                 retrying with backoff"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        if is_log_worthy(attempts) {
+                            warn!(
+                                block_number,
+                                attempts,
+                                err = %e,
+                                "Re-execution: witness rebuild failed — retrying with backoff"
+                            );
+                        }
                     }
                 }
-                Ok(None) => {
-                    error!(
-                        block_number,
-                        "Re-execution: block not yet in MDBX and not cached — block stuck \
-                         until driver commits it"
-                    );
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
                 }
-                Err(e) => {
-                    error!(
-                        block_number,
-                        err = %e,
-                        "Re-execution: witness rebuild failed — block will not be retried until \
-                         another rotation trigger"
-                    );
-                }
+                backoff = (backoff * 2).min(Duration::from_secs(60));
             }
         });
     }
@@ -1182,7 +1217,10 @@ impl OrchestratorState {
         signature: Vec<u8>,
         resume: Option<RbfResumeState>,
     ) {
-        let cancel = CancellationToken::new();
+        // Child token of shutdown — fires automatically on global shutdown so
+        // in-flight RBF workers exit promptly. Per-batch cancellation can still
+        // call cancel.cancel() explicitly.
+        let cancel = self.shutdown.child_token();
         self.dispatch_cancel.insert(batch_index, cancel.clone());
 
         let provider = self.config.l1_provider.clone();
@@ -1808,6 +1846,17 @@ async fn sign_batch_io(
             Ok(resp) => {
                 metrics::histogram!(crate::metrics::SIGN_BATCH_ROOT_DURATION)
                     .record(t_start.elapsed().as_secs_f64());
+                // Skip persistence if shutdown is in flight: a concurrent
+                // BatchReverted wipe may have queued WipeForRevert before us,
+                // and persisting after the wipe would leak an orphan
+                // batch_signatures row. On restart we re-sign anyway.
+                if shutdown.is_cancelled() {
+                    warn!(
+                        batch_index,
+                        "Sign succeeded during shutdown — dropping persistence to avoid wipe race"
+                    );
+                    return SignOutcome::TaskFailed;
+                }
                 if db_tx
                     .send(DbCommand::SaveBatchSignature { batch_index, resp: resp.clone() })
                     .await
@@ -2054,18 +2103,25 @@ async fn run_rbf_dispatch(
     // exists. Reconciliation latency = L1 finality delay (~13 min on
     // mainnet), which is fine — the alternative was an infinite retry loop.
     {
-        let on_chain = get_batch_on_chain(provider, contract, batch_index)
-            .await
-            .map_err(|e| eyre::eyre!("pre-flight getBatch({batch_index}) failed: {e}"))?;
+        // Honor cancel/shutdown across pre-flight RPC calls so workers exit
+        // promptly without an extra L1 round-trip after the process starts
+        // shutting down.
+        let on_chain = tokio::select! {
+            _ = cancel.cancelled() => return Ok(DispatchOutcome::Failed),
+            res = get_batch_on_chain(provider, contract, batch_index) => res
+                .map_err(|e| eyre::eyre!("pre-flight getBatch({batch_index}) failed: {e}"))?,
+        };
         match on_chain.status {
             batch_status::SUBMITTED => {
                 // Normal path — proceed to build + broadcast.
             }
             batch_status::PRECONFIRMED | batch_status::CHALLENGED | batch_status::FINALIZED => {
-                let finalized_head = provider
-                    .get_block_by_number(BlockNumberOrTag::Finalized)
-                    .await
-                    .map_err(|e| eyre::eyre!("get_block(Finalized) failed: {e}"))?
+                let finalized_block = tokio::select! {
+                    _ = cancel.cancelled() => return Ok(DispatchOutcome::Failed),
+                    res = provider.get_block_by_number(BlockNumberOrTag::Finalized) => res
+                        .map_err(|e| eyre::eyre!("get_block(Finalized) failed: {e}"))?,
+                };
+                let finalized_head = finalized_block
                     .ok_or_else(|| {
                         eyre::eyre!("L1 RPC returned no finalized block — chain not progressing?")
                     })?
@@ -2085,17 +2141,18 @@ async fn run_rbf_dispatch(
                     );
                     return Ok(DispatchOutcome::Failed);
                 }
-                let info = find_batch_preconfirm_event(
-                    provider,
-                    contract,
-                    batch_index,
-                    on_chain.accepted_at_block,
-                    finalized_head,
-                )
-                .await
-                .map_err(|e| {
-                    eyre::eyre!("find_batch_preconfirm_event({batch_index}) failed: {e}")
-                })?;
+                let info = tokio::select! {
+                    _ = cancel.cancelled() => return Ok(DispatchOutcome::Failed),
+                    res = find_batch_preconfirm_event(
+                        provider,
+                        contract,
+                        batch_index,
+                        on_chain.accepted_at_block,
+                        finalized_head,
+                    ) => res.map_err(|e| {
+                        eyre::eyre!("find_batch_preconfirm_event({batch_index}) failed: {e}")
+                    })?,
+                };
                 let Some(info) = info else {
                     // Two legitimate reasons for a miss:
                     // 1. `Challenged` opened from `Submitted` — no preceding BatchPreconfirmed
@@ -2164,23 +2221,29 @@ async fn run_rbf_dispatch(
     // `release` is a tail-CAS: it closes the gap only when no other allocation
     // raced in between, which is the common case under `dispatching_batch`
     // serialization.
-    let template = match build_preconfirm_tx(
-        provider,
-        contract,
-        verifier,
-        batch_index,
-        signature,
-        signer_addr,
-        nonce,
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(e) => {
+    let template = tokio::select! {
+        _ = cancel.cancelled() => {
             if resume.is_none() {
                 nonce_allocator.release(nonce);
             }
-            return Err(e);
+            return Ok(DispatchOutcome::Failed);
+        }
+        res = build_preconfirm_tx(
+            provider,
+            contract,
+            verifier,
+            batch_index,
+            signature,
+            signer_addr,
+            nonce,
+        ) => match res {
+            Ok(t) => t,
+            Err(e) => {
+                if resume.is_none() {
+                    nonce_allocator.release(nonce);
+                }
+                return Err(e);
+            }
         }
     };
 
@@ -2188,11 +2251,17 @@ async fn run_rbf_dispatch(
         match resume {
             Some(r) => (r.max_fee_per_gas, r.max_priority_fee_per_gas, r.tx_hash, false),
             None => {
-                let est = match provider.estimate_eip1559_fees().await {
-                    Ok(est) => est,
-                    Err(e) => {
+                let est = tokio::select! {
+                    _ = cancel.cancelled() => {
                         nonce_allocator.release(nonce);
-                        return Err(eyre::eyre!("estimate_eip1559_fees failed: {e}"));
+                        return Ok(DispatchOutcome::Failed);
+                    }
+                    res = provider.estimate_eip1559_fees() => match res {
+                        Ok(est) => est,
+                        Err(e) => {
+                            nonce_allocator.release(nonce);
+                            return Err(eyre::eyre!("estimate_eip1559_fees failed: {e}"));
+                        }
                     }
                 };
                 let mut fee = est.max_fee_per_gas;
@@ -2207,7 +2276,14 @@ async fn run_rbf_dispatch(
                         max_fee_cap, "RBF: initial fee at/above cap — clamping and proceeding"
                     );
                 }
-                let hash = match broadcast_preconfirm(provider, signer, &template, fee, tip).await {
+                let broadcast_res = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        nonce_allocator.release(nonce);
+                        return Ok(DispatchOutcome::Failed);
+                    }
+                    res = broadcast_preconfirm(provider, signer, &template, fee, tip) => res,
+                };
+                let hash = match broadcast_res {
                     Ok(h) => h,
                     Err(e) => {
                         let msg = e.to_string();
@@ -2724,7 +2800,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn finalization_ticker_oog_revert_undispatches_and_signals_retry() {
         let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let (dummy_db_tx, _dummy_db_rx) = mpsc::channel(100);
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db), dummy_db_tx.clone());
+        let tip = Arc::new(AtomicU64::new(0));
         let tx_hash = B256::repeat_byte(0xCC);
         register_dispatched(&mut acc, 1, 100, 110, tx_hash, 500).await;
 
@@ -2743,7 +2821,8 @@ mod tests {
         let outcome = apply_finalization_changes(
             done,
             &mut acc,
-            &db,
+            &dummy_db_tx,
+            &tip,
             &known_responses,
             &mut first_seen,
             &mut last_batch_end,
@@ -2761,7 +2840,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn finalization_ticker_logic_revert_undispatches_and_signals_backoff() {
         let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let (dummy_db_tx, _dummy_db_rx) = mpsc::channel(100);
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db), dummy_db_tx.clone());
+        let tip = Arc::new(AtomicU64::new(0));
         let tx_hash = B256::repeat_byte(0xDD);
         register_dispatched(&mut acc, 1, 100, 110, tx_hash, 500).await;
 
@@ -2780,7 +2861,8 @@ mod tests {
         let outcome = apply_finalization_changes(
             done,
             &mut acc,
-            &db,
+            &dummy_db_tx,
+            &tip,
             &known_responses,
             &mut first_seen,
             &mut last_batch_end,
@@ -2797,7 +2879,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn finalization_ticker_skips_stale_tx_hash() {
         let db = temp_db();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db));
+        let (dummy_db_tx, _dummy_db_rx) = mpsc::channel(100);
+        let mut acc = BatchAccumulator::with_db(Arc::clone(&db), dummy_db_tx.clone());
+        let tip = Arc::new(AtomicU64::new(0));
         let stale_hash = B256::repeat_byte(0xAA);
         let live_hash = B256::repeat_byte(0xBB);
 
@@ -2825,7 +2909,8 @@ mod tests {
         let outcome = apply_finalization_changes(
             done,
             &mut acc,
-            &db,
+            &dummy_db_tx,
+            &tip,
             &known_responses,
             &mut first_seen,
             &mut last_batch_end,

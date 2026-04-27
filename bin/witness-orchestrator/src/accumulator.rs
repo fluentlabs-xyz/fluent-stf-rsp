@@ -70,7 +70,8 @@ impl BatchAccumulator {
     async fn send_cmd(&self, cmd: DbCommand) {
         if let Some(tx) = &self.db_tx {
             if tx.send(cmd).await.is_err() {
-                warn!("send_cmd: db writer channel closed — mutation dropped");
+                metrics::counter!(crate::metrics::DB_WRITER_DROPPED_TOTAL).increment(1);
+                error!("send_cmd: db writer channel closed — mutation dropped");
             }
         }
     }
@@ -826,8 +827,11 @@ mod tests {
         let tx_hash = B256::from([0xEE; 32]);
         acc.mark_dispatched(1, tx_hash, 80, 0, 0, 0).await;
 
-        // Flush pending writes before reload.
+        // Flush pending writes before reload. Both senders (the local clone
+        // and the one held inside `acc`) must drop before the actor sees the
+        // channel close and exits.
         drop(db_tx);
+        drop(acc);
         handle.await.unwrap();
 
         // Reload from DB — build an accumulator without a live actor (reads

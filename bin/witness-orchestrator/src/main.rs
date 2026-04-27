@@ -542,7 +542,13 @@ async fn main() -> eyre::Result<()> {
     // (a) a runtime guard that stops the pruner when dispatch is lagging,
     // (b) an explicit StateAtBlockNotAvailable error instead of Ok(None)
     // from the driver's witness rebuild path. Until then — archive mode.
-    let _ = std::env::var("PRUNE_FULL"); // swallow env so misconfig doesn't silently fail
+    if std::env::var("PRUNE_FULL").as_deref() == Ok("true") {
+        tracing::warn!(
+            "PRUNE_FULL=true ignored — pruner is currently disabled (archive mode). \
+             Re-enabling requires runtime guard against witness retention; see TODO at \
+             bin/witness-orchestrator/src/main.rs:537."
+        );
+    }
     info!("Pruning disabled — archive mode");
     let pruner: Option<driver::DriverPruner> = None;
 
@@ -725,8 +731,15 @@ async fn main() -> eyre::Result<()> {
             }
         }
     };
-    if tokio::time::timeout(Duration::from_secs(300), drain_fut).await.is_err() {
-        tracing::error!("Background tasks drain timed out after 15s — forcing shutdown");
+    const SHUTDOWN_DRAIN_TIMEOUT_SECS: u64 = 300;
+    if tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS), drain_fut)
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT_SECS,
+            "Background tasks drain timed out — forcing shutdown"
+        );
         exit_code = 1;
     }
 
