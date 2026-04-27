@@ -864,28 +864,15 @@ impl OrchestratorState {
             return;
         }
 
-        // Drop results for blocks not covered by any active (pending or
-        // dispatched) batch. Their `block_responses` rows were either never
-        // tracked (below start) or already purged by `finalize_dispatched_batch`,
-        // and re-inserting would leak rows that no path will clean up. The
-        // simpler `<= last_batch_end` check is wrong when batches finalize
-        // out of order (e.g. an external operator preconfirms a later batch
-        // ahead of an unsigned earlier one), so we require active coverage.
-        let belongs_to_active = accumulator
-            .batches
-            .values()
-            .any(|b| (b.from_block..=b.to_block).contains(&block_number))
-            || accumulator
-                .dispatched
-                .values()
-                .any(|d| (d.from_block..=d.to_block).contains(&block_number));
-        if !belongs_to_active {
-            warn!(
-                block_number,
-                last_batch_end = ?self.last_batch_end,
-                "Ignoring block result: not covered by any active batch"
-            );
-            return;
+        if let Some(lbe) = self.last_batch_end {
+            if block_number <= lbe {
+                warn!(
+                    block_number,
+                    last_batch_end = lbe,
+                    "Ignoring block result: already finalized"
+                );
+                return;
+            }
         }
 
         info!(block_number, "Block execution response received");
