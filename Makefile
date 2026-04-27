@@ -88,14 +88,19 @@ build-nitro-validator-docker:
 ## + pinned rust toolchain + git-hashed source tree) — any machine with Nix
 ## produces the same PCR0. `--impure` is needed on first build to let
 ## builtins.fetchGit pull git dependencies from the Cargo.lock; subsequent
-## builds hit the store. Writes EIF + pcr.json into the repo root. PCR0 is
-## NOT injected into nitro-validator lib.rs here — use `make build-release`
-## to build all networks and rewrite lib.rs + README in one shot.
+## builds hit the store. Writes EIF + pcr.json into the repo root and rewrites
+## EXPECTED_PCR0 for $(NETWORK) in nitro-validator lib.rs and the matching
+## sentinel in README.md.
 build-enclave:
 	@command -v nix >/dev/null 2>&1 || { echo "error: nix not installed (see https://determinate.systems/nix)"; exit 1; }
 	nix --extra-experimental-features 'nix-command flakes' build .#enclave-$(NETWORK) --impure
 	install -m 0644 result/image.eif $(EIF)
 	install -m 0644 result/pcr.json  $(EIF).pcrs.json
+	python3 scripts/update_expected_pcr0.py \
+		$(EIF).pcrs.json \
+		bin/aws-nitro-validator/src/lib.rs \
+		$(NETWORK) \
+		--readme README.md
 	@echo "EIF: $(EIF)"
 	@echo "PCR0: $$(jq -r .PCR0 $(EIF).pcrs.json)"
 
@@ -117,6 +122,11 @@ build-enclave-docker:
 			&& install -m 0644 \$$(readlink -f /tmp/result)/image.eif /work/$(EIF) \
 			&& install -m 0644 \$$(readlink -f /tmp/result)/pcr.json  /work/$(EIF).pcrs.json \
 			&& chown $(shell id -u):$(shell id -g) /work/$(EIF) /work/$(EIF).pcrs.json"
+	python3 scripts/update_expected_pcr0.py \
+		$(EIF).pcrs.json \
+		bin/aws-nitro-validator/src/lib.rs \
+		$(NETWORK) \
+		--readme README.md
 	@echo "EIF: $(EIF)"
 	@echo "PCR0: $$(jq -r .PCR0 $(EIF).pcrs.json)"
 
@@ -130,13 +140,13 @@ NETWORKS_ALL := mainnet testnet devnet
 ## artifacts.
 ##
 ## Order inside one network is load-bearing:
-##   1. build-enclave                  → PCR0 in <eif>.pcrs.json
-##   2. update_expected_pcr0.py        → writes PCR0 into lib.rs
-##   3. build-nitro-validator-docker   → bakes that PCR0 into the vkey
-##   4. build-client-docker            → independent vkey
-##   5. update_readme_vkeys.py         → writes both vkeys + release version
+##   1. build-enclave                  → PCR0 in <eif>.pcrs.json,
+##                                       writes PCR0 into lib.rs + README
+##   2. build-nitro-validator-docker   → bakes that PCR0 into the vkey
+##   3. build-client-docker            → independent vkey
+##   4. update_readme_vkeys.py         → writes both vkeys + release version
 ##
-## Reordering steps 2↔3 produces a stale vkey that will not match the
+## Reordering steps 1↔2 produces a stale vkey that will not match the
 ## PCR0 committed in §3.3 of the README.
 ##
 ## After all networks are built, check_version_bump.py enforces the
@@ -149,11 +159,6 @@ build-release:
 	for net in $(NETWORKS_ALL); do \
 		echo "=== build-release: $$net ==="; \
 		$(MAKE) build-enclave NETWORK=$$net; \
-		python3 scripts/update_expected_pcr0.py \
-			rsp-client-enclave-$$net.eif.pcrs.json \
-			bin/aws-nitro-validator/src/lib.rs \
-			$$net \
-			--readme README.md; \
 		$(MAKE) build-nitro-validator-docker NETWORK=$$net; \
 		$(MAKE) build-client-docker NETWORK=$$net; \
 		python3 scripts/update_readme_vkeys.py \
