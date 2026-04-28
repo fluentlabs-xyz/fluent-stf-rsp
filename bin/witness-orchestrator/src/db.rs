@@ -651,7 +651,7 @@ impl Db {
 // DB writer actor
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// All mutating SQLite operations route through an `mpsc::Sender<DbCommand>`
+// All mutating SQLite operations route through an `mpsc::UnboundedSender<DbCommand>`
 // into a single background task that batches per-row writes into one
 // transaction per flush (size threshold OR timer tick) — collapsing N fsyncs
 // into one. Atomic multi-statement commands drain the per-row buffer first,
@@ -752,7 +752,7 @@ const DB_BUFFER_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// statement commands flush any pending buffer first and then run as their
 /// own transaction. On sender close, performs one final flush and exits.
 pub(crate) async fn run_db_writer(
-    mut rx: mpsc::Receiver<DbCommand>,
+    mut rx: mpsc::UnboundedReceiver<DbCommand>,
     db: Arc<std::sync::Mutex<Db>>,
 ) {
     tracing::info!("DB writer actor started");

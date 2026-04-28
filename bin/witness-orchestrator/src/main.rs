@@ -67,6 +67,7 @@ mod hub;
 mod l1_listener;
 mod metrics;
 mod orchestrator;
+mod rbf;
 mod types;
 mod witness_server;
 
@@ -387,7 +388,7 @@ async fn main() -> eyre::Result<()> {
     let db = Arc::new(Mutex::new(
         crate::db::Db::open(&db_path).expect("Failed to open orchestrator DB"),
     ));
-    let (db_tx, db_rx) = tokio::sync::mpsc::channel::<crate::db::DbCommand>(10_000);
+    let (db_tx, db_rx) = tokio::sync::mpsc::unbounded_channel::<crate::db::DbCommand>();
     {
         let db = Arc::clone(&db);
         tasks.spawn(async move {

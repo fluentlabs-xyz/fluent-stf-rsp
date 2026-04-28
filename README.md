@@ -70,7 +70,7 @@ Each network has its own set of cryptographic trust anchors. The values below ar
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:testnet:begin -->`9c4c1c41aaaabb15fd65712d1ab75ab859ef1d6b67d998f49e24818464ad13fd29274cc10ed2517991c8829f545897cf`<!-- pcr0:testnet:end --> |
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`f46f95f37666b070a15ac3ef9d8991bceba145a56e8a280d2d5ab14198da88239b44b2d20e1691611ec81a42c8fba6f4`<!-- pcr0:testnet:end --> |
 | nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x008059ac42a6cdda819cbc5f04f6028ea9c7fe39a092bfa3a6671d53c3707b1e`<!-- nv-vkey:testnet:end --> |
 | rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x001542cb5a66b9e20271941ad56b07f490701be789a6cbd61637a66e67f9eea7`<!-- rsp-vkey:testnet:end --> |
 
