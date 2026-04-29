@@ -50,9 +50,9 @@
 //! | `orchestrator_last_batch_signed` | **gauge** | Index of the most recently signed L1 batch (`/sign-batch-root`). |
 //! | `orchestrator_last_batch_signed_from_block` | **gauge** | `from_block` of the most recently signed batch. |
 //! | `orchestrator_last_batch_signed_to_block` | **gauge** | `to_block` of the most recently signed batch. |
-//! | `orchestrator_last_batch_dispatched` | **gauge** | Index of the most recently L1-included `preconfirmBatch` (status=1). |
-//! | `orchestrator_last_batch_dispatched_from_block` | **gauge** | `from_block` of the most recently L1-included batch. |
-//! | `orchestrator_last_batch_dispatched_to_block` | **gauge** | `to_block` of the most recently L1-included batch. |
+//! | `orchestrator_last_batch_preconfirmed` | **gauge** | Index of the most recently L1-included `preconfirmBatch` observed via `BatchPreconfirmed` event. |
+//! | `orchestrator_last_batch_preconfirmed_from_block` | **gauge** | `from_block` of the most recently L1-included batch. |
+//! | `orchestrator_last_batch_preconfirmed_to_block` | **gauge** | `to_block` of the most recently L1-included batch. |
 //! | `orchestrator_sign_block_execution_duration_seconds` | **histogram** | Per-attempt duration of `/sign-block-execution` HTTP call (seconds). |
 //! | `orchestrator_sign_batch_root_duration_seconds` | **histogram** | Per-attempt duration of `/sign-batch-root` HTTP call (seconds). |
 //! | `orchestrator_sign_failures_total` | **counter** | Sign-endpoint failures. Labels: `stage=block|batch`, `kind=enclave_busy|other`. |
@@ -74,9 +74,8 @@ mod types;
 mod witness_server;
 
 use std::{
-    collections::HashSet,
     path::PathBuf,
-    sync::{atomic::AtomicU64, Arc, Mutex, RwLock},
+    sync::{atomic::AtomicU64, Arc, Mutex},
     time::Duration,
 };
 
@@ -226,9 +225,9 @@ async fn main() -> eyre::Result<()> {
         let start_batch_id: Option<u64> = db_start_batch_id.or(env_start_batch_id);
 
         // Initial checkpoint is derived from the batches table — highest
-        // to_block among rows with status >= Sent (preconfirm pipeline has
+        // to_block among rows with status >= Dispatched (preconfirm pipeline has
         // moved past these blocks).
-        let initial_checkpoint = db_startup.highest_dispatched_to_block().unwrap_or(0);
+        let mut initial_checkpoint = db_startup.highest_dispatched_to_block().unwrap_or(0);
 
         if let Some(batch_id) = start_batch_id {
             if initial_checkpoint == 0 {
@@ -247,6 +246,8 @@ async fn main() -> eyre::Result<()> {
                     )
                     .await
                     .expect("Fatal: failed to resolve L2 start checkpoint from L1");
+
+                initial_checkpoint = l2_from_block.saturating_sub(1);
 
                 // For env-var bootstrap we rewind l1_checkpoint one block
                 // behind the committing event so the listener re-observes it.
@@ -275,23 +276,10 @@ async fn main() -> eyre::Result<()> {
             }
         }
 
-        // Roll the checkpoint back to (gap_block - 1) if any unsent batch has
-        // a missing block_responses row — the next signer attempt can't sign
-        // an incomplete batch, so re-execution must fill the gap first.
-        let gap_adjusted_checkpoint = match db_startup.earliest_unsent_with_gap() {
-            Some((batch_index, gap_block)) => {
-                info!(
-                    batch_index,
-                    gap_block,
-                    initial_checkpoint,
-                    "Startup: gap in block_responses — rolling back checkpoint"
-                );
-                initial_checkpoint.min(gap_block.saturating_sub(1))
-            }
-            None => initial_checkpoint,
-        };
-
-        let checkpoint = gap_adjusted_checkpoint;
+        // Missing-block recovery is handled by the orchestrator's
+        // `startup_recovery_feeder` task (priority-replay only the blocks
+        // absent from `block_responses`); no checkpoint rollback here.
+        let checkpoint = initial_checkpoint;
         let witness_from = if checkpoint > 0 { checkpoint + 1 } else { 0 };
 
         let lfb = if let Some(ckpt) = db_startup.get_l1_checkpoint() {
@@ -594,13 +582,6 @@ async fn main() -> eyre::Result<()> {
         rbf_max_fee_per_gas_wei,
     };
 
-    // Shared channel + dedup set between the feeder (driver pull) and the
-    // orchestrator (worker pool consumer). Owned at the top level so the
-    // feeder can be supervised via `tasks`.
-    let (normal_tx, normal_rx) =
-        async_channel::bounded::<orchestrator::ExecutionTask>(orchestrator::EXECUTION_WORKERS * 2);
-    let known_responses: orchestrator::KnownResponses = Arc::new(RwLock::new(HashSet::new()));
-
     // Spawn the driver's autonomous background loop into the top-level JoinSet.
     // It produces witnesses into `WitnessHub` up to the `max_lookahead_blocks`
     // cap beyond the shared `orchestrator_tip` — decoupled from the feeder so
@@ -615,36 +596,13 @@ async fn main() -> eyre::Result<()> {
         });
     }
 
-    // Spawn the feeder into the top-level JoinSet. It consumes ready witnesses
-    // from the cold witness store and forwards them to the worker pool. Feeder
-    // exit (clean or error) cancels the root token via the `tasks.join_next()`
-    // race below.
+    // Build and run the orchestrator. `new` performs every internal setup
+    // (response cache, channels, nonce-allocator bootstrap, metric seeds);
+    // `run` consumes self and supervises feeder + execution workers + per-
+    // role workers (signer, dispatcher, finalization, router, challenge
+    // resolver) until shutdown.
     let feeder_starting_block = orchestrator_checkpoint + 1;
-    {
-        let hub = hub_for_feeder;
-        let normal_tx = normal_tx.clone();
-        let known_responses = Arc::clone(&known_responses);
-        let shutdown = shutdown.clone();
-        tasks.spawn(async move {
-            let r = orchestrator::feeder_loop(
-                hub,
-                normal_tx,
-                known_responses,
-                feeder_starting_block,
-                shutdown,
-            )
-            .await;
-            ("feeder", r)
-        });
-    }
-
-    // Orchestrator runs in the foreground. Race it against `tasks.join_next()`
-    // so that ANY background task exiting first (signal handler, L1 listener,
-    // witness server, feeder) immediately cancels the root token. Catch-up is
-    // tracked separately via `catchup_handle` because its successful completion
-    // is expected and must not trigger shutdown.
-    let mut exit_code = 0;
-    let mut orchestrator_fut = std::pin::pin!(orchestrator::run(
+    let orchestrator = orchestrator::Orchestrator::new(
         config,
         Arc::clone(&db),
         db_tx.clone(),
@@ -652,14 +610,22 @@ async fn main() -> eyre::Result<()> {
         Arc::clone(&orchestrator_tip),
         l1_rx,
         shutdown.clone(),
-        normal_rx,
-        Arc::clone(&known_responses),
-    ));
-    // Drop the outer senders so once the orchestrator exits and drops its
-    // internal clones, the worker pool and DB writer actor observe the close
-    // and drain cleanly. Sign spawns hold their own db_tx clones transiently
-    // — those drop when their tasks finish.
-    drop(normal_tx);
+        hub_for_feeder,
+        feeder_starting_block,
+    )
+    .await;
+
+    // Race the orchestrator against `tasks.join_next()` so that ANY background
+    // task exiting first (signal handler, L1 listener, witness server, driver
+    // loop) immediately cancels the root token. Catch-up is tracked separately
+    // via `catchup_handle` because its successful completion is expected and
+    // must not trigger shutdown.
+    let mut exit_code = 0;
+    let mut orchestrator_fut = std::pin::pin!(orchestrator.run());
+    // Drop the outer `db_tx` so once the orchestrator exits and drops its
+    // internal clone, the DB writer actor observes the close and drains
+    // cleanly. Sign spawns hold their own `db_tx` clones transiently — those
+    // drop when their tasks finish.
     drop(db_tx);
 
     tokio::select! {

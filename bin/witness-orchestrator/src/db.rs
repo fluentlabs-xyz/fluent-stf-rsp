@@ -2,14 +2,14 @@
 //!
 //! Single source of truth for batch lifecycle state: every batch has one row
 //! in the `batches` table whose `status` field tracks the canonical L1
-//! contract progression (`committed → accepted → sent → preconfirmed →
+//! contract progression (`committed → accepted → dispatched → preconfirmed →
 //! finalized`). An orthogonal `enclave_signed` flag records the local
 //! milestone of `/sign-batch-root` succeeding.
 //!
 //! `block_responses` is the durability backstop for the in-memory hot cache
-//! held by `BatchAccumulator.responses` — async-batched writes amortize
-//! fsyncs; on crash we lose the trailing un-flushed window and recover by
-//! re-execution.
+//! held by `ResponseCache` — async-batched writes amortize fsyncs; on crash
+//! we lose the trailing un-flushed window and recover by replaying the
+//! missing blocks via `Db::missing_blocks_for_unsent_batches` at startup.
 //!
 //! `meta` carries the two non-derivable scalars: `l1_checkpoint` (listener
 //! resume point) and `start_batch_id` (BatchReverted recovery anchor).
@@ -27,9 +27,23 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::{interval, MissedTickBehavior},
 };
-use tracing::error;
+use tracing::{error, info, warn};
 
 use crate::types::{EthExecutionResponse, SubmitBatchResponse};
+
+// ============================================================================
+// RBF resume state — moved from accumulator.rs (part of the SQL surface)
+// ============================================================================
+
+/// State carried over from a prior process lifetime. Used by the dispatcher's
+/// resume path to skip the initial broadcast and enter the bump loop directly.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RbfResumeState {
+    pub(crate) nonce: u64,
+    pub(crate) tx_hash: B256,
+    pub(crate) max_fee_per_gas: u128,
+    pub(crate) max_priority_fee_per_gas: u128,
+}
 
 // ============================================================================
 // Status enum
@@ -39,7 +53,7 @@ use crate::types::{EthExecutionResponse, SubmitBatchResponse};
 pub(crate) enum BatchStatus {
     Committed = 0,
     Accepted = 1,
-    Sent = 2,
+    Dispatched = 2,
     Preconfirmed = 3,
     Finalized = 4,
 }
@@ -49,7 +63,7 @@ impl BatchStatus {
         match self {
             Self::Committed => "committed",
             Self::Accepted => "accepted",
-            Self::Sent => "sent",
+            Self::Dispatched => "dispatched",
             Self::Preconfirmed => "preconfirmed",
             Self::Finalized => "finalized",
         }
@@ -59,7 +73,7 @@ impl BatchStatus {
         match s {
             "committed" => Some(Self::Committed),
             "accepted" => Some(Self::Accepted),
-            "sent" => Some(Self::Sent),
+            "dispatched" => Some(Self::Dispatched),
             "preconfirmed" => Some(Self::Preconfirmed),
             "finalized" => Some(Self::Finalized),
             _ => None,
@@ -227,7 +241,7 @@ impl Db {
                 l1_block                 INTEGER,
                 committed_at             INTEGER NOT NULL,
                 last_status_change_at    INTEGER NOT NULL,
-                CHECK (status IN ('committed','accepted','sent','preconfirmed','finalized'))
+                CHECK (status IN ('committed','accepted','dispatched','preconfirmed','finalized'))
             );
             CREATE INDEX IF NOT EXISTS batches_status_idx ON batches(status);
 
@@ -239,6 +253,10 @@ impl Db {
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_submitted (
+                batch_index INTEGER PRIMARY KEY
             );
 
             CREATE TABLE IF NOT EXISTS challenges (
@@ -315,13 +333,13 @@ impl Db {
 
     // ── Derived scalars (computed from batches) ───────────────────────────────
 
-    /// `MAX(to_block)` across rows whose status is at least `Sent`.
+    /// `MAX(to_block)` across rows whose status is at least `Dispatched`.
     /// Drives the L2 driver checkpoint upper bound on startup.
     pub(crate) fn highest_dispatched_to_block(&self) -> Option<u64> {
         self.conn
             .query_row(
                 "SELECT MAX(to_block) FROM batches \
-                 WHERE status IN ('sent','preconfirmed','finalized')",
+                 WHERE status IN ('dispatched','preconfirmed','finalized')",
                 [],
                 |row| row.get::<_, Option<i64>>(0),
             )
@@ -330,48 +348,317 @@ impl Db {
             .map(|v| v as u64)
     }
 
-    /// First missing block in any unsent batch — drives startup checkpoint
-    /// adjustment. Returns `(batch_index, gap_block)` for the lowest-index
-    /// batch with any block in `from_block..=to_block` absent from
-    /// `block_responses`. `None` means every unsent batch is fully covered.
-    pub(crate) fn earliest_unsent_with_gap(&self) -> Option<(u64, u64)> {
+    /// `MAX(to_block)` across rows with status `finalized`.
+    pub(crate) fn highest_finalized_to_block(&self) -> Option<u64> {
+        self.conn
+            .query_row("SELECT MAX(to_block) FROM batches WHERE status = 'finalized'", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .ok()
+            .flatten()
+            .map(|v| v as u64)
+    }
+
+    /// `MAX(nonce) + 1` across all batches that have a recorded nonce — the
+    /// floor for the `NonceAllocator` bootstrap on startup.
+    pub(crate) fn stored_nonce_floor(&self) -> Option<u64> {
+        self.conn
+            .query_row("SELECT MAX(nonce) FROM batches WHERE nonce IS NOT NULL", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .ok()
+            .flatten()
+            .map(|v| (v as u64) + 1)
+    }
+
+    /// `tx_hash` of the row currently dispatched for `batch_index`, or `None`
+    /// if the row is absent / has no `tx_hash`. Used by the finalization worker
+    /// to detect stale ticker observations.
+    pub(crate) fn dispatched_tx_hash(&self, batch_index: u64) -> Option<B256> {
+        let blob: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT tx_hash FROM batches WHERE batch_index = ?1",
+                params![batch_index as i64],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten();
+        B256::try_from(blob?.as_slice()).ok()
+    }
+
+    /// Block numbers absent from `block_responses` for any batch whose status
+    /// is NOT IN ('dispatched','preconfirmed','finalized'). Returned in
+    /// ascending order; called once at startup by `startup_recovery_feeder`.
+    pub(crate) fn missing_blocks_for_unsent_batches(&self) -> Vec<u64> {
+        let sql = "WITH RECURSIVE blocks(batch_index, block_number, to_block) AS ( \
+                       SELECT batch_index, from_block, to_block FROM batches \
+                       WHERE status NOT IN ('dispatched','preconfirmed','finalized') \
+                     UNION ALL \
+                       SELECT batch_index, block_number+1, to_block FROM blocks \
+                       WHERE block_number+1 <= to_block \
+                   ) \
+                   SELECT block_number FROM blocks \
+                   WHERE NOT EXISTS ( \
+                       SELECT 1 FROM block_responses \
+                       WHERE block_responses.block_number = blocks.block_number \
+                   ) \
+                   ORDER BY block_number";
+        let mut stmt = match self.conn.prepare(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(err = %e, "missing_blocks_for_unsent_batches prepare failed");
+                return vec![];
+            }
+        };
+        stmt.query_map([], |row| row.get::<_, i64>(0))
+            .map(|iter| iter.filter_map(|r| r.ok()).map(|v| v as u64).collect())
+            .unwrap_or_default()
+    }
+
+    // ── Batch read predicates (post-Q0: workers consume these directly) ─────
+
+    /// Look up a single row by `batch_index`.
+    pub(crate) fn find_batch(&self, batch_index: u64) -> Option<BatchRow> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT batch_index, from_block, to_block FROM batches \
-                 WHERE status NOT IN ('sent','preconfirmed','finalized') \
-                 ORDER BY batch_index",
+                "SELECT batch_index, from_block, to_block, status, enclave_signed, \
+                        signature, tx_hash, nonce, max_fee_per_gas, max_priority_fee_per_gas, \
+                        l1_block, committed_at, last_status_change_at \
+                 FROM batches WHERE batch_index = ?1",
             )
             .ok()?;
-        let rows: Vec<(u64, u64, u64)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                ))
-            })
-            .ok()?
-            .filter_map(|r| r.ok())
-            .collect();
-        for (batch_index, from_block, to_block) in rows {
-            for b in from_block..=to_block {
-                let exists: bool = self
-                    .conn
-                    .query_row(
-                        "SELECT 1 FROM block_responses WHERE block_number = ?1",
-                        params![b as i64],
-                        |_| Ok(true),
-                    )
-                    .optional()
-                    .unwrap_or(None)
-                    .unwrap_or(false);
-                if !exists {
-                    return Some((batch_index, b));
-                }
-            }
+        stmt.query_row(params![batch_index as i64], row_to_batch_row).optional().ok().flatten()
+    }
+
+    /// Lowest-index batch ready for `/sign-batch-root`: status=accepted,
+    /// !enclave_signed, every block in `[from_block, to_block]` already has a
+    /// row in `block_responses`.
+    pub(crate) fn first_accepted_unsigned(&self) -> Option<u64> {
+        self.conn
+            .query_row(
+                "SELECT b.batch_index FROM batches b \
+                 WHERE b.status = 'accepted' AND b.enclave_signed = 0 \
+                   AND (b.to_block - b.from_block + 1) = ( \
+                         SELECT COUNT(*) FROM block_responses \
+                         WHERE block_number BETWEEN b.from_block AND b.to_block) \
+                 ORDER BY b.batch_index LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .map(|v| v as u64)
+    }
+
+    /// Lowest-index batch eligible for fresh dispatch — accepted +
+    /// enclave_signed, with the strict-sequential gate of the L1 contract:
+    /// the row is only dispatchable if either (a) the lowest-index batch
+    /// itself is accepted+enclave_signed, or (b) the lowest-index batch has
+    /// already moved past Dispatched (so we look for the next available).
+    pub(crate) fn first_dispatchable(&self) -> Option<u64> {
+        let first: Option<(u64, BatchStatus, bool)> = self
+            .conn
+            .query_row(
+                "SELECT batch_index, status, enclave_signed FROM batches \
+                 ORDER BY batch_index LIMIT 1",
+                [],
+                |row| {
+                    let idx: i64 = row.get(0)?;
+                    let status_str: String = row.get(1)?;
+                    let signed: i64 = row.get(2)?;
+                    Ok((
+                        idx as u64,
+                        BatchStatus::from_db(&status_str).unwrap_or(BatchStatus::Committed),
+                        signed != 0,
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let (first_idx, first_status, first_signed) = first?;
+
+        if first_status >= BatchStatus::Dispatched {
+            // Lowest-index batch is past Dispatched → look for the next dispatchable.
+            return self
+                .conn
+                .query_row(
+                    "SELECT batch_index FROM batches \
+                     WHERE status = 'accepted' AND enclave_signed = 1 \
+                     ORDER BY batch_index LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .map(|v| v as u64);
+        }
+        if first_status == BatchStatus::Accepted && first_signed {
+            return Some(first_idx);
         }
         None
+    }
+
+    /// Lowest-index dispatched batch whose RBF state is fully populated —
+    /// the dispatcher resumes its bump loop here on startup.
+    pub(crate) fn first_inflight_resume(&self) -> Option<(u64, Vec<u8>, RbfResumeState)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT batch_index, signature, nonce, tx_hash, \
+                        max_fee_per_gas, max_priority_fee_per_gas \
+                 FROM batches \
+                 WHERE status = 'dispatched' \
+                   AND nonce IS NOT NULL AND tx_hash IS NOT NULL \
+                   AND max_fee_per_gas IS NOT NULL AND max_priority_fee_per_gas IS NOT NULL \
+                   AND signature IS NOT NULL \
+                 ORDER BY batch_index LIMIT 1",
+            )
+            .ok()?;
+        stmt.query_row([], |row| {
+            let batch_index: i64 = row.get(0)?;
+            let sig_blob: Vec<u8> = row.get(1)?;
+            let nonce: i64 = row.get(2)?;
+            let tx_hash_blob: Vec<u8> = row.get(3)?;
+            let max_fee: String = row.get(4)?;
+            let max_priority: String = row.get(5)?;
+            let sig: SubmitBatchResponse = bincode::deserialize(&sig_blob).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("signature: {e}"))),
+                )
+            })?;
+            let tx_hash = B256::try_from(tx_hash_blob.as_slice()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("tx_hash: {e}"))),
+                )
+            })?;
+            let resume = RbfResumeState {
+                nonce: nonce as u64,
+                tx_hash,
+                max_fee_per_gas: max_fee.parse().unwrap_or(0),
+                max_priority_fee_per_gas: max_priority.parse().unwrap_or(0),
+            };
+            Ok((batch_index as u64, sig.signature, resume))
+        })
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Highest-index batch with status >= the given threshold, projected to
+    /// the (batch_index, from_block, to_block) tuple used by metric seeders.
+    pub(crate) fn find_highest_with_status_at_or_above(
+        &self,
+        threshold: BatchStatus,
+    ) -> Option<BatchRow> {
+        let allowed: &[&str] = match threshold {
+            BatchStatus::Committed => {
+                &["committed", "accepted", "dispatched", "preconfirmed", "finalized"]
+            }
+            BatchStatus::Accepted => &["accepted", "dispatched", "preconfirmed", "finalized"],
+            BatchStatus::Dispatched => &["dispatched", "preconfirmed", "finalized"],
+            BatchStatus::Preconfirmed => &["preconfirmed", "finalized"],
+            BatchStatus::Finalized => &["finalized"],
+        };
+        let placeholders = vec!["?"; allowed.len()].join(",");
+        let sql = format!(
+            "SELECT batch_index, from_block, to_block, status, enclave_signed, \
+                    signature, tx_hash, nonce, max_fee_per_gas, max_priority_fee_per_gas, \
+                    l1_block, committed_at, last_status_change_at \
+             FROM batches \
+             WHERE status IN ({placeholders}) \
+             ORDER BY batch_index DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql).ok()?;
+        let bind_refs: Vec<&dyn rusqlite::ToSql> =
+            allowed.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        stmt.query_row(&bind_refs[..], row_to_batch_row).optional().ok().flatten()
+    }
+
+    /// Highest-index batch with `enclave_signed=1`, for the startup metric seed.
+    pub(crate) fn find_highest_signed(&self) -> Option<BatchRow> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT batch_index, from_block, to_block, status, enclave_signed, \
+                        signature, tx_hash, nonce, max_fee_per_gas, max_priority_fee_per_gas, \
+                        l1_block, committed_at, last_status_change_at \
+                 FROM batches WHERE enclave_signed = 1 \
+                 ORDER BY batch_index DESC LIMIT 1",
+            )
+            .ok()?;
+        stmt.query_row([], row_to_batch_row).optional().ok().flatten()
+    }
+
+    /// Snapshot of all rows whose tx is mined on L1 (status=preconfirmed) —
+    /// for the finalization worker to poll Ethereum chain finality.
+    pub(crate) fn dispatched_for_finalization_check(&self) -> Vec<(u64, B256, u64)> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT batch_index, tx_hash, l1_block FROM batches \
+             WHERE status = 'preconfirmed' AND tx_hash IS NOT NULL AND l1_block IS NOT NULL",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(err = %e, "dispatched_for_finalization_check prepare failed");
+                return vec![];
+            }
+        };
+        stmt.query_map([], |row| {
+            let idx: i64 = row.get(0)?;
+            let tx_blob: Vec<u8> = row.get(1)?;
+            let l1_block: i64 = row.get(2)?;
+            let tx_hash = B256::try_from(tx_blob.as_slice()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("tx_hash: {e}"))),
+                )
+            })?;
+            Ok((idx as u64, tx_hash, l1_block as u64))
+        })
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    // ── pending_submitted (BatchSubmitted-before-BatchCommitted buffer) ─────
+
+    pub(crate) fn is_pending_submitted(&self, batch_index: u64) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM pending_submitted WHERE batch_index = ?1",
+                params![batch_index as i64],
+                |_| Ok(true),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn insert_pending_submitted(&self, batch_index: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO pending_submitted(batch_index) VALUES(?1)",
+            params![batch_index as i64],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_pending_submitted(&self, batch_index: u64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_submitted WHERE batch_index = ?1",
+            params![batch_index as i64],
+        )?;
+        Ok(())
     }
 
     // ── Batch table ──────────────────────────────────────────────────────────
@@ -459,24 +746,6 @@ impl Db {
         let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
         self.conn.execute(&sql, &bind_refs[..])?;
         Ok(())
-    }
-
-    pub(crate) fn load_all_batches(&self) -> Vec<BatchRow> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT batch_index, from_block, to_block, status, enclave_signed, \
-                    signature, tx_hash, nonce, max_fee_per_gas, max_priority_fee_per_gas, \
-                    l1_block, committed_at, last_status_change_at \
-             FROM batches ORDER BY batch_index",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(err = %e, "load_all_batches prepare failed");
-                return vec![];
-            }
-        };
-        stmt.query_map([], row_to_batch_row)
-            .map(|iter| iter.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
     }
 
     // ── block_responses ──────────────────────────────────────────────────────
@@ -706,6 +975,7 @@ impl Db {
                 "DELETE FROM batches; \
                  DELETE FROM block_responses; \
                  DELETE FROM challenges; \
+                 DELETE FROM pending_submitted; \
                  DELETE FROM meta;",
             )
             .and_then(|()| {
@@ -901,11 +1171,64 @@ pub(crate) enum AsyncOp {
 
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum SyncOp {
-    UpsertBatch(BatchRow),
-    PatchBatch { batch_index: u64, patch: BatchPatch },
-    WipeForRevert { start_batch_id: u64, l1_block: u64 },
+    PatchBatch {
+        batch_index: u64,
+        patch: BatchPatch,
+    },
+    /// `BatchCommitted` event. Inserts a new row at `Committed` (or `Accepted`
+    /// if a `BatchSubmitted` event was already buffered in `pending_submitted`).
+    /// Idempotent: no-op if a row for `batch_index` already exists.
+    ObserveCommitted {
+        batch_index: u64,
+        from_block: u64,
+        to_block: u64,
+    },
+    /// `BatchSubmitted` event. Patches `Committed → Accepted`. If the row is
+    /// not yet present, buffers `batch_index` in `pending_submitted` so the
+    /// next `ObserveCommitted` can promote directly.
+    ObserveSubmitted {
+        batch_index: u64,
+    },
+    /// `BatchPreconfirmed` event. Branching is by `enclave_signed`:
+    ///   - row absent → insert at `Preconfirmed` (very early external batch);
+    ///   - row already past `Preconfirmed` → idempotent no-op;
+    ///   - `enclave_signed=true` → "our batch": flip to `Preconfirmed`, preserve nonce/fees,
+    ///     overwrite `l1_block`, set `tx_hash` only if currently NULL;
+    ///   - `enclave_signed=false` → "external takeover": set status, tx_hash, l1_block, NULL
+    ///     nonce/fees.
+    ObservePreconfirmed {
+        batch_index: u64,
+        tx_hash: B256,
+        l1_block: u64,
+    },
+    /// L1 chain finality reached for our preconfirm tx.
+    ObserveFinalized {
+        batch_index: u64,
+    },
+    /// Reorg recovery: `Preconfirmed` → `Dispatched`, clear `l1_block`.
+    /// No-op for external rows (`nonce IS NULL`) or rows past `Preconfirmed`.
+    ObserveReorgToDispatched {
+        batch_index: u64,
+    },
+    /// `Dispatched` → `Accepted`, clear RBF state. No-op for external rows or
+    /// rows not at `Dispatched`.
+    RollbackToAccepted {
+        batch_index: u64,
+    },
+    /// Enclave key rotation: clear `enclave_signed` + `signature`. Status
+    /// unchanged.
+    InvalidateSignature {
+        batch_index: u64,
+    },
+    WipeForRevert {
+        start_batch_id: u64,
+        l1_block: u64,
+    },
     InsertChallenge(ChallengeRow),
-    PatchChallenge { challenge_id: i64, patch: ChallengePatch },
+    PatchChallenge {
+        challenge_id: i64,
+        patch: ChallengePatch,
+    },
 }
 
 const DB_BUFFER_FLUSH_SIZE: usize = 1000;
@@ -1015,14 +1338,195 @@ fn apply_async_op(tx: &rusqlite::Transaction<'_>, op: AsyncOp) {
 fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
     let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
     match op {
-        SyncOp::UpsertBatch(row) => {
-            if let Err(e) = guard.upsert_batch(&row) {
-                error!(err = %e, batch_index = row.batch_index, "upsert_batch failed");
-            }
-        }
         SyncOp::PatchBatch { batch_index, patch } => {
             if let Err(e) = guard.patch_batch(batch_index, &patch) {
                 error!(err = %e, batch_index, "patch_batch failed");
+            }
+        }
+        SyncOp::ObserveCommitted { batch_index, from_block, to_block } => {
+            if guard.find_batch(batch_index).is_some() {
+                return; // idempotent
+            }
+            let now = now_ts();
+            let blobs_in_l1 = guard.is_pending_submitted(batch_index);
+            let row = BatchRow {
+                batch_index,
+                from_block,
+                to_block,
+                status: if blobs_in_l1 { BatchStatus::Accepted } else { BatchStatus::Committed },
+                enclave_signed: false,
+                signature: None,
+                tx_hash: None,
+                nonce: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+                l1_block: None,
+                committed_at: now,
+                last_status_change_at: now,
+            };
+            if let Err(e) = guard.upsert_batch(&row) {
+                error!(err = %e, batch_index, "observe_committed upsert failed");
+                return;
+            }
+            if blobs_in_l1 {
+                let _ = guard.delete_pending_submitted(batch_index);
+            }
+            info!(
+                batch_index,
+                from_block,
+                to_block,
+                status = ?row.status,
+                "New batch registered"
+            );
+        }
+        SyncOp::ObserveSubmitted { batch_index } => match guard.find_batch(batch_index) {
+            Some(b) if b.status == BatchStatus::Committed => {
+                let patch =
+                    BatchPatch { status: Some(BatchStatus::Accepted), ..Default::default() };
+                if let Err(e) = guard.patch_batch(batch_index, &patch) {
+                    error!(err = %e, batch_index, "observe_submitted patch failed");
+                    return;
+                }
+                info!(batch_index, "Batch marked Accepted (blobs in L1)");
+            }
+            Some(_) => { /* already past Accepted; idempotent no-op */ }
+            None => {
+                if let Err(e) = guard.insert_pending_submitted(batch_index) {
+                    error!(err = %e, batch_index, "insert_pending_submitted failed");
+                    return;
+                }
+                warn!(batch_index, "BatchSubmitted arrived before BatchCommitted — buffered");
+            }
+        },
+        SyncOp::ObservePreconfirmed { batch_index, tx_hash, l1_block } => {
+            let row = guard.find_batch(batch_index);
+            let now = now_ts();
+            match row {
+                // (a) idempotent — already past Preconfirmed
+                Some(b) if b.status >= BatchStatus::Preconfirmed => {}
+                // (b) "our batch" — we signed it, regardless of where in the lifecycle the
+                //     listener catches up. Preserve any RBF state we may have written.
+                Some(b) if b.enclave_signed && b.signature.is_some() => {
+                    let patch = BatchPatch {
+                        status: Some(BatchStatus::Preconfirmed),
+                        l1_block: Some(Some(l1_block)),
+                        tx_hash: if b.tx_hash.is_none() { Some(Some(tx_hash)) } else { None },
+                        ..Default::default()
+                    };
+                    if let Err(e) = guard.patch_batch(batch_index, &patch) {
+                        error!(err = %e, batch_index, "observe_preconfirmed (our) patch failed");
+                        return;
+                    }
+                    info!(batch_index, %tx_hash, l1_block, "PRECONFIRMED via our broadcast");
+                }
+                // (c) external takeover — never seen in current production but kept for
+                //     edge case (future second validator).
+                Some(_) => {
+                    let patch = BatchPatch {
+                        status: Some(BatchStatus::Preconfirmed),
+                        tx_hash: Some(Some(tx_hash)),
+                        l1_block: Some(Some(l1_block)),
+                        nonce: Some(None),
+                        max_fee_per_gas: Some(None),
+                        max_priority_fee_per_gas: Some(None),
+                        ..Default::default()
+                    };
+                    if let Err(e) = guard.patch_batch(batch_index, &patch) {
+                        error!(err = %e, batch_index, "observe_preconfirmed (external) patch failed");
+                        return;
+                    }
+                    warn!(batch_index, %tx_hash, l1_block, "PRECONFIRMED via external takeover");
+                }
+                // (d) row absent — insert at Preconfirmed (very early external batch).
+                None => {
+                    let row = BatchRow {
+                        batch_index,
+                        from_block: 0,
+                        to_block: 0,
+                        status: BatchStatus::Preconfirmed,
+                        enclave_signed: false,
+                        signature: None,
+                        tx_hash: Some(tx_hash),
+                        nonce: None,
+                        max_fee_per_gas: None,
+                        max_priority_fee_per_gas: None,
+                        l1_block: Some(l1_block),
+                        committed_at: now,
+                        last_status_change_at: now,
+                    };
+                    if let Err(e) = guard.upsert_batch(&row) {
+                        error!(err = %e, batch_index, "observe_preconfirmed insert failed");
+                        return;
+                    }
+                    warn!(
+                        batch_index,
+                        %tx_hash,
+                        l1_block,
+                        "PRECONFIRMED via external takeover (no prior row)"
+                    );
+                }
+            }
+        }
+        SyncOp::ObserveFinalized { batch_index } => {
+            let patch = BatchPatch { status: Some(BatchStatus::Finalized), ..Default::default() };
+            if let Err(e) = guard.patch_batch(batch_index, &patch) {
+                error!(err = %e, batch_index, "observe_finalized patch failed");
+            }
+        }
+        SyncOp::ObserveReorgToDispatched { batch_index } => {
+            let row = match guard.find_batch(batch_index) {
+                Some(r) => r,
+                None => return,
+            };
+            if row.status != BatchStatus::Preconfirmed {
+                return;
+            }
+            if row.nonce.is_none() {
+                info!(batch_index, "Skip reorg rollback: external dispatch (nonce=None)");
+                return;
+            }
+            let patch = BatchPatch {
+                status: Some(BatchStatus::Dispatched),
+                l1_block: Some(None),
+                ..Default::default()
+            };
+            if let Err(e) = guard.patch_batch(batch_index, &patch) {
+                error!(err = %e, batch_index, "observe_reorg_to_dispatched patch failed");
+            }
+        }
+        SyncOp::RollbackToAccepted { batch_index } => {
+            let row = match guard.find_batch(batch_index) {
+                Some(r) => r,
+                None => return,
+            };
+            if row.nonce.is_none() {
+                info!(batch_index, "Skip rollback: external dispatch (nonce=None)");
+                return;
+            }
+            if row.status != BatchStatus::Dispatched {
+                return;
+            }
+            let patch = BatchPatch {
+                status: Some(BatchStatus::Accepted),
+                tx_hash: Some(None),
+                nonce: Some(None),
+                max_fee_per_gas: Some(None),
+                max_priority_fee_per_gas: Some(None),
+                l1_block: Some(None),
+                ..Default::default()
+            };
+            if let Err(e) = guard.patch_batch(batch_index, &patch) {
+                error!(err = %e, batch_index, "rollback_to_accepted patch failed");
+            }
+        }
+        SyncOp::InvalidateSignature { batch_index } => {
+            let patch = BatchPatch {
+                enclave_signed: Some(false),
+                signature: Some(None),
+                ..Default::default()
+            };
+            if let Err(e) = guard.patch_batch(batch_index, &patch) {
+                error!(err = %e, batch_index, "invalidate_signature patch failed");
             }
         }
         SyncOp::WipeForRevert { start_batch_id, l1_block } => {

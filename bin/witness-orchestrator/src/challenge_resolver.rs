@@ -53,52 +53,60 @@ pub(crate) async fn run(shared: Arc<OrchestratorShared>) {
     info!("challenge_resolver started");
     let mut tick = tokio::time::interval(WORKER_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the immediately-ready first tick so the loop body runs on cycle 0.
+    tick.tick().await;
     let mut backoff = DispatchBackoff::default();
 
     loop {
-        tokio::select! {
-            biased;
-            _ = shared.shutdown.cancelled() => break,
-            _ = tick.tick() => {}
+        if shared.shutdown.is_cancelled() {
+            break;
         }
 
-        let row = {
-            let guard = shared.db.lock().unwrap_or_else(|e| e.into_inner());
-            guard.find_active_challenge()
-        };
-        let Some(row) = row else { continue };
+        'work: {
+            let row = {
+                let guard = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+                guard.find_active_challenge()
+            };
+            let Some(row) = row else { break 'work };
 
-        // Deadline visibility: log + metric, but the operator decides what
-        // to do — we do not auto-abort (per the no-`aborted` decision).
-        if row.deadline != u64::MAX {
-            if let Ok(current_l1_block) = shared.config.l1_provider.get_block_number().await {
-                if current_l1_block > row.deadline {
-                    metrics::counter!(
-                        "orchestrator_challenge_deadline_expired_total",
-                        "kind" => row.kind.as_str(),
-                    )
-                    .increment(1);
-                    warn!(
-                        challenge_id = row.challenge_id,
-                        deadline = row.deadline,
-                        current_l1_block,
-                        "challenge deadline expired"
-                    );
+            // Deadline visibility: log + metric, but the operator decides what
+            // to do — we do not auto-abort (per the no-`aborted` decision).
+            if row.deadline != u64::MAX {
+                if let Ok(current_l1_block) = shared.config.l1_provider.get_block_number().await {
+                    if current_l1_block > row.deadline {
+                        metrics::counter!(
+                            "orchestrator_challenge_deadline_expired_total",
+                            "kind" => row.kind.as_str(),
+                        )
+                        .increment(1);
+                        warn!(
+                            challenge_id = row.challenge_id,
+                            deadline = row.deadline,
+                            current_l1_block,
+                            "challenge deadline expired"
+                        );
+                    }
+                }
+            }
+
+            match row.status {
+                ChallengeStatus::Received => handle_received(&shared, &row, &mut backoff).await,
+                ChallengeStatus::Sp1Proving => handle_sp1_proving(&shared, &row).await,
+                ChallengeStatus::Sp1Proved => handle_sp1_proved(&shared, &row, &mut backoff).await,
+                ChallengeStatus::Dispatched => {
+                    handle_dispatched_resume(&shared, &row, &mut backoff).await;
+                }
+                ChallengeStatus::Resolved => {
+                    // Filtered by `find_active_challenge`; defensive log.
+                    warn!(challenge_id = row.challenge_id, "active gate returned resolved row");
                 }
             }
         }
 
-        match row.status {
-            ChallengeStatus::Received => handle_received(&shared, &row, &mut backoff).await,
-            ChallengeStatus::Sp1Proving => handle_sp1_proving(&shared, &row).await,
-            ChallengeStatus::Sp1Proved => handle_sp1_proved(&shared, &row, &mut backoff).await,
-            ChallengeStatus::Dispatched => {
-                handle_dispatched_resume(&shared, &row, &mut backoff).await;
-            }
-            ChallengeStatus::Resolved => {
-                // Filtered by `find_active_challenge`; defensive log.
-                warn!(challenge_id = row.challenge_id, "active gate returned resolved row");
-            }
+        tokio::select! {
+            biased;
+            _ = shared.shutdown.cancelled() => break,
+            _ = tick.tick() => {}
         }
     }
     info!("challenge_resolver exiting");
@@ -270,7 +278,7 @@ async fn handle_dispatched_resume(
         row.batch_index,
         &template,
         resume.nonce,
-        Some(crate::accumulator::RbfResumeState {
+        Some(crate::db::RbfResumeState {
             nonce: resume.nonce,
             tx_hash: resume.tx_hash,
             max_fee_per_gas: resume.max_fee_per_gas,

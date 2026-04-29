@@ -23,26 +23,25 @@ use tracing::{error, info, warn};
 use async_trait::async_trait;
 
 use crate::{
-    accumulator::{self, RbfResumeState},
-    db::BatchStatus,
+    db::{db_send_sync, BatchPatch, BatchStatus, RbfResumeState, SyncOp},
     orchestrator::{
         classify_revert, DispatchBackoff, OrchestratorShared, RevertKind, STUCK_AT_CAP_TIMEOUT,
     },
 };
 
 /// State-mutation hooks for the RBF lifecycle. Implemented by the
-/// preconfirm dispatcher (mutates the `batches` table via accumulator
-/// helpers) and the challenge resolver (no persistent state — pure no-ops +
-/// log). Methods are `async fn` because mutations route through the
+/// preconfirm dispatcher (writes the `batches` table via `db_send_sync`)
+/// and the challenge resolver (writes the `challenges` table the same way).
+/// Methods are `async fn` because mutations route through the
 /// sync-write actor (`db_send_sync`) and await durability.
 #[async_trait]
 pub(crate) trait RbfObserver: Send + Sync {
-    /// First successful broadcast. Records `status=Sent` + RBF state.
+    /// First successful broadcast. Records `status=Dispatched` + RBF state.
     async fn on_first_broadcast(&self, hash: B256, fee: u128, tip: u128);
-    /// RBF bump rebroadcast. Overwrites tx_hash + fees; status stays Sent.
+    /// RBF bump rebroadcast. Overwrites tx_hash + fees; status stays Dispatched.
     async fn on_rebroadcast(&self, hash: B256, fee: u128, tip: u128);
     /// Receipt observed with status=1. Records `l1_block`; the L1 listener
-    /// owns the `Sent → Preconfirmed` transition.
+    /// owns the `Dispatched → Preconfirmed` transition.
     async fn on_submitted(&self, hash: B256, l1_block: u64);
     /// Receipt observed with status=0. Rolls back to `Accepted`.
     async fn on_reverted(&self, hash: B256, kind: RevertKind);
@@ -55,8 +54,8 @@ pub(crate) trait RbfObserver: Send + Sync {
     async fn should_abort(&self) -> bool;
 }
 
-/// Preconfirm-path observer: routes state mutations through
-/// `BatchAccumulator` (dispatched-row bookkeeping, RBF-bump record).
+/// Preconfirm-path observer: routes state mutations directly to SQLite via
+/// `db_send_sync`. No in-memory mirror.
 pub(crate) struct PreconfirmObserver<'a> {
     shared: &'a OrchestratorShared,
     batch_index: u64,
@@ -72,38 +71,48 @@ impl<'a> PreconfirmObserver<'a> {
 #[async_trait]
 impl RbfObserver for PreconfirmObserver<'_> {
     async fn on_first_broadcast(&self, hash: B256, fee: u128, tip: u128) {
-        info!(
-            batch_index = self.batch_index,
-            nonce = self.nonce,
-            %hash,
-            max_fee_per_gas = fee,
-            max_priority_fee_per_gas = tip,
-            "preconfirmBatch tx broadcast (initial)"
-        );
-        if let Err(e) = accumulator::record_broadcast(
-            &self.shared.accumulator,
-            self.batch_index,
-            hash,
-            self.nonce,
-            fee,
-            tip,
+        let patch = BatchPatch {
+            status: Some(BatchStatus::Dispatched),
+            tx_hash: Some(Some(hash)),
+            nonce: Some(Some(self.nonce)),
+            max_fee_per_gas: Some(Some(fee)),
+            max_priority_fee_per_gas: Some(Some(tip)),
+            ..Default::default()
+        };
+        if let Err(e) = db_send_sync(
+            &self.shared.db_tx,
+            SyncOp::PatchBatch { batch_index: self.batch_index, patch },
         )
         .await
         {
             error!(batch_index = self.batch_index, err = %e, "record_broadcast failed");
             return;
         }
-        let acc = self.shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(batch) = acc.get(self.batch_index) {
-            crate::metrics::set_last_batch_dispatched(
-                self.batch_index,
-                batch.from_block,
-                batch.to_block,
-            );
-        }
+        info!(
+            batch_index = self.batch_index,
+            nonce = self.nonce,
+            %hash,
+            max_fee_per_gas = fee,
+            max_priority_fee_per_gas = tip,
+            "preconfirmBatch DISPATCHED"
+        );
     }
 
     async fn on_rebroadcast(&self, hash: B256, fee: u128, tip: u128) {
+        let patch = BatchPatch {
+            tx_hash: Some(Some(hash)),
+            max_fee_per_gas: Some(Some(fee)),
+            max_priority_fee_per_gas: Some(Some(tip)),
+            ..Default::default()
+        };
+        if let Err(e) = db_send_sync(
+            &self.shared.db_tx,
+            SyncOp::PatchBatch { batch_index: self.batch_index, patch },
+        )
+        .await
+        {
+            error!(batch_index = self.batch_index, err = %e, "record_rbf_bump failed");
+        }
         info!(
             batch_index = self.batch_index,
             %hash,
@@ -111,21 +120,15 @@ impl RbfObserver for PreconfirmObserver<'_> {
             max_priority_fee_per_gas = tip,
             "RBF bump rebroadcast"
         );
-        if let Err(e) =
-            accumulator::record_rbf_bump(&self.shared.accumulator, self.batch_index, hash, fee, tip)
-                .await
-        {
-            error!(batch_index = self.batch_index, err = %e, "record_rbf_bump failed");
-        }
     }
 
     async fn on_submitted(&self, hash: B256, l1_block: u64) {
-        // Record the L1 block of the receipt; status stays `Sent`. The L1
-        // listener owns the `Sent → Preconfirmed` transition (Q3/Q4).
-        if let Err(e) = accumulator::record_receipt_observed(
-            &self.shared.accumulator,
-            self.batch_index,
-            l1_block,
+        // Record the L1 block of the receipt; status stays `Dispatched`. The L1
+        // listener owns the `Dispatched → Preconfirmed` transition (Q3/Q4).
+        let patch = BatchPatch { l1_block: Some(Some(l1_block)), ..Default::default() };
+        if let Err(e) = db_send_sync(
+            &self.shared.db_tx,
+            SyncOp::PatchBatch { batch_index: self.batch_index, patch },
         )
         .await
         {
@@ -146,16 +149,22 @@ impl RbfObserver for PreconfirmObserver<'_> {
             ?kind,
             "preconfirmBatch REVERTED on L1 — rolling back to Accepted"
         );
-        if let Err(e) =
-            accumulator::rollback_to_accepted(&self.shared.accumulator, self.batch_index).await
+        if let Err(e) = db_send_sync(
+            &self.shared.db_tx,
+            SyncOp::RollbackToAccepted { batch_index: self.batch_index },
+        )
+        .await
         {
             error!(batch_index = self.batch_index, err = %e, "rollback_to_accepted failed");
         }
     }
 
     async fn on_pre_receipt_failure(&self, _reason: &'static str) {
-        if let Err(e) =
-            accumulator::rollback_to_accepted(&self.shared.accumulator, self.batch_index).await
+        if let Err(e) = db_send_sync(
+            &self.shared.db_tx,
+            SyncOp::RollbackToAccepted { batch_index: self.batch_index },
+        )
+        .await
         {
             error!(batch_index = self.batch_index, err = %e, "rollback_to_accepted failed");
         }
@@ -164,23 +173,23 @@ impl RbfObserver for PreconfirmObserver<'_> {
     async fn should_abort(&self) -> bool {
         // External-takeover guard: a `BatchPreconfirmed` L1 event flips the
         // row's status to `Preconfirmed` (and clears nonce for external).
-        // If our row is no longer at `Sent` someone else won the slot — exit
-        // the bump loop without further mutations.
-        let acc = self.shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-        match acc.get(self.batch_index).map(|b| (b.status, b.nonce.is_some())) {
-            Some((BatchStatus::Sent, true)) => false,
-            Some((BatchStatus::Sent, false)) => {
+        // If our row is no longer at `Dispatched` someone else won the slot —
+        // exit the bump loop without further mutations.
+        let g = self.shared.db.lock().unwrap_or_else(|e| e.into_inner());
+        match g.find_batch(self.batch_index).map(|b| (b.status, b.nonce.is_some())) {
+            Some((BatchStatus::Dispatched, true)) => false,
+            Some((BatchStatus::Dispatched, false)) => {
                 info!(
                     batch_index = self.batch_index,
                     "RBF: external takeover detected (nonce=None) — exiting bump loop"
                 );
                 true
             }
-            Some((status, _)) if status > BatchStatus::Sent => {
+            Some((status, _)) if status > BatchStatus::Dispatched => {
                 info!(
                     batch_index = self.batch_index,
                     ?status,
-                    "RBF: status moved past Sent — exiting bump loop"
+                    "RBF: status moved past Dispatched — exiting bump loop"
                 );
                 true
             }
@@ -395,11 +404,9 @@ async fn handle_already_preconfirmed(
         l1_block = info.l1_block,
         "pre-flight: batch already preconfirmed on L1 — recording preconfirmation"
     );
-    if let Err(e) = accumulator::observe_preconfirmed(
-        &shared.accumulator,
-        batch_index,
-        info.tx_hash,
-        info.l1_block,
+    if let Err(e) = db_send_sync(
+        &shared.db_tx,
+        SyncOp::ObservePreconfirmed { batch_index, tx_hash: info.tx_hash, l1_block: info.l1_block },
     )
     .await
     {
@@ -407,16 +414,8 @@ async fn handle_already_preconfirmed(
         backoff.apply("observe_preconfirmed failed");
         return;
     }
-    {
-        let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(batch) = acc.get(batch_index) {
-            crate::metrics::set_last_batch_dispatched(
-                batch_index,
-                batch.from_block,
-                batch.to_block,
-            );
-        }
-    }
+    // Metric `last_batch_preconfirmed` is set from the listener's
+    // BatchPreconfirmed handler; no metric write here.
     backoff.reset();
 }
 
@@ -895,7 +894,7 @@ async fn handle_failed_then_undispatch_preflight(
     backoff: &mut DispatchBackoff,
     reason: &'static str,
 ) {
-    if let Err(e) = accumulator::rollback_to_accepted(&shared.accumulator, batch_index).await {
+    if let Err(e) = db_send_sync(&shared.db_tx, SyncOp::RollbackToAccepted { batch_index }).await {
         warn!(batch_index, err = %e, "preflight rollback failed");
     }
     backoff.apply(reason);

@@ -24,11 +24,11 @@ pub(crate) const LAST_BLOCK_SIGNED: &str = "orchestrator_last_block_signed";
 pub(crate) const LAST_BATCH_SIGNED: &str = "orchestrator_last_batch_signed";
 pub(crate) const LAST_BATCH_SIGNED_FROM_BLOCK: &str = "orchestrator_last_batch_signed_from_block";
 pub(crate) const LAST_BATCH_SIGNED_TO_BLOCK: &str = "orchestrator_last_batch_signed_to_block";
-pub(crate) const LAST_BATCH_DISPATCHED: &str = "orchestrator_last_batch_dispatched";
-pub(crate) const LAST_BATCH_DISPATCHED_FROM_BLOCK: &str =
-    "orchestrator_last_batch_dispatched_from_block";
-pub(crate) const LAST_BATCH_DISPATCHED_TO_BLOCK: &str =
-    "orchestrator_last_batch_dispatched_to_block";
+pub(crate) const LAST_BATCH_PRECONFIRMED: &str = "orchestrator_last_batch_preconfirmed";
+pub(crate) const LAST_BATCH_PRECONFIRMED_FROM_BLOCK: &str =
+    "orchestrator_last_batch_preconfirmed_from_block";
+pub(crate) const LAST_BATCH_PRECONFIRMED_TO_BLOCK: &str =
+    "orchestrator_last_batch_preconfirmed_to_block";
 
 // Duration histograms
 pub(crate) const SIGN_BLOCK_EXECUTION_DURATION: &str =
@@ -128,15 +128,15 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
         "to_block of the most recently signed batch"
     );
     metrics::describe_gauge!(
-        LAST_BATCH_DISPATCHED,
-        "Index of the most recently L1-included preconfirmBatch (status=1)"
+        LAST_BATCH_PRECONFIRMED,
+        "Index of the most recently L1-included preconfirmBatch observed via BatchPreconfirmed event"
     );
     metrics::describe_gauge!(
-        LAST_BATCH_DISPATCHED_FROM_BLOCK,
+        LAST_BATCH_PRECONFIRMED_FROM_BLOCK,
         "from_block of the most recently L1-included batch"
     );
     metrics::describe_gauge!(
-        LAST_BATCH_DISPATCHED_TO_BLOCK,
+        LAST_BATCH_PRECONFIRMED_TO_BLOCK,
         "to_block of the most recently L1-included batch"
     );
 
@@ -273,20 +273,20 @@ pub(crate) fn observe_dispatch_cost(receipt: &TransactionReceipt) {
     metrics::histogram!(L1_DISPATCH_COST_ETH).record(eth);
 }
 
-/// Set all three `last_batch_dispatched*` gauges in one call.
-pub(crate) fn set_last_batch_dispatched(batch_index: u64, from_block: u64, to_block: u64) {
-    metrics::gauge!(LAST_BATCH_DISPATCHED).set(batch_index as f64);
-    metrics::gauge!(LAST_BATCH_DISPATCHED_FROM_BLOCK).set(from_block as f64);
-    metrics::gauge!(LAST_BATCH_DISPATCHED_TO_BLOCK).set(to_block as f64);
+/// Set all three `last_batch_preconfirmed*` gauges in one call.
+pub(crate) fn set_last_batch_preconfirmed(batch_index: u64, from_block: u64, to_block: u64) {
+    metrics::gauge!(LAST_BATCH_PRECONFIRMED).set(batch_index as f64);
+    metrics::gauge!(LAST_BATCH_PRECONFIRMED_FROM_BLOCK).set(from_block as f64);
+    metrics::gauge!(LAST_BATCH_PRECONFIRMED_TO_BLOCK).set(to_block as f64);
 }
 
 /// Seed progress gauges from rehydrated state. Prometheus skips rendering a
 /// metric that has never been emitted, so low-cadence gauges
-/// (`last_batch_dispatched*`, `last_batch_signed*`) would stay absent until
-/// the next real event — potentially hours on a stalled pipeline.
+/// (`last_batch_preconfirmed*`, `last_batch_signed*`) would stay absent
+/// until the next real event — potentially hours on a stalled pipeline.
 pub(crate) fn seed_gauges_on_startup(
     checkpoint: u64,
-    dispatched: Option<(u64, u64, u64)>,
+    preconfirmed: Option<(u64, u64, u64)>,
     signed: Option<(u64, u64, u64)>,
 ) {
     if checkpoint > 0 {
@@ -299,8 +299,8 @@ pub(crate) fn seed_gauges_on_startup(
         metrics::gauge!(LAST_BATCH_SIGNED_TO_BLOCK).set(to as f64);
         metrics::gauge!(LAST_BLOCK_SIGNED).set(to as f64);
     }
-    if let Some((idx, from, to)) = dispatched {
-        set_last_batch_dispatched(idx, from, to);
+    if let Some((idx, from, to)) = preconfirmed {
+        set_last_batch_preconfirmed(idx, from, to);
     }
 }
 

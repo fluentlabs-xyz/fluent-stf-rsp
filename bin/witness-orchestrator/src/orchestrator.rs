@@ -23,7 +23,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -35,8 +35,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
-    accumulator::{self, BatchAccumulator, RbfResumeState},
-    db::{db_send_sync, AsyncOp, BatchStatus, Db, DbCommand, SyncOp},
+    accumulator::ResponseCache,
+    db::{db_send_sync, AsyncOp, BatchPatch, BatchStatus, Db, DbCommand, RbfResumeState, SyncOp},
     driver::Driver,
     l1_listener::L1Event,
     types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse},
@@ -52,13 +52,6 @@ use alloy_provider::{
     },
     Identity, Provider, RootProvider,
 };
-
-/// Shared set of block numbers whose execution response is already present in
-/// the accumulator. Read by the feeder (to skip blocks with a response),
-/// written on every response insert / purge / finalization. Kept as a narrow
-/// projection of `BatchAccumulator.responses` so the feeder does not need to
-/// lock the full accumulator.
-pub(crate) type KnownResponses = Arc<RwLock<HashSet<u64>>>;
 
 /// Concrete type of the L1 write provider built in `main`. Pinned to the
 /// current alloy filler stack; a future alloy upgrade that changes the filler
@@ -84,7 +77,7 @@ pub(crate) type L1WriteProvider = FillProvider<
 pub(crate) const STUCK_AT_CAP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Number of persistent execution workers sending blocks to the Nitro proxy.
-pub(crate) const EXECUTION_WORKERS: usize = 8;
+const EXECUTION_WORKERS: usize = 8;
 
 /// Bounded wait for workers to finish their in-flight HTTP calls on
 /// shutdown. Longer than a typical request, shorter than a systemd
@@ -135,34 +128,31 @@ pub(crate) struct OrchestratorConfig {
     pub rbf_max_fee_per_gas_wei: u128,
 }
 
-/// `accumulator` uses `std::sync::Mutex` deliberately: holding the guard
-/// across `.await` is a compile error, which forces every site to drop the
-/// lock before any async work and prevents deadlocks at runtime.
+/// All batch state lives in SQLite — `db` is the read path, `db_tx` is the
+/// write path (every mutation goes through `run_db_writer`). Only the per-
+/// block response hot cache (`ResponseCache`) is kept in-memory, behind the
+/// same `std::sync::Mutex` discipline that keeps guards out of `.await`.
 pub(crate) struct OrchestratorShared {
     pub(crate) config: OrchestratorConfig,
-    /// Direct DB read access for the challenge active worker (status
-    /// queries every tick) and for L1-event handlers that need to look up
-    /// existing challenge rows. Writes still flow through `db_tx`.
     pub(crate) db: Arc<std::sync::Mutex<Db>>,
     pub(crate) db_tx: mpsc::UnboundedSender<DbCommand>,
-    pub(crate) accumulator: Arc<std::sync::Mutex<BatchAccumulator>>,
-    pub(crate) known_responses: KnownResponses,
+    pub(crate) cache: Arc<std::sync::Mutex<ResponseCache>>,
     pub(crate) nonce_allocator: Arc<NonceAllocator>,
     pub(crate) orchestrator_tip: Arc<AtomicU64>,
     /// Set by the signer on `InvalidSignatures` (key rotation detected),
     /// cleared by the spawned key-check task once the new key is on L1.
     /// The dispatcher skips broadcasting while this is `Some(_)`.
     pub(crate) pending_key_check: Arc<std::sync::Mutex<Option<Address>>>,
-    pub(crate) high_tx: AsyncSender<ExecutionTask>,
+    high_tx: AsyncSender<ExecutionTask>,
     pub(crate) driver: Arc<Driver>,
     pub(crate) shutdown: CancellationToken,
 }
 
 /// Task for the execution worker pool. Produced by the feeder (from the
 /// driver) and by the re-execution path (enclave key rotation recovery).
-pub(crate) struct ExecutionTask {
-    pub(crate) block_number: u64,
-    pub(crate) payload: Vec<u8>,
+struct ExecutionTask {
+    block_number: u64,
+    payload: Vec<u8>,
 }
 
 /// Response from a `/sign-block-execution` request.
@@ -223,7 +213,7 @@ enum ReceiptCheck {
     },
     /// Receipt absent — implies the tx is no longer in the canonical
     /// chain (reorg) or the RPC is briefly inconsistent. Caller drives
-    /// recovery by rolling status back to `Sent` so the dispatcher
+    /// recovery by rolling status back to `Dispatched` so the dispatcher
     /// resumes RBF.
     Missing,
     CheckFailed,
@@ -368,16 +358,17 @@ async fn execution_worker(
 ///
 /// **Invariant.** This is the ONLY producer for `normal_tx`; the key-rotation
 /// replay path writes directly to the high-priority channel owned inside
-/// `run`. Back-pressure propagates naturally: when workers saturate,
-/// `normal_tx.send().await` blocks the feeder — the driver's background
-/// loop continues filling the hub up to the orchestrator_tip lookahead cap.
+/// `Orchestrator::run`. Back-pressure propagates naturally: when workers
+/// saturate, `normal_tx.send().await` blocks the feeder — the driver's
+/// background loop continues filling the hub up to the orchestrator_tip
+/// lookahead cap.
 ///
-/// Spawned by `main.rs` into the top-level `JoinSet`; feeder exit (clean or
-/// error) is observed by the main-loop race and triggers clean process exit.
-pub(crate) async fn feeder_loop(
+/// Spawned inside `Orchestrator::run`; feeder exit cancels the orchestrator's
+/// internal task race, which propagates back up to `main.rs`.
+async fn feeder_loop(
     hub: Arc<crate::hub::WitnessHub>,
     normal_tx: AsyncSender<ExecutionTask>,
-    known_responses: KnownResponses,
+    cache: Arc<Mutex<ResponseCache>>,
     starting_block: u64,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
@@ -389,11 +380,11 @@ pub(crate) async fn feeder_loop(
             break;
         }
 
-        // Dedup: if the main loop already has a response for this block
-        // (startup checkpoint rollback path), skip the proxy round-trip and
-        // advance. `on_block_result` enforces the gate if a dup slips through;
-        // this is an efficiency layer.
-        if known_responses.read().unwrap_or_else(|e| e.into_inner()).contains(&next_block) {
+        // Dedup: if the cache already has a response for this block (loaded
+        // from `block_responses` at startup, or written by a prior tick),
+        // skip the proxy round-trip and advance. `on_block_result` enforces
+        // the gate if a dup slips through; this is an efficiency layer.
+        if cache.lock().unwrap_or_else(|e| e.into_inner()).contains(next_block) {
             next_block += 1;
             continue;
         }
@@ -421,210 +412,269 @@ pub(crate) async fn feeder_loop(
 }
 
 // ============================================================================
-// Main orchestrator loop
+// Orchestrator entry point — main.rs sees only `Orchestrator::{new, run}`
 // ============================================================================
 
-/// Run the orchestrator loop until `shutdown` fires.
-///
-/// Creates the persistent execution worker pool once. The feeder task that
-/// pulls witnesses from the embedded driver and forwards them into `normal_tx`
-/// is owned by `main.rs` and supervised via the top-level `JoinSet`, so a
-/// feeder crash triggers clean process exit alongside the orchestrator.
-///
-/// `known_responses` is shared with the feeder and is seeded here from the
-/// persistent accumulator before entering the main select loop.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run(
-    config: OrchestratorConfig,
-    db: Arc<Mutex<Db>>,
-    db_tx: mpsc::UnboundedSender<DbCommand>,
-    driver: Arc<Driver>,
-    orchestrator_tip: Arc<AtomicU64>,
-    l1_events: mpsc::Receiver<L1Event>,
-    shutdown: CancellationToken,
+/// Owns every internal piece of state assembled by `new`. `run` consumes the
+/// struct, spawns the worker pool, the feeder, and the per-role workers, then
+/// blocks until shutdown or any worker exits.
+pub(crate) struct Orchestrator {
+    shared: Arc<OrchestratorShared>,
+    hub: Arc<crate::hub::WitnessHub>,
+    feeder_starting_block: u64,
+    initial_checkpoint: u64,
+    high_rx: AsyncReceiver<ExecutionTask>,
+    normal_tx: AsyncSender<ExecutionTask>,
     normal_rx: AsyncReceiver<ExecutionTask>,
-    known_responses: KnownResponses,
-) {
-    let accumulator = {
-        let db = Arc::clone(&db);
-        let db_tx = db_tx.clone();
-        tokio::task::spawn_blocking(move || BatchAccumulator::with_db(db, db_tx))
+    result_tx: mpsc::Sender<BlockResult>,
+    result_rx: mpsc::Receiver<BlockResult>,
+    l1_events: mpsc::Receiver<L1Event>,
+}
+
+impl Orchestrator {
+    /// Build all internal state: `ResponseCache` (loaded from SQLite),
+    /// `NonceAllocator` (bootstrapped from L1), execution-pool channels,
+    /// metric seeds, and the shared context wired into every worker.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new(
+        config: OrchestratorConfig,
+        db: Arc<Mutex<Db>>,
+        db_tx: mpsc::UnboundedSender<DbCommand>,
+        driver: Arc<Driver>,
+        orchestrator_tip: Arc<AtomicU64>,
+        l1_events: mpsc::Receiver<L1Event>,
+        shutdown: CancellationToken,
+        hub: Arc<crate::hub::WitnessHub>,
+        feeder_starting_block: u64,
+    ) -> Self {
+        // Seed startup gauges from SQLite directly (no in-memory mirror).
+        {
+            let g = db.lock().unwrap_or_else(|e| e.into_inner());
+            let checkpoint = g.highest_dispatched_to_block().unwrap_or(0);
+            let dispatched_max: Option<(u64, u64, u64)> = g
+                .find_highest_with_status_at_or_above(BatchStatus::Dispatched)
+                .map(|b| (b.batch_index, b.from_block, b.to_block));
+            let signed_max: Option<(u64, u64, u64)> =
+                g.find_highest_signed().map(|b| (b.batch_index, b.from_block, b.to_block));
+            crate::metrics::seed_gauges_on_startup(checkpoint, dispatched_max, signed_max);
+        }
+
+        let initial_last_batch_end: Option<u64> = {
+            let g = db.lock().unwrap_or_else(|e| e.into_inner());
+            g.highest_finalized_to_block()
+        };
+
+        // The single in-memory cache for `block_responses`; loaded from SQLite
+        // on startup, written-through async, used by the feeder for dedup and
+        // by the signer for batch-root assembly.
+        let cache: Arc<Mutex<ResponseCache>> =
+            Arc::new(Mutex::new(ResponseCache::with_db(Arc::clone(&db), db_tx.clone())));
+
+        // Capacity tied to `EXECUTION_WORKERS`: each queued `ExecutionTask`
+        // can hold a 30-80 MB payload, so larger buffers risk OOM.
+        let (high_tx, high_rx) = async_channel::bounded::<ExecutionTask>(EXECUTION_WORKERS);
+        let (normal_tx, normal_rx) = async_channel::bounded::<ExecutionTask>(EXECUTION_WORKERS * 2);
+        let (result_tx, result_rx) = mpsc::channel::<BlockResult>(EXECUTION_WORKERS * 2);
+
+        let initial_checkpoint = orchestrator_tip.load(Ordering::Relaxed);
+
+        let stored_nonce_floor: Option<u64> = {
+            let g = db.lock().unwrap_or_else(|e| e.into_inner());
+            g.stored_nonce_floor()
+        };
+        let nonce_allocator = Arc::new(
+            NonceAllocator::bootstrap(
+                &config.l1_provider,
+                config.l1_signer_address,
+                stored_nonce_floor,
+            )
             .await
-            .expect("startup accumulator load panicked")
-    };
+            .expect("NonceAllocator bootstrap failed — L1 RPC unreachable at startup"),
+        );
 
-    // Single-writer window — runs before any background task that could emit.
-    {
-        let checkpoint = accumulator.highest_dispatched_to_block().unwrap_or(0);
-        let dispatched_max: Option<(u64, u64, u64)> = accumulator
-            .batches
-            .values()
-            .rev()
-            .find(|b| b.status >= BatchStatus::Sent)
-            .map(|b| (b.batch_index, b.from_block, b.to_block));
-        let signed_max: Option<(u64, u64, u64)> = accumulator
-            .batches
-            .values()
-            .rev()
-            .find(|b| b.enclave_signed)
-            .map(|b| (b.batch_index, b.from_block, b.to_block));
-        crate::metrics::seed_gauges_on_startup(checkpoint, dispatched_max, signed_max);
-    }
-
-    let mut initial_last_batch_end: Option<u64> = accumulator.highest_finalized_to_block();
-
-    // Sweep preconfirmed rows from the prior process before spawning workers,
-    // so finalization gets a chance to drive any already-finalized rows to
-    // terminal status, and the dispatcher does not try to resume one whose
-    // tx is already mined.
-    run_startup_sweep(
-        &accumulator,
-        &db_tx,
-        &mut initial_last_batch_end,
-        &orchestrator_tip,
-        &config.l1_provider,
-    )
-    .await;
-
-    // Capacity tied to `EXECUTION_WORKERS`: each queued `ExecutionTask`
-    // can hold a 30-80 MB payload, so larger buffers risk OOM.
-    let (high_tx, high_rx) = async_channel::bounded::<ExecutionTask>(EXECUTION_WORKERS);
-    let (result_tx, result_rx) = mpsc::channel::<BlockResult>(EXECUTION_WORKERS * 2);
-
-    let mut workers: JoinSet<()> = JoinSet::new();
-    for i in 0..EXECUTION_WORKERS {
-        workers.spawn(execution_worker(
-            i,
-            high_rx.clone(),
-            normal_rx.clone(),
-            result_tx.clone(),
-            config.http_client.clone(),
-            config.proxy_url.clone(),
-            config.api_key.clone(),
-            shutdown.clone(),
-        ));
-    }
-
-    let initial_checkpoint = accumulator.highest_dispatched_to_block().unwrap_or(0);
-    let from_block = initial_checkpoint + 1;
-
-    let stored_nonce_floor: Option<u64> = accumulator.stored_nonce_floor();
-    let nonce_allocator = Arc::new(
-        NonceAllocator::bootstrap(
-            &config.l1_provider,
-            config.l1_signer_address,
-            stored_nonce_floor,
-        )
-        .await
-        .expect("NonceAllocator bootstrap failed — L1 RPC unreachable at startup"),
-    );
-
-    let target_tip = initial_checkpoint.max(initial_last_batch_end.unwrap_or(0));
-    let current_tip = orchestrator_tip.load(Ordering::Relaxed);
-    if target_tip > current_tip {
-        orchestrator_tip.store(target_tip, Ordering::Relaxed);
-    }
-    let _ = initial_last_batch_end;
-
-    let shared = Arc::new(OrchestratorShared {
-        config,
-        db: Arc::clone(&db),
-        db_tx: db_tx.clone(),
-        accumulator: Arc::new(std::sync::Mutex::new(accumulator)),
-        known_responses: Arc::clone(&known_responses),
-        nonce_allocator,
-        orchestrator_tip: Arc::clone(&orchestrator_tip),
-        pending_key_check: Arc::new(std::sync::Mutex::new(None)),
-        high_tx: high_tx.clone(),
-        driver: Arc::clone(&driver),
-        shutdown: shutdown.clone(),
-    });
-
-    info!(from_block, "Orchestrator ready — awaiting witnesses");
-
-    let mut tasks: JoinSet<&'static str> = JoinSet::new();
-    {
-        let shared = Arc::clone(&shared);
-        tasks.spawn(async move {
-            signer_worker(shared).await;
-            "signer_worker"
-        });
-    }
-    {
-        let shared = Arc::clone(&shared);
-        tasks.spawn(async move {
-            dispatcher_worker(shared).await;
-            "dispatcher_worker"
-        });
-    }
-    {
-        let shared = Arc::clone(&shared);
-        tasks.spawn(async move {
-            finalization_worker(shared).await;
-            "finalization_worker"
-        });
-    }
-    {
-        let shared = Arc::clone(&shared);
-        tasks.spawn(async move {
-            router(shared, l1_events, result_rx, initial_checkpoint).await;
-            "router"
-        });
-    }
-    {
-        let shared = Arc::clone(&shared);
-        tasks.spawn(async move {
-            crate::challenge_resolver::run(shared).await;
-            "challenge_resolver"
-        });
-    }
-
-    // Any worker exit — clean or fatal — cancels the root token so the
-    // rest drain together.
-    tokio::select! {
-        _ = shutdown.cancelled() => {
-            info!("Shutdown requested — draining orchestrator workers");
+        let target_tip = initial_checkpoint.max(initial_last_batch_end.unwrap_or(0));
+        if target_tip > orchestrator_tip.load(Ordering::Relaxed) {
+            orchestrator_tip.store(target_tip, Ordering::Relaxed);
         }
-        Some(join) = tasks.join_next() => {
+        let _ = initial_last_batch_end;
+
+        let shared = Arc::new(OrchestratorShared {
+            config,
+            db,
+            db_tx,
+            cache,
+            nonce_allocator,
+            orchestrator_tip,
+            pending_key_check: Arc::new(std::sync::Mutex::new(None)),
+            high_tx,
+            driver,
+            shutdown,
+        });
+
+        Self {
+            shared,
+            hub,
+            feeder_starting_block,
+            initial_checkpoint,
+            high_rx,
+            normal_tx,
+            normal_rx,
+            result_tx,
+            result_rx,
+            l1_events,
+        }
+    }
+
+    /// Spawn the execution-worker pool, the feeder, the startup-recovery
+    /// task, and the five per-role workers, then block until shutdown or
+    /// any supervised worker exits.
+    pub(crate) async fn run(self) {
+        let Self {
+            shared,
+            hub,
+            feeder_starting_block,
+            initial_checkpoint,
+            high_rx,
+            normal_tx,
+            normal_rx,
+            result_tx,
+            result_rx,
+            l1_events,
+        } = self;
+
+        let from_block = initial_checkpoint + 1;
+        info!(from_block, "Orchestrator ready — awaiting witnesses");
+
+        let mut workers: JoinSet<()> = JoinSet::new();
+        for i in 0..EXECUTION_WORKERS {
+            workers.spawn(execution_worker(
+                i,
+                high_rx.clone(),
+                normal_rx.clone(),
+                result_tx.clone(),
+                shared.config.http_client.clone(),
+                shared.config.proxy_url.clone(),
+                shared.config.api_key.clone(),
+                shared.shutdown.clone(),
+            ));
+        }
+
+        // One-shot startup recovery: priority-replay only the blocks missing
+        // from `block_responses` for any unsent batch. Steady-state workers
+        // self-recover from SQLite each tick (see `Db::*` predicates), so
+        // there is no other "recovery" code path. Spawned fire-and-forget so
+        // its successful exit (expected) does not cancel the root token.
+        {
+            let db = Arc::clone(&shared.db);
+            let driver = Arc::clone(&shared.driver);
+            let high_tx = shared.high_tx.clone();
+            let shutdown = shared.shutdown.clone();
+            tokio::spawn(async move {
+                startup_recovery_feeder(db, driver, high_tx, shutdown).await;
+            });
+        }
+
+        let mut tasks: JoinSet<&'static str> = JoinSet::new();
+        {
+            let hub = Arc::clone(&hub);
+            let cache = Arc::clone(&shared.cache);
+            let normal_tx = normal_tx.clone();
+            let shutdown = shared.shutdown.clone();
+            tasks.spawn(async move {
+                if let Err(e) =
+                    feeder_loop(hub, normal_tx, cache, feeder_starting_block, shutdown).await
+                {
+                    warn!(err = %e, "feeder exited with error");
+                }
+                "feeder"
+            });
+        }
+        {
+            let shared = Arc::clone(&shared);
+            tasks.spawn(async move {
+                signer_worker(shared).await;
+                "signer_worker"
+            });
+        }
+        {
+            let shared = Arc::clone(&shared);
+            tasks.spawn(async move {
+                dispatcher_worker(shared).await;
+                "dispatcher_worker"
+            });
+        }
+        {
+            let shared = Arc::clone(&shared);
+            tasks.spawn(async move {
+                finalization_worker(shared).await;
+                "finalization_worker"
+            });
+        }
+        {
+            let shared = Arc::clone(&shared);
+            tasks.spawn(async move {
+                router(shared, l1_events, result_rx, initial_checkpoint).await;
+                "router"
+            });
+        }
+        {
+            let shared = Arc::clone(&shared);
+            tasks.spawn(async move {
+                crate::challenge_resolver::run(shared).await;
+                "challenge_resolver"
+            });
+        }
+
+        // Any worker exit — clean or fatal — cancels the root token so the
+        // rest drain together.
+        tokio::select! {
+            _ = shared.shutdown.cancelled() => {
+                info!("Shutdown requested — draining orchestrator workers");
+            }
+            Some(join) = tasks.join_next() => {
+                match join {
+                    Ok(name) => info!(task = name, "orchestrator worker exited"),
+                    Err(e) => warn!(err = %e, "orchestrator worker join failed"),
+                }
+                shared.shutdown.cancel();
+            }
+        }
+
+        while let Some(join) = tasks.join_next().await {
             match join {
-                Ok(name) => info!(task = name, "orchestrator worker exited"),
-                Err(e) => warn!(err = %e, "orchestrator worker join failed"),
-            }
-            shutdown.cancel();
-        }
-    }
-
-    while let Some(join) = tasks.join_next().await {
-        match join {
-            Ok(name) => info!(task = name, "orchestrator worker drained"),
-            Err(e) => warn!(err = %e, "orchestrator worker join failed during drain"),
-        }
-    }
-
-    // The feeder owns `normal_tx` and drops it on cancel; here we only
-    // drop the channels the orchestrator itself owns.
-    info!("Closing worker task channels — draining execution workers");
-    drop(high_tx);
-    drop(result_tx);
-
-    let drain = async {
-        while let Some(res) = workers.join_next().await {
-            if let Err(e) = res {
-                warn!(err = %e, "Worker panicked or was cancelled");
+                Ok(name) => info!(task = name, "orchestrator worker drained"),
+                Err(e) => warn!(err = %e, "orchestrator worker join failed during drain"),
             }
         }
-    };
-    match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain).await {
-        Ok(()) => info!("All workers drained cleanly"),
-        Err(_) => {
-            warn!(
-                timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
-                "Shutdown drain deadline exceeded — aborting remaining workers"
-            );
-            workers.shutdown().await;
+
+        // Drop everything we still hold so the worker pool sees the channels
+        // close and drains cleanly.
+        info!("Closing worker task channels — draining execution workers");
+        drop(normal_tx);
+        drop(result_tx);
+        // `shared.high_tx` is the last live producer for `high_rx`; dropping
+        // `shared` releases it.
+        drop(shared);
+
+        let drain = async {
+            while let Some(res) = workers.join_next().await {
+                if let Err(e) = res {
+                    warn!(err = %e, "Worker panicked or was cancelled");
+                }
+            }
+        };
+        match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain).await {
+            Ok(()) => info!("All workers drained cleanly"),
+            Err(_) => {
+                warn!(
+                    timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                    "Shutdown drain deadline exceeded — aborting remaining workers"
+                );
+                workers.shutdown().await;
+            }
         }
+        info!("Orchestrator::run exited");
     }
-    info!("client::run exited");
 }
 
 // ============================================================================
@@ -675,10 +725,9 @@ impl<P: Provider + Send + Sync> FinalityRpc for P {
 }
 
 /// Pure-RPC half of the finalization + reorg check: takes a `dispatched`
-/// snapshot and returns receipt observations without touching the
-/// accumulator or DB. Skips rows whose `l1_block == 0` (in-flight
-/// initial broadcast — the dispatcher remains the sole observer until
-/// its first broadcast lands).
+/// snapshot and returns receipt observations without touching the DB.
+/// Skips rows whose `l1_block == 0` (in-flight initial broadcast — the
+/// dispatcher remains the sole observer until its first broadcast lands).
 async fn check_finalized_batches_query(
     provider: &dyn FinalityRpc,
     dispatched_snapshot: Vec<(u64, B256, u64)>,
@@ -955,6 +1004,53 @@ impl DispatchBackoff {
     }
 }
 
+/// One-shot startup task: enumerate every block that is missing from
+/// `block_responses` for any batch whose status is < Dispatched, build the
+/// witness for it via the driver (cold-store hit or MDBX rebuild), and push
+/// it onto the priority `high_tx` channel. The bounded channel provides
+/// natural backpressure if the missing-block count is large.
+async fn startup_recovery_feeder(
+    db: Arc<Mutex<Db>>,
+    driver: Arc<Driver>,
+    high_tx: AsyncSender<ExecutionTask>,
+    shutdown: CancellationToken,
+) {
+    let missing: Vec<u64> = {
+        let g = db.lock().unwrap_or_else(|e| e.into_inner());
+        g.missing_blocks_for_unsent_batches()
+    };
+    if missing.is_empty() {
+        info!("Startup recovery: no missing blocks");
+        return;
+    }
+    info!(count = missing.len(), "Startup recovery: priority-replaying missing blocks");
+    for block_number in missing {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let payload = match driver.get_or_build_witness(block_number).await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                warn!(block_number, "Startup recovery: witness not available — skipping");
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    block_number,
+                    err = %e,
+                    "Startup recovery: witness rebuild failed — skipping"
+                );
+                continue;
+            }
+        };
+        if high_tx.send(ExecutionTask { block_number, payload }).await.is_err() {
+            warn!("Startup recovery: high_tx closed — exiting");
+            return;
+        }
+    }
+    info!("Startup recovery: all missing blocks queued");
+}
+
 fn spawn_re_execution(shared: Arc<OrchestratorShared>, block_number: u64) {
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
@@ -1058,14 +1154,14 @@ enum DispatchTarget {
     None,
 }
 
-fn pick_next_dispatch_target(acc: &BatchAccumulator) -> DispatchTarget {
-    if let Some((batch_index, signature, resume)) = acc.first_inflight_resume() {
+fn pick_next_dispatch_target(db: &Db) -> DispatchTarget {
+    if let Some((batch_index, signature, resume)) = db.first_inflight_resume() {
         return DispatchTarget::ResumeInFlight { batch_index, signature, resume };
     }
-    if let Some(batch_index) = acc.first_dispatchable() {
-        if let Some(row) = acc.get(batch_index) {
-            if let Some(sig) = &row.signature {
-                return DispatchTarget::Fresh { batch_index, signature: sig.signature.clone() };
+    if let Some(batch_index) = db.first_dispatchable() {
+        if let Some(row) = db.find_batch(batch_index) {
+            if let Some(sig) = row.signature {
+                return DispatchTarget::Fresh { batch_index, signature: sig.signature };
             }
         }
     }
@@ -1077,43 +1173,52 @@ fn pick_next_dispatch_target(acc: &BatchAccumulator) -> DispatchTarget {
 async fn dispatcher_worker(shared: Arc<OrchestratorShared>) {
     let mut tick = tokio::time::interval(WORKER_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the immediately-ready first tick so the loop body runs on cycle 0.
+    tick.tick().await;
     let mut backoff = DispatchBackoff::default();
 
     loop {
+        if shared.shutdown.is_cancelled() {
+            break;
+        }
+
+        'work: {
+            if backoff.is_blocking() {
+                break 'work;
+            }
+            if shared.pending_key_check.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                break 'work;
+            }
+
+            let target = {
+                let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+                pick_next_dispatch_target(&g)
+            };
+
+            match target {
+                DispatchTarget::ResumeInFlight { batch_index, signature, resume } => {
+                    info!(
+                        batch_index,
+                        nonce = resume.nonce,
+                        stored_tx_hash = %resume.tx_hash,
+                        stored_max_fee_per_gas = resume.max_fee_per_gas,
+                        stored_max_priority_fee_per_gas = resume.max_priority_fee_per_gas,
+                        "RBF: resuming dispatched batch from persisted state"
+                    );
+                    crate::rbf::run(&shared, batch_index, signature, Some(resume), &mut backoff)
+                        .await;
+                }
+                DispatchTarget::Fresh { batch_index, signature } => {
+                    crate::rbf::run(&shared, batch_index, signature, None, &mut backoff).await;
+                }
+                DispatchTarget::None => {}
+            }
+        }
+
         tokio::select! {
             biased;
             _ = shared.shutdown.cancelled() => break,
             _ = tick.tick() => {}
-        }
-
-        if backoff.is_blocking() {
-            continue;
-        }
-        if shared.pending_key_check.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-            continue;
-        }
-
-        let target = {
-            let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-            pick_next_dispatch_target(&acc)
-        };
-
-        match target {
-            DispatchTarget::ResumeInFlight { batch_index, signature, resume } => {
-                info!(
-                    batch_index,
-                    nonce = resume.nonce,
-                    stored_tx_hash = %resume.tx_hash,
-                    stored_max_fee_per_gas = resume.max_fee_per_gas,
-                    stored_max_priority_fee_per_gas = resume.max_priority_fee_per_gas,
-                    "RBF: resuming dispatched batch from persisted state"
-                );
-                crate::rbf::run(&shared, batch_index, signature, Some(resume), &mut backoff).await;
-            }
-            DispatchTarget::Fresh { batch_index, signature } => {
-                crate::rbf::run(&shared, batch_index, signature, None, &mut backoff).await;
-            }
-            DispatchTarget::None => {}
         }
     }
     info!("dispatcher_worker exiting");
@@ -1122,115 +1227,114 @@ async fn dispatcher_worker(shared: Arc<OrchestratorShared>) {
 async fn signer_worker(shared: Arc<OrchestratorShared>) {
     let mut tick = tokio::time::interval(WORKER_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the immediately-ready first tick so the loop body runs on cycle 0.
+    tick.tick().await;
 
     loop {
+        if shared.shutdown.is_cancelled() {
+            break;
+        }
+
+        'work: {
+            // Snapshot current state: pick the next batch eligible to sign
+            // (status=Accepted, !enclave_signed, all responses present) and
+            // copy out its responses. Drop the locks before the HTTP call.
+            let pick: Option<(u64, u64, u64, Vec<EthExecutionResponse>)> = {
+                let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+                g.first_accepted_unsigned().and_then(|batch_index| {
+                    let batch = g.find_batch(batch_index)?;
+                    let from_block = batch.from_block;
+                    let to_block = batch.to_block;
+                    let responses = {
+                        let c = shared.cache.lock().unwrap_or_else(|e| e.into_inner());
+                        c.get_range(from_block, to_block)
+                    };
+                    Some((batch_index, from_block, to_block, responses))
+                })
+            };
+
+            let Some((batch_index, from_block, to_block, responses)) = pick else { break 'work };
+
+            let outcome = sign_batch_io(
+                &shared.config.http_client,
+                &shared.config.proxy_url,
+                &shared.config.api_key,
+                batch_index,
+                from_block,
+                to_block,
+                responses,
+                &shared.config.l2_provider,
+                &shared.shutdown,
+            )
+            .await;
+
+            match outcome {
+                SignOutcome::Signed { response } => {
+                    info!(batch_index, "Batch signed — available for dispatch");
+                    let patch = BatchPatch {
+                        enclave_signed: Some(true),
+                        signature: Some(Some(response)),
+                        ..Default::default()
+                    };
+                    if let Err(e) =
+                        db_send_sync(&shared.db_tx, SyncOp::PatchBatch { batch_index, patch }).await
+                    {
+                        error!(batch_index, err = %e, "record_enclave_signed failed");
+                        break 'work;
+                    }
+                    metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED).set(batch_index as f64);
+                    metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_FROM_BLOCK)
+                        .set(from_block as f64);
+                    metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_TO_BLOCK)
+                        .set(to_block as f64);
+                    metrics::gauge!(crate::metrics::LAST_BLOCK_SIGNED).set(to_block as f64);
+                    let blocks: Vec<u64> = (from_block..=to_block).collect();
+                    {
+                        let mut c = shared.cache.lock().unwrap_or_else(|e| e.into_inner());
+                        c.purge(&blocks);
+                    }
+                }
+                SignOutcome::InvalidSignatures { invalid_blocks, enclave_address } => {
+                    warn!(
+                        batch_index,
+                        invalid_count = invalid_blocks.len(),
+                        %enclave_address,
+                        "Key rotation detected — invalidating signature and re-executing"
+                    );
+
+                    if let Err(e) =
+                        db_send_sync(&shared.db_tx, SyncOp::InvalidateSignature { batch_index })
+                            .await
+                    {
+                        error!(batch_index, err = %e, "invalidate_signature failed");
+                    }
+
+                    {
+                        let mut c = shared.cache.lock().unwrap_or_else(|e| e.into_inner());
+                        c.purge(&invalid_blocks);
+                    }
+
+                    for &block_number in &invalid_blocks {
+                        spawn_re_execution(Arc::clone(&shared), block_number);
+                    }
+
+                    {
+                        let mut g =
+                            shared.pending_key_check.lock().unwrap_or_else(|e| e.into_inner());
+                        *g = Some(enclave_address);
+                    }
+                    spawn_key_check(Arc::clone(&shared), enclave_address);
+                }
+                SignOutcome::TaskFailed => {
+                    error!(batch_index, "Sign task crashed — batch will be retried on next tick");
+                }
+            }
+        }
+
         tokio::select! {
             biased;
             _ = shared.shutdown.cancelled() => break,
             _ = tick.tick() => {}
-        }
-
-        // Snapshot current state under one lock acquisition: pick the next
-        // batch eligible to sign (status=Accepted, !enclave_signed, all
-        // responses present) and copy out its responses. Drop the lock
-        // before the HTTP call.
-        let pick: Option<(u64, u64, u64, Vec<EthExecutionResponse>)> = {
-            let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-            acc.first_accepted_unsigned().and_then(|batch_index| {
-                let batch = acc.get(batch_index)?;
-                let from_block = batch.from_block;
-                let to_block = batch.to_block;
-                let responses = acc.get_responses(from_block, to_block);
-                Some((batch_index, from_block, to_block, responses))
-            })
-        };
-
-        let Some((batch_index, from_block, to_block, responses)) = pick else { continue };
-
-        let outcome = sign_batch_io(
-            &shared.config.http_client,
-            &shared.config.proxy_url,
-            &shared.config.api_key,
-            batch_index,
-            from_block,
-            to_block,
-            responses,
-            &shared.config.l2_provider,
-            &shared.shutdown,
-        )
-        .await;
-
-        match outcome {
-            SignOutcome::Signed { response } => {
-                info!(batch_index, "Batch signed — available for dispatch");
-                if let Err(e) =
-                    accumulator::record_enclave_signed(&shared.accumulator, batch_index, response)
-                        .await
-                {
-                    error!(batch_index, err = %e, "record_enclave_signed failed");
-                    continue;
-                }
-                // Update gauges + purge per-block responses (memory + queued
-                // SQL DELETE). known_responses stays populated to dedupe any
-                // stale in-flight worker result for this range.
-                let blocks: Option<Vec<u64>> = {
-                    let mut acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                    let blocks = acc.get(batch_index).map(|batch| {
-                        metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED).set(batch_index as f64);
-                        metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_FROM_BLOCK)
-                            .set(batch.from_block as f64);
-                        metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_TO_BLOCK)
-                            .set(batch.to_block as f64);
-                        metrics::gauge!(crate::metrics::LAST_BLOCK_SIGNED)
-                            .set(batch.to_block as f64);
-                        (batch.from_block..=batch.to_block).collect::<Vec<u64>>()
-                    });
-                    if let Some(ref b) = blocks {
-                        acc.purge_responses(b);
-                    }
-                    blocks
-                };
-                let _ = blocks;
-            }
-            SignOutcome::InvalidSignatures { invalid_blocks, enclave_address } => {
-                warn!(
-                    batch_index,
-                    invalid_count = invalid_blocks.len(),
-                    %enclave_address,
-                    "Key rotation detected — invalidating signature and re-executing"
-                );
-
-                if let Err(e) =
-                    accumulator::invalidate_signature(&shared.accumulator, batch_index).await
-                {
-                    error!(batch_index, err = %e, "invalidate_signature failed");
-                }
-
-                {
-                    let mut acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                    acc.purge_responses(&invalid_blocks);
-                }
-
-                {
-                    let mut w = shared.known_responses.write().unwrap_or_else(|e| e.into_inner());
-                    for b in &invalid_blocks {
-                        w.remove(b);
-                    }
-                }
-
-                for &block_number in &invalid_blocks {
-                    spawn_re_execution(Arc::clone(&shared), block_number);
-                }
-
-                {
-                    let mut g = shared.pending_key_check.lock().unwrap_or_else(|e| e.into_inner());
-                    *g = Some(enclave_address);
-                }
-                spawn_key_check(Arc::clone(&shared), enclave_address);
-            }
-            SignOutcome::TaskFailed => {
-                error!(batch_index, "Sign task crashed — batch will be retried on next tick");
-            }
         }
     }
     info!("signer_worker exiting");
@@ -1239,24 +1343,25 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
 async fn finalization_worker(shared: Arc<OrchestratorShared>) {
     let mut tick = tokio::time::interval(FINALIZATION_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the immediately-ready first tick so the loop body runs on cycle 0.
+    tick.tick().await;
 
     loop {
-        tokio::select! {
-            biased;
-            _ = shared.shutdown.cancelled() => break,
-            _ = tick.tick() => {}
+        if shared.shutdown.is_cancelled() {
+            break;
         }
 
         let batch_snapshot = {
-            let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-            acc.dispatched_for_finalization_check()
+            let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+            g.dispatched_for_finalization_check()
         };
         if !batch_snapshot.is_empty() {
             let done =
                 check_finalized_batches_query(&shared.config.l1_provider, batch_snapshot).await;
             apply_finalization_changes(
-                &shared.accumulator,
-                &shared.known_responses,
+                &shared.db,
+                &shared.db_tx,
+                &shared.cache,
                 &shared.orchestrator_tip,
                 done,
             )
@@ -1277,6 +1382,12 @@ async fn finalization_worker(shared: Arc<OrchestratorShared>) {
                 challenge_snapshot,
             )
             .await;
+        }
+
+        tokio::select! {
+            biased;
+            _ = shared.shutdown.cancelled() => break,
+            _ = tick.tick() => {}
         }
     }
     info!("finalization_worker exiting");
@@ -1340,54 +1451,10 @@ async fn apply_challenge_reorg_check(
     }
 }
 
-/// Startup-only sweep: drives each `Preconfirmed` row through one
-/// finalization-check pass before workers spawn. `Sent` rows are left for
-/// the dispatcher's resume path (`first_inflight_resume`).
-async fn run_startup_sweep(
-    accumulator: &BatchAccumulator,
-    _db_tx: &mpsc::UnboundedSender<DbCommand>,
-    last_batch_end: &mut Option<u64>,
-    orchestrator_tip: &Arc<AtomicU64>,
-    provider: &dyn FinalityRpc,
-) {
-    let snapshot = accumulator.dispatched_for_finalization_check();
-    if snapshot.is_empty() {
-        return;
-    }
-    info!(rows = snapshot.len(), "Startup: sweeping preconfirmed rows for finality");
-    // We can't call `record_finalized` here because the accumulator is not
-    // yet wrapped in the shared Mutex. Instead, after the sweep completes,
-    // the steady-state finalization_worker will pick these up on its first
-    // tick. We DO advance orchestrator_tip and last_batch_end so the driver
-    // bootstrap reflects the post-sweep watermark immediately.
-    let done = check_finalized_batches_query(provider, snapshot).await;
-    let FinalizationDone::Observed { observations } = done else { return };
-    for (batch_index, tx_hash, check) in observations {
-        if !matches!(check, ReceiptCheck::Found { finalized: true }) {
-            continue;
-        }
-        let Some(row) = accumulator.get(batch_index) else { continue };
-        let block = row.to_block;
-        *last_batch_end = Some(match *last_batch_end {
-            Some(prev) => prev.max(block),
-            None => block,
-        });
-        let current = orchestrator_tip.load(Ordering::Relaxed);
-        if block > current {
-            orchestrator_tip.store(block, Ordering::Relaxed);
-        }
-        info!(
-            batch_index,
-            %tx_hash,
-            to_block = block,
-            "Startup: batch already finalized on L1"
-        );
-    }
-}
-
 async fn apply_finalization_changes(
-    accumulator: &Arc<std::sync::Mutex<BatchAccumulator>>,
-    known_responses: &KnownResponses,
+    db: &Arc<std::sync::Mutex<Db>>,
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    cache: &Arc<std::sync::Mutex<ResponseCache>>,
     orchestrator_tip: &Arc<AtomicU64>,
     done: FinalizationDone,
 ) {
@@ -1398,19 +1465,19 @@ async fn apply_finalization_changes(
         match check {
             ReceiptCheck::Found { finalized: true } => {
                 let range = {
-                    let acc = accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                    acc.get(batch_index).map(|b| (b.from_block, b.to_block))
+                    let g = db.lock().unwrap_or_else(|e| e.into_inner());
+                    g.find_batch(batch_index).map(|b| (b.from_block, b.to_block))
                 };
-                if let Err(e) = accumulator::record_finalized(accumulator, batch_index).await {
-                    error!(batch_index, err = %e, "record_finalized failed");
+                if let Err(e) = db_send_sync(db_tx, SyncOp::ObserveFinalized { batch_index }).await
+                {
+                    error!(batch_index, err = %e, "observe_finalized failed");
                     continue;
                 }
                 let Some((from_block, to_block)) = range else { continue };
                 {
-                    let mut w = known_responses.write().unwrap_or_else(|e| e.into_inner());
-                    for b in from_block..=to_block {
-                        w.remove(&b);
-                    }
+                    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+                    let blocks: Vec<u64> = (from_block..=to_block).collect();
+                    c.purge(&blocks);
                 }
                 let current = orchestrator_tip.load(Ordering::Relaxed);
                 if to_block > current {
@@ -1425,8 +1492,8 @@ async fn apply_finalization_changes(
             }
             ReceiptCheck::Reverted { kind } => {
                 let still_ours = {
-                    let acc = accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                    acc.dispatched_tx_hash(batch_index) == Some(tx_hash)
+                    let g = db.lock().unwrap_or_else(|e| e.into_inner());
+                    g.dispatched_tx_hash(batch_index) == Some(tx_hash)
                 };
                 if !still_ours {
                     info!(
@@ -1447,7 +1514,7 @@ async fn apply_finalization_changes(
                         "Finalization-ticker rolling back reverted batch"
                     );
                     if let Err(e) =
-                        accumulator::rollback_to_accepted(accumulator, batch_index).await
+                        db_send_sync(db_tx, SyncOp::RollbackToAccepted { batch_index }).await
                     {
                         error!(batch_index, err = %e, "rollback_to_accepted failed");
                     }
@@ -1456,12 +1523,12 @@ async fn apply_finalization_changes(
             ReceiptCheck::Missing => {
                 // Reorg recovery: the L1 event was observed
                 // (status=Preconfirmed + l1_block set) but the receipt is
-                // gone. Roll status back to `Sent` + clear l1_block so
+                // gone. Roll status back to `Dispatched` + clear l1_block so
                 // the dispatcher's `first_inflight_resume` resumes RBF
                 // against the persisted nonce.
                 let still_ours = {
-                    let acc = accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                    acc.dispatched_tx_hash(batch_index) == Some(tx_hash)
+                    let g = db.lock().unwrap_or_else(|e| e.into_inner());
+                    g.dispatched_tx_hash(batch_index) == Some(tx_hash)
                 };
                 if !still_ours {
                     info!(
@@ -1475,10 +1542,12 @@ async fn apply_finalization_changes(
                 warn!(
                     batch_index,
                     %tx_hash,
-                    "Batch tx receipt missing — suspecting reorg, rolling back to Sent"
+                    "Batch tx receipt missing — suspecting reorg, rolling back to Dispatched"
                 );
-                if let Err(e) = accumulator::record_reorg_to_sent(accumulator, batch_index).await {
-                    error!(batch_index, err = %e, "record_reorg_to_sent failed");
+                if let Err(e) =
+                    db_send_sync(db_tx, SyncOp::ObserveReorgToDispatched { batch_index }).await
+                {
+                    error!(batch_index, err = %e, "observe_reorg_to_dispatched failed");
                 }
             }
             ReceiptCheck::CheckFailed => {}
@@ -1515,29 +1584,31 @@ async fn router(
 async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
     match event {
         L1Event::BatchCommitted { batch_index, from, to } => {
-            if let Err(e) =
-                accumulator::observe_committed(&shared.accumulator, batch_index, from, to).await
+            if let Err(e) = db_send_sync(
+                &shared.db_tx,
+                SyncOp::ObserveCommitted { batch_index, from_block: from, to_block: to },
+            )
+            .await
             {
                 error!(batch_index, err = %e, "observe_committed failed");
             }
         }
         L1Event::BatchSubmitted { batch_index } => {
-            if let Err(e) = accumulator::observe_submitted(&shared.accumulator, batch_index).await {
+            if let Err(e) =
+                db_send_sync(&shared.db_tx, SyncOp::ObserveSubmitted { batch_index }).await
+            {
                 error!(batch_index, err = %e, "observe_submitted failed");
             }
         }
         L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block } => {
-            // The accumulator decides "external" vs "ours" by the row's
-            // current status. If we owned the broadcast (status=Sent),
-            // status flips to Preconfirmed and l1_block is overwritten with
-            // the event-authoritative value. If we never broadcast
-            // (status<=Accepted), the row is marked as external takeover
-            // (nonce/fees cleared, tx_hash from the event).
-            if let Err(e) = accumulator::observe_preconfirmed(
-                &shared.accumulator,
-                batch_index,
-                tx_hash,
-                l1_block,
+            // Branching is by `enclave_signed`: if we signed the batch (we own
+            // it), preserve any RBF state we may have written. Otherwise
+            // (external takeover edge case) clear nonce/fees and adopt the
+            // event's tx_hash. The decision happens atomically inside the
+            // writer actor — see `SyncOp::ObservePreconfirmed`.
+            if let Err(e) = db_send_sync(
+                &shared.db_tx,
+                SyncOp::ObservePreconfirmed { batch_index, tx_hash, l1_block },
             )
             .await
             {
@@ -1545,9 +1616,9 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
                 return;
             }
             {
-                let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(batch) = acc.get(batch_index) {
-                    crate::metrics::set_last_batch_dispatched(
+                let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(batch) = g.find_batch(batch_index) {
+                    crate::metrics::set_last_batch_preconfirmed(
                         batch_index,
                         batch.from_block,
                         batch.to_block,
@@ -1632,15 +1703,15 @@ async fn handle_block_result(
 ) {
     let block_number = result.block_number;
 
-    if shared.known_responses.read().unwrap_or_else(|e| e.into_inner()).contains(&block_number) {
+    if shared.cache.lock().unwrap_or_else(|e| e.into_inner()).contains(block_number) {
         return;
     }
 
     // Drop late results that fall at or below the highest finalized batch's
-    // to_block. Derived from the accumulator (no separate scalar).
+    // to_block.
     {
-        let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(lbe) = acc.highest_finalized_to_block() {
+        let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lbe) = g.highest_finalized_to_block() {
             if block_number <= lbe {
                 warn!(
                     block_number,
@@ -1654,13 +1725,11 @@ async fn handle_block_result(
 
     info!(block_number, "Block execution response received");
     {
-        let mut acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-        acc.insert_response(result.response);
+        let mut c = shared.cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.insert(result.response);
     }
 
     metrics::gauge!(crate::metrics::LAST_BLOCK_EXECUTED).set(block_number as f64);
-
-    shared.known_responses.write().unwrap_or_else(|e| e.into_inner()).insert(block_number);
 
     confirmed.insert(block_number);
     while confirmed.contains(&(*checkpoint + 1)) {
