@@ -1,6 +1,8 @@
 use serde::Serialize;
-use std::io::{Read, Write};
-use std::time::Duration;
+use std::{
+    io::{Read, Write},
+    time::Duration,
+};
 use vsock::{VsockListener, VsockStream};
 
 use crate::nitro::MAX_FRAME_SIZE;
@@ -54,8 +56,9 @@ impl VsockChannel {
     /// Core logic for sending a length-prefixed frame over VSOCK.
     /// Handles length prefixing, writing, and flushing.
     fn write_frame(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        let len = u32::try_from(data.len())
-            .map_err(|_| anyhow::anyhow!("Outgoing frame size ({}) exceeds u32::MAX", data.len()))?;
+        let len = u32::try_from(data.len()).map_err(|_| {
+            anyhow::anyhow!("Outgoing frame size ({}) exceeds u32::MAX", data.len())
+        })?;
 
         // 1. Send the 4-byte Big-Endian length prefix
         self.stream

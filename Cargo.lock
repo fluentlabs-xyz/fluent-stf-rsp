@@ -1811,6 +1811,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "batch-merkle"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+]
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8644,6 +8651,7 @@ dependencies = [
  "alloy-provider",
  "alloy-rpc-types",
  "alloy-transport",
+ "batch-merkle",
  "bincode 1.3.3",
  "dotenv",
  "fluent-stf-primitives",
@@ -13022,6 +13030,7 @@ dependencies = [
  "async-channel",
  "async-trait",
  "axum 0.8.9",
+ "batch-merkle",
  "bincode 1.3.3",
  "brotli",
  "bytes",

@@ -18,7 +18,10 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::Filter;
 use alloy_sol_types::SolEvent;
 use eyre::{eyre, Result};
-use l1_rollup_client::{BatchCommitted, BatchPreconfirmed, BatchReverted, BatchSubmitted};
+use l1_rollup_client::{
+    BatchCommitted, BatchPreconfirmed, BatchReverted, BatchRootChallengeResolved,
+    BatchRootChallenged, BatchSubmitted, BlockChallenged, ChallengeResolved,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -44,6 +47,17 @@ pub(crate) enum L1Event {
     /// graceful shutdown so the startup path re-resolves the L2 checkpoint
     /// from L1.
     BatchReverted { from_batch_index: u64, l1_block: u64 },
+    /// `BlockChallenged(batchIndex, commitment, challenger)` — a block
+    /// dispute opened against a preconfirmed batch.
+    BlockChallenged { batch_index: u64, commitment: B256 },
+    /// `BatchRootChallenged(batchIndex)` — a batch-root dispute opened.
+    BatchRootChallenged { batch_index: u64 },
+    /// `ChallengeResolved(batchIndex, commitment, prover)` — block-level
+    /// dispute resolved (by any prover, possibly us).
+    ChallengeResolved { batch_index: u64, commitment: B256 },
+    /// `BatchRootChallengeResolved(batchIndex, prover)` — batch-root
+    /// dispute resolved by some prover.
+    BatchRootChallengeResolved { batch_index: u64 },
     /// All events up to this L1 block have been sent.
     /// Orchestrator persists this as the L1 checkpoint.
     Checkpoint(u64),
@@ -244,6 +258,10 @@ async fn process_page(
             BatchSubmitted::SIGNATURE_HASH,
             BatchPreconfirmed::SIGNATURE_HASH,
             BatchReverted::SIGNATURE_HASH,
+            BlockChallenged::SIGNATURE_HASH,
+            BatchRootChallenged::SIGNATURE_HASH,
+            ChallengeResolved::SIGNATURE_HASH,
+            BatchRootChallengeResolved::SIGNATURE_HASH,
         ])
         .from_block(from)
         .to_block(to);
@@ -340,6 +358,63 @@ async fn process_page(
                 log.block_number.ok_or_else(|| eyre!("BatchReverted log missing block_number"))?;
             info!(from_batch_index, l1_block, "BatchReverted event");
             if tx.send(L1Event::BatchReverted { from_batch_index, l1_block }).await.is_err() {
+                return Err(eyre!("L1 event channel closed"));
+            }
+        } else if topic0 == BlockChallenged::SIGNATURE_HASH {
+            let event = BlockChallenged::decode_log_data(&log.inner.data).map_err(|e| {
+                eyre!("Failed to decode BlockChallenged at L1 block {:?}: {e}", log.block_number)
+            })?;
+            let batch_index: u64 = event
+                .batchIndex
+                .try_into()
+                .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
+            let commitment = event.commitment;
+            info!(batch_index, %commitment, "BlockChallenged event");
+            if tx.send(L1Event::BlockChallenged { batch_index, commitment }).await.is_err() {
+                return Err(eyre!("L1 event channel closed"));
+            }
+        } else if topic0 == BatchRootChallenged::SIGNATURE_HASH {
+            let event = BatchRootChallenged::decode_log_data(&log.inner.data).map_err(|e| {
+                eyre!(
+                    "Failed to decode BatchRootChallenged at L1 block {:?}: {e}",
+                    log.block_number
+                )
+            })?;
+            let batch_index: u64 = event
+                .batchIndex
+                .try_into()
+                .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
+            info!(batch_index, "BatchRootChallenged event");
+            if tx.send(L1Event::BatchRootChallenged { batch_index }).await.is_err() {
+                return Err(eyre!("L1 event channel closed"));
+            }
+        } else if topic0 == ChallengeResolved::SIGNATURE_HASH {
+            let event = ChallengeResolved::decode_log_data(&log.inner.data).map_err(|e| {
+                eyre!("Failed to decode ChallengeResolved at L1 block {:?}: {e}", log.block_number)
+            })?;
+            let batch_index: u64 = event
+                .batchIndex
+                .try_into()
+                .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
+            let commitment = event.commitment;
+            info!(batch_index, %commitment, "ChallengeResolved event");
+            if tx.send(L1Event::ChallengeResolved { batch_index, commitment }).await.is_err() {
+                return Err(eyre!("L1 event channel closed"));
+            }
+        } else if topic0 == BatchRootChallengeResolved::SIGNATURE_HASH {
+            let event =
+                BatchRootChallengeResolved::decode_log_data(&log.inner.data).map_err(|e| {
+                    eyre!(
+                        "Failed to decode BatchRootChallengeResolved at L1 block {:?}: {e}",
+                        log.block_number
+                    )
+                })?;
+            let batch_index: u64 = event
+                .batchIndex
+                .try_into()
+                .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
+            info!(batch_index, "BatchRootChallengeResolved event");
+            if tx.send(L1Event::BatchRootChallengeResolved { batch_index }).await.is_err() {
                 return Err(eyre!("L1 event channel closed"));
             }
         }

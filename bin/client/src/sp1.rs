@@ -1,11 +1,11 @@
 #[cfg(not(test))]
 sp1_zkvm::entrypoint!(main);
 
-use rsp_client_executor::executor::EthClientExecutor;
 #[cfg(target_os = "zkvm")]
 use rsp_client_executor::executor::DESERIALZE_INPUTS;
-use rsp_client_executor::io::EthClientExecutorInput;
-use rsp_client_executor::utils::profile_report;
+use rsp_client_executor::{
+    executor::EthClientExecutor, io::EthClientExecutorInput, utils::profile_report,
+};
 
 use alloy_primitives::B256;
 use sha2::{Digest, Sha256};
@@ -31,12 +31,10 @@ pub fn main() {
             .with_limit(MAX_INPUT_SIZE);
 
         let exec_bytes = sp1_zkvm::io::read_vec();
-        let exec_input =
-            opts.deserialize::<EthClientExecutorInput>(&exec_bytes).unwrap();
+        let exec_input = opts.deserialize::<EthClientExecutorInput>(&exec_bytes).unwrap();
 
         let blob_bytes = sp1_zkvm::io::read_vec();
-        let blob_input =
-            opts.deserialize::<BlobVerificationInput>(&blob_bytes).unwrap();
+        let blob_input = opts.deserialize::<BlobVerificationInput>(&blob_bytes).unwrap();
 
         (exec_input, blob_input)
     });
@@ -53,9 +51,8 @@ pub fn main() {
     let (header, events_hash) = executor.execute(executor_input).expect("STF execution failed");
     let stf_block_hash = header.hash_slow();
 
-    // 3. Decanonicalize + brotli-decompress the blob AFTER STF: defers
-    //    decompression cost past any early STF panic and keeps the brotli-
-    //    output buffer out of the hottest allocation phase.
+    // 3. Decanonicalize + brotli-decompress the blob AFTER STF: defers decompression cost past any
+    //    early STF panic and keeps the brotli- output buffer out of the hottest allocation phase.
     {
         let decompressed = blob::decode_blob_payload(&blob_input.blobs).unwrap();
 
@@ -72,11 +69,7 @@ pub fn main() {
         blob_input.commitments.len(),
         "blobs / commitments length mismatch"
     );
-    assert_eq!(
-        blob_input.blobs.len(),
-        blob_input.proofs.len(),
-        "blobs / proofs length mismatch"
-    );
+    assert_eq!(blob_input.blobs.len(), blob_input.proofs.len(), "blobs / proofs length mismatch");
     let mut versioned_hashes = Vec::with_capacity(blob_input.commitments.len());
     for i in 0..blob_input.blobs.len() {
         let blob = Blob::from_slice(&blob_input.blobs[i]).expect("Invalid blob slice");

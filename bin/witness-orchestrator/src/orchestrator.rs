@@ -20,7 +20,7 @@
 //! queue independent of the feeder.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
@@ -35,8 +35,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
-    accumulator::{BatchAccumulator, RbfResumeState},
-    db::{Db, DbCommand},
+    accumulator::{self, BatchAccumulator, RbfResumeState},
+    db::{db_send_sync, AsyncOp, BatchStatus, Db, DbCommand, SyncOp},
     driver::Driver,
     l1_listener::L1Event,
     types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse},
@@ -75,14 +75,6 @@ pub(crate) type L1WriteProvider = FillProvider<
     Ethereum,
 >;
 
-/// Time window after which a still-missing receipt triggers a single warn-level
-/// log per batch (then resets). With RBF in place the worker owns the broadcast
-/// lifecycle, so this is purely a visibility aid — no action is taken. The
-/// value is chosen to be meaningfully larger than a normal fee-bump climb to
-/// the configured cap, so the log fires only on genuinely stuck dispatches
-/// rather than on every in-flight bump cycle.
-const RECEIPT_MISSING_WINDOW: Duration = Duration::from_secs(600);
-
 /// Maximum wall-clock time the RBF worker will keep rebroadcasting at the
 /// fee cap after the cap is first reached. Once this elapses with no
 /// receipt, the worker returns `Failed` so the main loop can undispatch,
@@ -118,8 +110,15 @@ pub(crate) struct OrchestratorConfig {
     pub proxy_url: String,
     pub http_client: reqwest::Client,
     pub l1_rollup_addr: Address,
+    /// L1 block where the Rollup contract was deployed. Lower bound for
+    /// `fetch_batch_range` event scans on the challenge-resolve path.
+    pub l1_deploy_block: u64,
     pub nitro_verifier_addr: Address,
     pub l1_provider: L1WriteProvider,
+    /// Separate L1 read provider for `fetch_batch_range` (which expects
+    /// the concrete `RootProvider`, not the wallet-filler stack). Built
+    /// once at startup; same RPC URL as `l1_provider`.
+    pub l1_read_provider: RootProvider,
     pub api_key: String,
     pub l2_provider: alloy_provider::RootProvider,
     /// Held alongside `l1_provider` so the RBF worker can sign with an
@@ -141,9 +140,9 @@ pub(crate) struct OrchestratorConfig {
 /// lock before any async work and prevents deadlocks at runtime.
 pub(crate) struct OrchestratorShared {
     pub(crate) config: OrchestratorConfig,
-    /// Synchronous SQLite handle, used for the startup load and the
-    /// `get_batch_signature` cache check inside `sign_batch_io`. All
-    /// writes go through `db_tx` instead.
+    /// Direct DB read access for the challenge active worker (status
+    /// queries every tick) and for L1-event handlers that need to look up
+    /// existing challenge rows. Writes still flow through `db_tx`.
     pub(crate) db: Arc<std::sync::Mutex<Db>>,
     pub(crate) db_tx: mpsc::UnboundedSender<DbCommand>,
     pub(crate) accumulator: Arc<std::sync::Mutex<BatchAccumulator>>,
@@ -154,10 +153,6 @@ pub(crate) struct OrchestratorShared {
     /// cleared by the spawned key-check task once the new key is on L1.
     /// The dispatcher skips broadcasting while this is `Some(_)`.
     pub(crate) pending_key_check: Arc<std::sync::Mutex<Option<Address>>>,
-    /// `to_block` of the last L1-finalized dispatched batch. Read by the
-    /// router to drop already-finalized block results, written by the
-    /// finalization worker.
-    pub(crate) last_batch_end: Arc<std::sync::Mutex<Option<u64>>>,
     pub(crate) high_tx: AsyncSender<ExecutionTask>,
     pub(crate) driver: Arc<Driver>,
     pub(crate) shutdown: CancellationToken,
@@ -217,8 +212,19 @@ pub(crate) fn classify_revert(gas_used: u64, gas_limit: u64) -> RevertKind {
 }
 
 enum ReceiptCheck {
-    Found,
-    Reverted { kind: RevertKind },
+    /// Receipt found with status=1. `finalized` reflects whether
+    /// `l1_block <= finalized_block_number` at observation time —
+    /// finality decisions are deferred to `apply_finalization_changes`.
+    Found {
+        finalized: bool,
+    },
+    Reverted {
+        kind: RevertKind,
+    },
+    /// Receipt absent — implies the tx is no longer in the canonical
+    /// chain (reorg) or the RPC is briefly inconsistent. Caller drives
+    /// recovery by rolling status back to `Sent` so the dispatcher
+    /// resumes RBF.
     Missing,
     CheckFailed,
 }
@@ -439,7 +445,7 @@ pub(crate) async fn run(
     normal_rx: AsyncReceiver<ExecutionTask>,
     known_responses: KnownResponses,
 ) {
-    let mut accumulator = {
+    let accumulator = {
         let db = Arc::clone(&db);
         let db_tx = db_tx.clone();
         tokio::task::spawn_blocking(move || BatchAccumulator::with_db(db, db_tx))
@@ -449,40 +455,36 @@ pub(crate) async fn run(
 
     // Single-writer window — runs before any background task that could emit.
     {
-        let checkpoint = db.lock().unwrap_or_else(|e| e.into_inner()).get_checkpoint();
-        let dispatched_max: Option<(u64, u64, u64)> =
-            accumulator.dispatched.iter().next_back().map(|(&i, d)| (i, d.from_block, d.to_block));
-        let pending_signed = accumulator
+        let checkpoint = accumulator.highest_dispatched_to_block().unwrap_or(0);
+        let dispatched_max: Option<(u64, u64, u64)> = accumulator
             .batches
-            .iter()
+            .values()
             .rev()
-            .find(|(i, _)| accumulator.signatures.contains_key(i))
-            .map(|(&i, b)| (i, b.from_block, b.to_block));
-        let signed_max = match (pending_signed, dispatched_max) {
-            (Some(s), Some(d)) if d.0 > s.0 => Some(d),
-            (None, d) => d,
-            (s, _) => s,
-        };
+            .find(|b| b.status >= BatchStatus::Sent)
+            .map(|b| (b.batch_index, b.from_block, b.to_block));
+        let signed_max: Option<(u64, u64, u64)> = accumulator
+            .batches
+            .values()
+            .rev()
+            .find(|b| b.enclave_signed)
+            .map(|b| (b.batch_index, b.from_block, b.to_block));
         crate::metrics::seed_gauges_on_startup(checkpoint, dispatched_max, signed_max);
     }
 
-    let mut initial_last_batch_end: Option<u64> =
-        db.lock().unwrap_or_else(|e| e.into_inner()).get_last_batch_end();
+    let mut initial_last_batch_end: Option<u64> = accumulator.highest_finalized_to_block();
 
-    // Sweep dispatched rows from the prior process before spawning workers,
-    // so the dispatcher does not try to resume one already finalized on L1.
-    let mut missing_receipt_first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
+    // Sweep preconfirmed rows from the prior process before spawning workers,
+    // so finalization gets a chance to drive any already-finalized rows to
+    // terminal status, and the dispatcher does not try to resume one whose
+    // tx is already mined.
     run_startup_sweep(
-        &mut accumulator,
+        &accumulator,
         &db_tx,
         &mut initial_last_batch_end,
-        &known_responses,
         &orchestrator_tip,
         &config.l1_provider,
-        &mut missing_receipt_first_seen,
     )
     .await;
-    drop(missing_receipt_first_seen);
 
     // Capacity tied to `EXECUTION_WORKERS`: each queued `ExecutionTask`
     // can hold a 30-80 MB payload, so larger buffers risk OOM.
@@ -503,13 +505,10 @@ pub(crate) async fn run(
         ));
     }
 
-    let from_block = {
-        let db_guard = db.lock().unwrap_or_else(|e| e.into_inner());
-        db_guard.get_checkpoint() + 1
-    };
+    let initial_checkpoint = accumulator.highest_dispatched_to_block().unwrap_or(0);
+    let from_block = initial_checkpoint + 1;
 
-    let stored_nonce_floor: Option<u64> =
-        accumulator.dispatched.values().filter_map(|d| d.nonce).max().map(|n| n + 1);
+    let stored_nonce_floor: Option<u64> = accumulator.stored_nonce_floor();
     let nonce_allocator = Arc::new(
         NonceAllocator::bootstrap(
             &config.l1_provider,
@@ -520,12 +519,12 @@ pub(crate) async fn run(
         .expect("NonceAllocator bootstrap failed — L1 RPC unreachable at startup"),
     );
 
-    let initial_checkpoint = from_block.saturating_sub(1);
     let target_tip = initial_checkpoint.max(initial_last_batch_end.unwrap_or(0));
     let current_tip = orchestrator_tip.load(Ordering::Relaxed);
     if target_tip > current_tip {
         orchestrator_tip.store(target_tip, Ordering::Relaxed);
     }
+    let _ = initial_last_batch_end;
 
     let shared = Arc::new(OrchestratorShared {
         config,
@@ -536,7 +535,6 @@ pub(crate) async fn run(
         nonce_allocator,
         orchestrator_tip: Arc::clone(&orchestrator_tip),
         pending_key_check: Arc::new(std::sync::Mutex::new(None)),
-        last_batch_end: Arc::new(std::sync::Mutex::new(initial_last_batch_end)),
         high_tx: high_tx.clone(),
         driver: Arc::clone(&driver),
         shutdown: shutdown.clone(),
@@ -571,6 +569,13 @@ pub(crate) async fn run(
         tasks.spawn(async move {
             router(shared, l1_events, result_rx, initial_checkpoint).await;
             "router"
+        });
+    }
+    {
+        let shared = Arc::clone(&shared);
+        tasks.spawn(async move {
+            crate::challenge_resolver::run(shared).await;
+            "challenge_resolver"
         });
     }
 
@@ -669,8 +674,11 @@ impl<P: Provider + Send + Sync> FinalityRpc for P {
     }
 }
 
-/// Pure-RPC half of the finalization check: takes a `dispatched` snapshot
-/// and returns receipt observations without touching accumulator or DB.
+/// Pure-RPC half of the finalization + reorg check: takes a `dispatched`
+/// snapshot and returns receipt observations without touching the
+/// accumulator or DB. Skips rows whose `l1_block == 0` (in-flight
+/// initial broadcast — the dispatcher remains the sole observer until
+/// its first broadcast lands).
 async fn check_finalized_batches_query(
     provider: &dyn FinalityRpc,
     dispatched_snapshot: Vec<(u64, B256, u64)>,
@@ -678,22 +686,15 @@ async fn check_finalized_batches_query(
     let Some(finalized_block) = provider.finalized_block_number().await else {
         return FinalizationDone::NoOp;
     };
-    // Skip the `l1_block == 0` placeholder so the in-flight dispatcher
-    // remains the sole receipt observer until its initial broadcast lands;
-    // otherwise this loop and `finalize_dispatched` would race on the
-    // same row.
-    let candidates: Vec<(u64, B256)> = dispatched_snapshot
-        .into_iter()
-        .filter(|(_, _, l1_block)| *l1_block > 0 && *l1_block <= finalized_block)
-        .map(|(bi, tx_hash, _)| (bi, tx_hash))
-        .collect();
+    let candidates: Vec<(u64, B256, u64)> =
+        dispatched_snapshot.into_iter().filter(|(_, _, l1_block)| *l1_block > 0).collect();
     if candidates.is_empty() {
         return FinalizationDone::NoOp;
     }
     let mut observations = Vec::with_capacity(candidates.len());
-    for (batch_index, tx_hash) in candidates {
+    for (batch_index, tx_hash, l1_block) in candidates {
         let check = match provider.receipt_status(tx_hash).await {
-            Ok(Some((true, _))) => ReceiptCheck::Found,
+            Ok(Some((true, _))) => ReceiptCheck::Found { finalized: l1_block <= finalized_block },
             Ok(Some((false, gas_used))) => {
                 let gas_limit = match provider.tx_gas_limit(tx_hash).await {
                     Ok(Some(g)) => g,
@@ -735,25 +736,9 @@ async fn sign_batch_io(
     from_block: u64,
     to_block: u64,
     responses: Vec<EthExecutionResponse>,
-    db: Arc<Mutex<Db>>,
-    db_tx: mpsc::UnboundedSender<DbCommand>,
     l2_provider: &alloy_provider::RootProvider,
     shutdown: &CancellationToken,
 ) -> SignOutcome {
-    // Check for a cached signature from a previous attempt (survived crash).
-    {
-        let db_check = Arc::clone(&db);
-        let sig = tokio::task::spawn_blocking(move || {
-            db_check.lock().unwrap_or_else(|e| e.into_inner()).get_batch_signature(batch_index)
-        })
-        .await
-        .unwrap_or(None);
-        if let Some(resp) = sig {
-            info!(batch_index, "Batch already signed (cached) — skipping /sign-batch-root");
-            return SignOutcome::Signed { response: resp };
-        }
-    }
-
     info!(batch_index, from_block, to_block, "Signing batch root");
 
     let blobs = {
@@ -793,24 +778,7 @@ async fn sign_batch_io(
             Ok(resp) => {
                 metrics::histogram!(crate::metrics::SIGN_BATCH_ROOT_DURATION)
                     .record(t_start.elapsed().as_secs_f64());
-                // Skip persistence if shutdown is in flight: a concurrent
-                // BatchReverted wipe may have queued WipeForRevert before us,
-                // and persisting after the wipe would leak an orphan
-                // batch_signatures row. On restart we re-sign anyway.
-                if shutdown.is_cancelled() {
-                    warn!(
-                        batch_index,
-                        "Sign succeeded during shutdown — dropping persistence to avoid wipe race"
-                    );
-                    return SignOutcome::TaskFailed;
-                }
-                if db_tx
-                    .send(DbCommand::SaveBatchSignature { batch_index, resp: resp.clone() })
-                    .is_err()
-                {
-                    warn!(batch_index, "save_batch_signature: db writer channel closed");
-                }
-                info!(batch_index, "Batch root signed and persisted");
+                info!(batch_index, "Batch root signed");
                 return SignOutcome::Signed { response: resp };
             }
             Err(SignBatchError::InvalidSignatures { invalid_blocks, enclave_address }) => {
@@ -949,23 +917,6 @@ async fn send_block_request(
     resp.json::<EthExecutionResponse>()
         .await
         .map_err(|e| eyre::eyre!("Failed to parse response: {e}"))
-}
-
-/// `tip <= max_fee` is the EIP-1559 invariant; the third return value is
-/// the `clamped` flag indicating the post-bump fee reached `cap`.
-pub(crate) fn bump_fees(
-    max_fee: u128,
-    tip: u128,
-    bump_percent: u32,
-    cap: u128,
-) -> (u128, u128, bool) {
-    let factor = 100u128 + bump_percent as u128;
-    let new_fee = max_fee.saturating_mul(factor) / 100;
-    let new_tip = tip.saturating_mul(factor) / 100;
-    let clamped = new_fee >= cap;
-    let new_fee = new_fee.min(cap);
-    let new_tip = new_tip.min(new_fee);
-    (new_fee, new_tip, clamped)
 }
 
 // ============================================================================
@@ -1111,8 +1062,12 @@ fn pick_next_dispatch_target(acc: &BatchAccumulator) -> DispatchTarget {
     if let Some((batch_index, signature, resume)) = acc.first_inflight_resume() {
         return DispatchTarget::ResumeInFlight { batch_index, signature, resume };
     }
-    if let Some((batch_index, signature)) = acc.first_sequential_signed() {
-        return DispatchTarget::Fresh { batch_index, signature };
+    if let Some(batch_index) = acc.first_dispatchable() {
+        if let Some(row) = acc.get(batch_index) {
+            if let Some(sig) = &row.signature {
+                return DispatchTarget::Fresh { batch_index, signature: sig.signature.clone() };
+            }
+        }
     }
     DispatchTarget::None
 }
@@ -1175,9 +1130,13 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
             _ = tick.tick() => {}
         }
 
+        // Snapshot current state under one lock acquisition: pick the next
+        // batch eligible to sign (status=Accepted, !enclave_signed, all
+        // responses present) and copy out its responses. Drop the lock
+        // before the HTTP call.
         let pick: Option<(u64, u64, u64, Vec<EthExecutionResponse>)> = {
             let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-            acc.first_ready_unsigned().and_then(|batch_index| {
+            acc.first_accepted_unsigned().and_then(|batch_index| {
                 let batch = acc.get(batch_index)?;
                 let from_block = batch.from_block;
                 let to_block = batch.to_block;
@@ -1196,8 +1155,6 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
             from_block,
             to_block,
             responses,
-            Arc::clone(&shared.db),
-            shared.db_tx.clone(),
             &shared.config.l2_provider,
             &shared.shutdown,
         )
@@ -1206,16 +1163,19 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
         match outcome {
             SignOutcome::Signed { response } => {
                 info!(batch_index, "Batch signed — available for dispatch");
-
-                // After `cache_signature`, future sign attempts for this
-                // batch short-circuit to the cached signature, so the
-                // per-block responses are unreachable — purge them now to
-                // reclaim memory and SQLite rows. `known_responses` stays
-                // populated to dedupe any stale in-flight result.
+                if let Err(e) =
+                    accumulator::record_enclave_signed(&shared.accumulator, batch_index, response)
+                        .await
                 {
+                    error!(batch_index, err = %e, "record_enclave_signed failed");
+                    continue;
+                }
+                // Update gauges + purge per-block responses (memory + queued
+                // SQL DELETE). known_responses stays populated to dedupe any
+                // stale in-flight worker result for this range.
+                let blocks: Option<Vec<u64>> = {
                     let mut acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                    acc.cache_signature(batch_index, response);
-                    let blocks: Option<Vec<u64>> = acc.get(batch_index).map(|batch| {
+                    let blocks = acc.get(batch_index).map(|batch| {
                         metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED).set(batch_index as f64);
                         metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_FROM_BLOCK)
                             .set(batch.from_block as f64);
@@ -1223,25 +1183,32 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
                             .set(batch.to_block as f64);
                         metrics::gauge!(crate::metrics::LAST_BLOCK_SIGNED)
                             .set(batch.to_block as f64);
-                        (batch.from_block..=batch.to_block).collect()
+                        (batch.from_block..=batch.to_block).collect::<Vec<u64>>()
                     });
-                    if let Some(b) = blocks {
-                        acc.purge_responses(&b);
+                    if let Some(ref b) = blocks {
+                        acc.purge_responses(b);
                     }
-                }
+                    blocks
+                };
+                let _ = blocks;
             }
             SignOutcome::InvalidSignatures { invalid_blocks, enclave_address } => {
                 warn!(
                     batch_index,
                     invalid_count = invalid_blocks.len(),
                     %enclave_address,
-                    "Key rotation detected — purging stale responses and re-executing"
+                    "Key rotation detected — invalidating signature and re-executing"
                 );
+
+                if let Err(e) =
+                    accumulator::invalidate_signature(&shared.accumulator, batch_index).await
+                {
+                    error!(batch_index, err = %e, "invalidate_signature failed");
+                }
 
                 {
                     let mut acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
                     acc.purge_responses(&invalid_blocks);
-                    acc.delete_batch_signature(batch_index);
                 }
 
                 {
@@ -1272,7 +1239,6 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
 async fn finalization_worker(shared: Arc<OrchestratorShared>) {
     let mut tick = tokio::time::interval(FINALIZATION_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut missing_receipt_first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -1281,175 +1247,188 @@ async fn finalization_worker(shared: Arc<OrchestratorShared>) {
             _ = tick.tick() => {}
         }
 
-        let snapshot = {
+        let batch_snapshot = {
             let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-            if !acc.has_dispatched() {
-                continue;
-            }
-            acc.dispatched_snapshot()
+            acc.dispatched_for_finalization_check()
         };
+        if !batch_snapshot.is_empty() {
+            let done =
+                check_finalized_batches_query(&shared.config.l1_provider, batch_snapshot).await;
+            apply_finalization_changes(
+                &shared.accumulator,
+                &shared.known_responses,
+                &shared.orchestrator_tip,
+                done,
+            )
+            .await;
+        }
 
-        let done = check_finalized_batches_query(&shared.config.l1_provider, snapshot).await;
-        apply_finalization_changes_v2(
-            &shared.accumulator,
-            &shared.db_tx,
-            &shared.last_batch_end,
-            &shared.known_responses,
-            &shared.orchestrator_tip,
-            done,
-            &mut missing_receipt_first_seen,
-        )
-        .await;
+        // Reorg detection for dispatched challenge rows. The active worker
+        // owns the in-flight RBF lifecycle (dispatched + l1_block IS NULL);
+        // here we only watch rows that have already observed a receipt.
+        let challenge_snapshot: Vec<(i64, B256, u64)> = {
+            let guard = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+            guard.dispatched_challenges_with_l1_block()
+        };
+        if !challenge_snapshot.is_empty() {
+            apply_challenge_reorg_check(
+                &shared.config.l1_provider,
+                &shared.db_tx,
+                challenge_snapshot,
+            )
+            .await;
+        }
     }
     info!("finalization_worker exiting");
 }
 
-/// Startup-only sweep: drives each previously-dispatched batch through one
-/// finalization-check pass, applying receipt observations directly to the
-/// passed-in references. Mirrors the steady-state finalization loop but
-/// runs before `OrchestratorShared` is constructed, so it operates on
-/// pre-shared values (`&mut Option<u64>` for `last_batch_end`, etc.). The
-/// `&mut` on `last_batch_end` is what lets the post-sweep `orchestrator_tip`
-/// seed in `run()` reflect the highest `to_block` finalized here.
-#[allow(clippy::too_many_arguments)]
-async fn run_startup_sweep(
-    accumulator: &mut BatchAccumulator,
-    db_tx: &mpsc::UnboundedSender<DbCommand>,
-    last_batch_end: &mut Option<u64>,
-    known_responses: &KnownResponses,
-    orchestrator_tip: &Arc<AtomicU64>,
+/// For each dispatched challenge row that has previously observed a
+/// receipt: re-check the receipt against L1. A missing receipt indicates
+/// reorg — clear `l1_block` so the active worker re-broadcasts (using
+/// the persisted `sp1_proof_bytes`, no re-prove). A revert indicates the
+/// receipt-watcher missed the failure earlier — clear RBF state and
+/// alert.
+async fn apply_challenge_reorg_check(
     provider: &dyn FinalityRpc,
-    missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
+    db_tx: &mpsc::UnboundedSender<crate::db::DbCommand>,
+    snapshot: Vec<(i64, B256, u64)>,
 ) {
-    if !accumulator.has_dispatched() {
-        return;
-    }
-    info!("Checking dispatched batches from previous run...");
-    let snapshot = accumulator.dispatched_snapshot();
-    let done = check_finalized_batches_query(provider, snapshot).await;
-    let FinalizationDone::Observed { observations } = done else {
-        return;
-    };
-    for (batch_index, tx_hash, check) in observations {
-        match check {
-            ReceiptCheck::Found => {
-                let Some(dispatched) = accumulator.finalize_dispatched(batch_index) else {
-                    continue;
-                };
-                {
-                    let mut w = known_responses.write().unwrap_or_else(|e| e.into_inner());
-                    for b in dispatched.from_block..=dispatched.to_block {
-                        w.remove(&b);
-                    }
-                }
-                let block = dispatched.to_block;
-                if db_tx.send(DbCommand::SaveLastBatchEnd(block)).is_err() {
-                    warn!(block, "save_last_batch_end: db writer channel closed");
-                }
-                *last_batch_end = Some(match *last_batch_end {
-                    Some(prev) => prev.max(block),
-                    None => block,
-                });
-                let current = orchestrator_tip.load(Ordering::Relaxed);
-                if block > current {
-                    orchestrator_tip.store(block, Ordering::Relaxed);
-                }
-                info!(
-                    batch_index,
+    use crate::db::{db_send_sync, ChallengePatch, SyncOp};
+
+    for (challenge_id, tx_hash, recorded_l1_block) in snapshot {
+        match provider.receipt_status(tx_hash).await {
+            Ok(Some((true, _gas_used))) => {}
+            Ok(Some((false, _))) => {
+                metrics::counter!("orchestrator_challenge_reverted_post_mine_total").increment(1);
+                warn!(
+                    challenge_id,
                     %tx_hash,
-                    to_block = dispatched.to_block,
-                    "Startup: batch finalized on L1 — cleaned up"
+                    recorded_l1_block,
+                    "challenge tx receipt status=0 post-mine — clearing RBF state for retry"
                 );
-            }
-            ReceiptCheck::Reverted { kind } => {
-                if accumulator.dispatched_tx_hash(batch_index) == Some(tx_hash) {
-                    metrics::counter!(
-                        crate::metrics::L1_DISPATCH_REJECTED_TOTAL,
-                        "kind" => crate::metrics::revert_kind_label(kind),
-                    )
-                    .increment(1);
-                    error!(
-                        batch_index,
-                        %tx_hash,
-                        ?kind,
-                        "Startup: undispatching reverted batch"
-                    );
-                    accumulator.undispatch(batch_index);
+                let patch = ChallengePatch {
+                    tx_hash: Some(None),
+                    nonce: Some(None),
+                    max_fee_per_gas: Some(None),
+                    max_priority_fee_per_gas: Some(None),
+                    l1_block: Some(None),
+                    ..Default::default()
+                };
+                if let Err(e) =
+                    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+                {
+                    error!(challenge_id, err = %e, "patch_challenge (reverted post-mine) failed");
                 }
             }
-            ReceiptCheck::Missing => {
-                missing_receipt_first_seen
-                    .entry(batch_index)
-                    .or_insert(tokio::time::Instant::now());
+            Ok(None) => {
+                metrics::counter!("orchestrator_challenge_reorg_detected_total").increment(1);
+                warn!(
+                    challenge_id,
+                    %tx_hash,
+                    recorded_l1_block,
+                    "challenge tx receipt missing — suspecting reorg, clearing l1_block"
+                );
+                let patch = ChallengePatch { l1_block: Some(None), ..Default::default() };
+                if let Err(e) =
+                    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+                {
+                    error!(challenge_id, err = %e, "patch_challenge (reorg) failed");
+                }
             }
-            ReceiptCheck::CheckFailed => {}
+            Err(e) => warn!(challenge_id, %tx_hash, err = %e, "challenge receipt check failed"),
         }
     }
 }
 
-/// Takes shared fields by reference rather than `&OrchestratorShared` so
-/// the unit tests can drive it without building a full shared state.
-#[allow(clippy::too_many_arguments)]
-async fn apply_finalization_changes_v2(
-    accumulator: &std::sync::Mutex<BatchAccumulator>,
-    db_tx: &mpsc::UnboundedSender<DbCommand>,
-    last_batch_end: &std::sync::Mutex<Option<u64>>,
+/// Startup-only sweep: drives each `Preconfirmed` row through one
+/// finalization-check pass before workers spawn. `Sent` rows are left for
+/// the dispatcher's resume path (`first_inflight_resume`).
+async fn run_startup_sweep(
+    accumulator: &BatchAccumulator,
+    _db_tx: &mpsc::UnboundedSender<DbCommand>,
+    last_batch_end: &mut Option<u64>,
+    orchestrator_tip: &Arc<AtomicU64>,
+    provider: &dyn FinalityRpc,
+) {
+    let snapshot = accumulator.dispatched_for_finalization_check();
+    if snapshot.is_empty() {
+        return;
+    }
+    info!(rows = snapshot.len(), "Startup: sweeping preconfirmed rows for finality");
+    // We can't call `record_finalized` here because the accumulator is not
+    // yet wrapped in the shared Mutex. Instead, after the sweep completes,
+    // the steady-state finalization_worker will pick these up on its first
+    // tick. We DO advance orchestrator_tip and last_batch_end so the driver
+    // bootstrap reflects the post-sweep watermark immediately.
+    let done = check_finalized_batches_query(provider, snapshot).await;
+    let FinalizationDone::Observed { observations } = done else { return };
+    for (batch_index, tx_hash, check) in observations {
+        if !matches!(check, ReceiptCheck::Found { finalized: true }) {
+            continue;
+        }
+        let Some(row) = accumulator.get(batch_index) else { continue };
+        let block = row.to_block;
+        *last_batch_end = Some(match *last_batch_end {
+            Some(prev) => prev.max(block),
+            None => block,
+        });
+        let current = orchestrator_tip.load(Ordering::Relaxed);
+        if block > current {
+            orchestrator_tip.store(block, Ordering::Relaxed);
+        }
+        info!(
+            batch_index,
+            %tx_hash,
+            to_block = block,
+            "Startup: batch already finalized on L1"
+        );
+    }
+}
+
+async fn apply_finalization_changes(
+    accumulator: &Arc<std::sync::Mutex<BatchAccumulator>>,
     known_responses: &KnownResponses,
     orchestrator_tip: &Arc<AtomicU64>,
     done: FinalizationDone,
-    missing_receipt_first_seen: &mut HashMap<u64, tokio::time::Instant>,
 ) {
     let FinalizationDone::Observed { observations } = done else {
         return;
     };
     for (batch_index, tx_hash, check) in observations {
         match check {
-            ReceiptCheck::Found => {
-                missing_receipt_first_seen.remove(&batch_index);
-                let finalized = {
-                    let mut acc = accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                    acc.finalize_dispatched(batch_index)
+            ReceiptCheck::Found { finalized: true } => {
+                let range = {
+                    let acc = accumulator.lock().unwrap_or_else(|e| e.into_inner());
+                    acc.get(batch_index).map(|b| (b.from_block, b.to_block))
                 };
-                let Some(dispatched) = finalized else {
+                if let Err(e) = accumulator::record_finalized(accumulator, batch_index).await {
+                    error!(batch_index, err = %e, "record_finalized failed");
                     continue;
-                };
+                }
+                let Some((from_block, to_block)) = range else { continue };
                 {
                     let mut w = known_responses.write().unwrap_or_else(|e| e.into_inner());
-                    for b in dispatched.from_block..=dispatched.to_block {
+                    for b in from_block..=to_block {
                         w.remove(&b);
                     }
                 }
-                {
-                    let block = dispatched.to_block;
-                    if db_tx.send(DbCommand::SaveLastBatchEnd(block)).is_err() {
-                        warn!(block, "save_last_batch_end: db writer channel closed");
-                    }
-                    let mut lbe = last_batch_end.lock().unwrap_or_else(|e| e.into_inner());
-                    *lbe = Some(match *lbe {
-                        Some(prev) => prev.max(block),
-                        None => block,
-                    });
-                    // Monotonic to keep a late checkpoint update from
-                    // rolling the tip backwards.
-                    let current = orchestrator_tip.load(Ordering::Relaxed);
-                    if block > current {
-                        orchestrator_tip.store(block, Ordering::Relaxed);
-                    }
+                let current = orchestrator_tip.load(Ordering::Relaxed);
+                if to_block > current {
+                    orchestrator_tip.store(to_block, Ordering::Relaxed);
                 }
-                info!(
-                    batch_index,
-                    %tx_hash,
-                    to_block = dispatched.to_block,
-                    "Batch finalized on L1 — cleaned up"
-                );
+                info!(batch_index, %tx_hash, to_block, "Batch finalized on L1");
+            }
+            ReceiptCheck::Found { finalized: false } => {
+                // Receipt is observable but the L1 block is still in the
+                // unfinalized window. No-op — wait for the next tick to
+                // re-check finality.
             }
             ReceiptCheck::Reverted { kind } => {
-                missing_receipt_first_seen.remove(&batch_index);
-                // Skip if the snapshot's `tx_hash` is no longer current —
-                // the dispatcher worker has already started a fresh
-                // dispatch which will be observed on its own merits.
-                let mut acc = accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                if acc.dispatched_tx_hash(batch_index) != Some(tx_hash) {
+                let still_ours = {
+                    let acc = accumulator.lock().unwrap_or_else(|e| e.into_inner());
+                    acc.dispatched_tx_hash(batch_index) == Some(tx_hash)
+                };
+                if !still_ours {
                     info!(
                         batch_index,
                         observed = %tx_hash,
@@ -1465,35 +1444,41 @@ async fn apply_finalization_changes_v2(
                         batch_index,
                         %tx_hash,
                         ?kind,
-                        "Finalization-ticker undispatching reverted batch"
+                        "Finalization-ticker rolling back reverted batch"
                     );
-                    acc.undispatch(batch_index);
+                    if let Err(e) =
+                        accumulator::rollback_to_accepted(accumulator, batch_index).await
+                    {
+                        error!(batch_index, err = %e, "rollback_to_accepted failed");
+                    }
                 }
             }
             ReceiptCheck::Missing => {
-                let now = tokio::time::Instant::now();
-                let first = *missing_receipt_first_seen.entry(batch_index).or_insert(now);
-                let elapsed = now.duration_since(first);
+                // Reorg recovery: the L1 event was observed
+                // (status=Preconfirmed + l1_block set) but the receipt is
+                // gone. Roll status back to `Sent` + clear l1_block so
+                // the dispatcher's `first_inflight_resume` resumes RBF
+                // against the persisted nonce.
+                let still_ours = {
+                    let acc = accumulator.lock().unwrap_or_else(|e| e.into_inner());
+                    acc.dispatched_tx_hash(batch_index) == Some(tx_hash)
+                };
+                if !still_ours {
+                    info!(
+                        batch_index,
+                        observed = %tx_hash,
+                        "Stale Missing observation: dispatched tx_hash changed — skip"
+                    );
+                    continue;
+                }
+                metrics::counter!("orchestrator_batch_reorg_detected_total").increment(1);
                 warn!(
                     batch_index,
                     %tx_hash,
-                    elapsed_secs = elapsed.as_secs(),
-                    "Receipt missing after finalization"
+                    "Batch tx receipt missing — suspecting reorg, rolling back to Sent"
                 );
-                // The dispatcher owns the broadcast lifecycle. Forcing
-                // an undispatch here would collide on the nonce it is
-                // still bumping against; the dispatcher will either land
-                // the tx or bail via STUCK_AT_CAP_TIMEOUT.
-                if elapsed >= RECEIPT_MISSING_WINDOW {
-                    warn!(
-                        batch_index,
-                        %tx_hash,
-                        elapsed_secs = elapsed.as_secs(),
-                        "Receipt still missing beyond window — dispatcher owns recovery; \
-                         inspect dispatcher logs for batch"
-                    );
-                    // Reset the window so this logs at most once per cycle.
-                    missing_receipt_first_seen.insert(batch_index, now);
+                if let Err(e) = accumulator::record_reorg_to_sent(accumulator, batch_index).await {
+                    error!(batch_index, err = %e, "record_reorg_to_sent failed");
                 }
             }
             ReceiptCheck::CheckFailed => {}
@@ -1530,26 +1515,38 @@ async fn router(
 async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
     match event {
         L1Event::BatchCommitted { batch_index, from, to } => {
-            let mut acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-            acc.set_batch(batch_index, from, to);
+            if let Err(e) =
+                accumulator::observe_committed(&shared.accumulator, batch_index, from, to).await
+            {
+                error!(batch_index, err = %e, "observe_committed failed");
+            }
         }
         L1Event::BatchSubmitted { batch_index } => {
-            let mut acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-            acc.mark_batch_submitted(batch_index);
+            if let Err(e) = accumulator::observe_submitted(&shared.accumulator, batch_index).await {
+                error!(batch_index, err = %e, "observe_submitted failed");
+            }
         }
         L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block } => {
-            // External `BatchPreconfirmed`: if the batch is still in
-            // `batches` (we hadn't dispatched yet), `mark_dispatched_external`
-            // moves it to `dispatched` with `nonce = None`, which
-            // `pick_next_dispatch_target` will skip. If we ARE mid-dispatch
-            // (the row is already in `dispatched`), the call returns early
-            // and the bump loop observes its own receipt via
-            // `poll_for_terminal` — cancelling here would race that
-            // observation and leak the loop's allocated nonce.
+            // The accumulator decides "external" vs "ours" by the row's
+            // current status. If we owned the broadcast (status=Sent),
+            // status flips to Preconfirmed and l1_block is overwritten with
+            // the event-authoritative value. If we never broadcast
+            // (status<=Accepted), the row is marked as external takeover
+            // (nonce/fees cleared, tx_hash from the event).
+            if let Err(e) = accumulator::observe_preconfirmed(
+                &shared.accumulator,
+                batch_index,
+                tx_hash,
+                l1_block,
+            )
+            .await
             {
-                let mut acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
-                acc.mark_dispatched_external(batch_index, tx_hash, l1_block);
-                if let Some(batch) = acc.dispatched.get(&batch_index) {
+                error!(batch_index, err = %e, "observe_preconfirmed failed");
+                return;
+            }
+            {
+                let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(batch) = acc.get(batch_index) {
                     crate::metrics::set_last_batch_dispatched(
                         batch_index,
                         batch.from_block,
@@ -1557,15 +1554,9 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
                     );
                 }
             }
-            info!(
-                batch_index,
-                %tx_hash,
-                l1_block,
-                "BatchPreconfirmed — marked dispatched via L1 event"
-            );
         }
         L1Event::Checkpoint(l1_block) => {
-            if shared.db_tx.send(DbCommand::SaveL1Checkpoint(l1_block)).is_err() {
+            if shared.db_tx.send(DbCommand::Async(AsyncOp::SaveL1Checkpoint(l1_block))).is_err() {
                 warn!(l1_block, "save_l1_checkpoint: db writer channel closed");
             }
         }
@@ -1574,14 +1565,61 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
             // supervisor's restart can re-resolve the L2 checkpoint from
             // the reverted batch via `resolve_l2_start_checkpoint`.
             info!(from_batch_index, l1_block, "BatchReverted — wiping DB and scheduling restart");
-            if shared
-                .db_tx
-                .send(DbCommand::WipeForRevert { start_batch_id: from_batch_index, l1_block })
-                .is_err()
+            if let Err(e) = db_send_sync(
+                &shared.db_tx,
+                SyncOp::WipeForRevert { start_batch_id: from_batch_index, l1_block },
+            )
+            .await
             {
-                error!(from_batch_index, l1_block, "wipe_for_revert: db writer channel closed");
+                error!(from_batch_index, l1_block, err = %e, "wipe_for_revert failed");
             }
             shared.shutdown.cancel();
+        }
+        L1Event::BlockChallenged { batch_index, commitment } => {
+            if let Err(e) = crate::challenge_db::observe_block_challenged(
+                &shared.db_tx,
+                &shared.config.l1_provider,
+                shared.config.l1_rollup_addr,
+                batch_index,
+                commitment,
+            )
+            .await
+            {
+                warn!(batch_index, %commitment, err = %e, "observe_block_challenged failed");
+            }
+        }
+        L1Event::BatchRootChallenged { batch_index } => {
+            if let Err(e) =
+                crate::challenge_db::observe_batch_root_challenged(&shared.db_tx, batch_index).await
+            {
+                warn!(batch_index, err = %e, "observe_batch_root_challenged failed");
+            }
+        }
+        L1Event::ChallengeResolved { batch_index, commitment } => {
+            if let Err(e) = crate::challenge_db::observe_resolved(
+                &shared.db,
+                &shared.db_tx,
+                crate::db::ChallengeKind::Block,
+                batch_index,
+                Some(commitment),
+            )
+            .await
+            {
+                warn!(batch_index, %commitment, err = %e, "observe_resolved (block) failed");
+            }
+        }
+        L1Event::BatchRootChallengeResolved { batch_index } => {
+            if let Err(e) = crate::challenge_db::observe_resolved(
+                &shared.db,
+                &shared.db_tx,
+                crate::db::ChallengeKind::BatchRoot,
+                batch_index,
+                None,
+            )
+            .await
+            {
+                warn!(batch_index, err = %e, "observe_resolved (batch_root) failed");
+            }
         }
     }
 }
@@ -1598,9 +1636,11 @@ async fn handle_block_result(
         return;
     }
 
+    // Drop late results that fall at or below the highest finalized batch's
+    // to_block. Derived from the accumulator (no separate scalar).
     {
-        let lbe = *shared.last_batch_end.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(lbe) = lbe {
+        let acc = shared.accumulator.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lbe) = acc.highest_finalized_to_block() {
             if block_number <= lbe {
                 warn!(
                     block_number,
@@ -1628,176 +1668,17 @@ async fn handle_block_result(
         confirmed.remove(checkpoint);
     }
     let cp = *checkpoint;
-    if shared.db_tx.send(DbCommand::SaveCheckpoint(cp)).is_err() {
-        warn!(cp, "save_checkpoint: db writer channel closed");
-    }
     shared.orchestrator_tip.store(cp, Ordering::Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{accumulator::BatchAccumulator, db::Db};
-    use std::{
-        collections::HashMap,
-        sync::{
-            atomic::{AtomicU64, Ordering},
-            Mutex as StdMutex,
-        },
-    };
-
-    fn temp_db() -> Arc<StdMutex<Db>> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("client_test_{id}_{}.db", std::process::id()));
-        let db = Db::open(&path).unwrap();
-        Arc::new(StdMutex::new(db))
-    }
-
-    /// Hand-rolled stub implementing the RPC methods
-    /// [`check_finalized_batches_query`] actually touches.
-    struct StubFinality {
-        finalized: Option<u64>,
-        receipt_statuses: HashMap<B256, Result<Option<(bool, u64)>, String>>,
-        tx_gas_limits: HashMap<B256, Result<Option<u64>, String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl FinalityRpc for StubFinality {
-        async fn finalized_block_number(&self) -> Option<u64> {
-            self.finalized
-        }
-        async fn receipt_status(&self, tx_hash: B256) -> Result<Option<(bool, u64)>, String> {
-            self.receipt_statuses.get(&tx_hash).cloned().unwrap_or(Ok(None))
-        }
-        async fn tx_gas_limit(&self, tx_hash: B256) -> Result<Option<u64>, String> {
-            self.tx_gas_limits.get(&tx_hash).cloned().unwrap_or(Ok(None))
-        }
-    }
-
-    fn register_dispatched(
-        acc: &mut BatchAccumulator,
-        batch_index: u64,
-        from_block: u64,
-        to_block: u64,
-        tx_hash: B256,
-        l1_block: u64,
-    ) {
-        acc.set_batch(batch_index, from_block, to_block);
-        acc.mark_dispatched(batch_index, tx_hash, l1_block, 0, 0, 0);
-    }
-
-    struct FinalizationFixture {
-        accumulator: Arc<std::sync::Mutex<BatchAccumulator>>,
-        db_tx: mpsc::UnboundedSender<DbCommand>,
-        last_batch_end: Arc<std::sync::Mutex<Option<u64>>>,
-        known_responses: KnownResponses,
-        tip: Arc<AtomicU64>,
-        first_seen: HashMap<u64, tokio::time::Instant>,
-    }
-
-    impl FinalizationFixture {
-        fn new() -> (Self, mpsc::UnboundedReceiver<DbCommand>) {
-            let db = temp_db();
-            let (db_tx, db_rx) = mpsc::unbounded_channel();
-            let acc = BatchAccumulator::with_db(Arc::clone(&db), db_tx.clone());
-            (
-                Self {
-                    accumulator: Arc::new(std::sync::Mutex::new(acc)),
-                    db_tx,
-                    last_batch_end: Arc::new(std::sync::Mutex::new(None)),
-                    known_responses: Arc::new(RwLock::new(HashSet::new())),
-                    tip: Arc::new(AtomicU64::new(0)),
-                    first_seen: HashMap::new(),
-                },
-                db_rx,
-            )
-        }
-
-        async fn run_once(&mut self, provider: &dyn FinalityRpc) {
-            let snapshot = {
-                let acc = self.accumulator.lock().unwrap();
-                if !acc.has_dispatched() {
-                    return;
-                }
-                acc.dispatched_snapshot()
-            };
-            let done = check_finalized_batches_query(provider, snapshot).await;
-            apply_finalization_changes_v2(
-                &self.accumulator,
-                &self.db_tx,
-                &self.last_batch_end,
-                &self.known_responses,
-                &self.tip,
-                done,
-                &mut self.first_seen,
-            )
-            .await;
-        }
-    }
-
-    /// The finalization path must not undispatch from the missing-receipt
-    /// window — that would collide with the dispatcher on the same nonce.
-    #[tokio::test(start_paused = true)]
-    async fn receipt_missing_window_logs_only() {
-        let (mut fx, _db_rx) = FinalizationFixture::new();
-        let tx_hash = B256::repeat_byte(0xAA);
-        register_dispatched(&mut fx.accumulator.lock().unwrap(), 1, 100, 110, tx_hash, 500);
-
-        let provider = StubFinality {
-            finalized: Some(1000),
-            receipt_statuses: HashMap::new(),
-            tx_gas_limits: HashMap::new(),
-        };
-
-        fx.run_once(&provider).await;
-        assert!(fx.accumulator.lock().unwrap().has_dispatched(), "batch must remain dispatched");
-        assert!(fx.first_seen.contains_key(&1));
-
-        tokio::time::advance(RECEIPT_MISSING_WINDOW + Duration::from_secs(1)).await;
-        fx.run_once(&provider).await;
-        assert!(
-            fx.accumulator.lock().unwrap().has_dispatched(),
-            "batch must remain dispatched after window"
-        );
-        assert!(fx.first_seen.contains_key(&1), "timer is reset but entry stays");
-    }
-
-    /// One `Ok(None)` on an early candidate must not abort the tick —
-    /// later candidates with real receipts must still be finalized.
-    #[tokio::test(start_paused = true)]
-    async fn finalization_no_break_after_transient_none() {
-        let (mut fx, _db_rx) = FinalizationFixture::new();
-        let tx_a = B256::repeat_byte(0x01);
-        let tx_b = B256::repeat_byte(0x02);
-        {
-            let mut acc = fx.accumulator.lock().unwrap();
-            register_dispatched(&mut acc, 1, 100, 110, tx_a, 500);
-            register_dispatched(&mut acc, 2, 111, 120, tx_b, 501);
-        }
-
-        let mut receipt_statuses = HashMap::new();
-        receipt_statuses.insert(tx_a, Ok(None));
-        receipt_statuses.insert(tx_b, Ok(Some((true, 50_000u64))));
-
-        let provider =
-            StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits: HashMap::new() };
-
-        fx.run_once(&provider).await;
-
-        assert!(fx.first_seen.contains_key(&1), "batch 1 first_seen recorded");
-        let acc = fx.accumulator.lock().unwrap();
-        assert!(acc.has_dispatched(), "batch 1 remains dispatched (transient None)");
-        assert!(
-            !acc.dispatched.contains_key(&2),
-            "batch 2 must be removed from dispatched after finalization"
-        );
-    }
+    use crate::rbf::bump_fees;
 
     #[test]
     fn classify_revert_above_95pct_is_oog() {
         assert_eq!(classify_revert(95_000, 100_000), RevertKind::Oog);
-        // Real on-chain numbers from batch 553 failed tx 0xc09798…cbbd.
         assert_eq!(classify_revert(85_591, 86_476), RevertKind::Oog);
     }
 
@@ -1811,87 +1692,6 @@ mod tests {
     #[test]
     fn classify_revert_zero_limit_is_logic() {
         assert_eq!(classify_revert(0, 0), RevertKind::Logic);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn finalization_ticker_oog_revert_undispatches() {
-        let (mut fx, _db_rx) = FinalizationFixture::new();
-        let tx_hash = B256::repeat_byte(0xCC);
-        register_dispatched(&mut fx.accumulator.lock().unwrap(), 1, 100, 110, tx_hash, 500);
-
-        let mut receipt_statuses = HashMap::new();
-        receipt_statuses.insert(tx_hash, Ok(Some((false, 95_000u64))));
-        let mut tx_gas_limits = HashMap::new();
-        tx_gas_limits.insert(tx_hash, Ok(Some(100_000u64)));
-        let provider = StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits };
-
-        fx.run_once(&provider).await;
-
-        let acc = fx.accumulator.lock().unwrap();
-        assert!(!acc.has_dispatched(), "batch must be undispatched");
-        assert!(acc.get(1).is_some(), "batch must be back in pending after undispatch");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn finalization_ticker_logic_revert_undispatches() {
-        let (mut fx, _db_rx) = FinalizationFixture::new();
-        let tx_hash = B256::repeat_byte(0xDD);
-        register_dispatched(&mut fx.accumulator.lock().unwrap(), 1, 100, 110, tx_hash, 500);
-
-        let mut receipt_statuses = HashMap::new();
-        receipt_statuses.insert(tx_hash, Ok(Some((false, 50_000u64))));
-        let mut tx_gas_limits = HashMap::new();
-        tx_gas_limits.insert(tx_hash, Ok(Some(100_000u64)));
-        let provider = StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits };
-
-        fx.run_once(&provider).await;
-
-        assert!(!fx.accumulator.lock().unwrap().has_dispatched(), "batch must be undispatched");
-    }
-
-    /// Stale ticker observation (snapshot tx_hash differs from current
-    /// dispatched tx_hash) MUST NOT undispatch the live dispatch.
-    #[tokio::test(start_paused = true)]
-    async fn finalization_ticker_skips_stale_tx_hash() {
-        let (mut fx, _db_rx) = FinalizationFixture::new();
-        let stale_hash = B256::repeat_byte(0xAA);
-        let live_hash = B256::repeat_byte(0xBB);
-
-        // Register dispatch with stale_hash, then re-mark with live_hash via
-        // record_rbf_bump so accumulator's dispatched.tx_hash = live_hash.
-        {
-            let mut acc = fx.accumulator.lock().unwrap();
-            register_dispatched(&mut acc, 1, 100, 110, stale_hash, 500);
-            acc.record_rbf_bump(1, live_hash, 0, 0);
-        }
-
-        // Provider returns reverted for stale_hash (the snapshot value).
-        let mut receipt_statuses = HashMap::new();
-        receipt_statuses.insert(stale_hash, Ok(Some((false, 95_000u64))));
-        let mut tx_gas_limits = HashMap::new();
-        tx_gas_limits.insert(stale_hash, Ok(Some(100_000u64)));
-        let provider = StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits };
-
-        // Build the stale snapshot directly so the test can assert the
-        // skip path that production hits when the snapshot's `tx_hash`
-        // diverges from the live dispatched row.
-        let stale_snapshot = vec![(1u64, stale_hash, 500u64)];
-        let done = check_finalized_batches_query(&provider, stale_snapshot).await;
-        apply_finalization_changes_v2(
-            &fx.accumulator,
-            &fx.db_tx,
-            &fx.last_batch_end,
-            &fx.known_responses,
-            &fx.tip,
-            done,
-            &mut fx.first_seen,
-        )
-        .await;
-
-        assert!(
-            fx.accumulator.lock().unwrap().has_dispatched(),
-            "live dispatch must remain untouched"
-        );
     }
 
     #[test]
@@ -1926,202 +1726,5 @@ mod tests {
         let (fee_out, tip_out, _) = bump_fees(max_fee, tip, 20, u128::MAX);
         assert!(fee_out >= max_fee * 1125 / 1000);
         assert!(tip_out >= tip * 1125 / 1000);
-    }
-
-    /// Sweep finalizes a row whose `to_block` is ahead of the pre-sweep
-    /// `last_batch_end`. Both `last_batch_end` and `orchestrator_tip` must
-    /// reflect the post-sweep value — otherwise downstream block-result
-    /// gating uses a stale watermark and the driver's lookahead is wrong.
-    #[tokio::test(start_paused = true)]
-    async fn startup_sweep_advances_last_batch_end_and_tip() {
-        let db = temp_db();
-        let (db_tx, _db_rx) = mpsc::unbounded_channel();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db), db_tx.clone());
-
-        let tx_hash = B256::repeat_byte(0xAA);
-        register_dispatched(&mut acc, 1, 100, 200, tx_hash, 500);
-
-        let mut receipt_statuses = HashMap::new();
-        receipt_statuses.insert(tx_hash, Ok(Some((true, 50_000u64))));
-        let provider =
-            StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits: HashMap::new() };
-
-        let mut last_batch_end: Option<u64> = Some(50);
-        let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
-        let tip = Arc::new(AtomicU64::new(0));
-        let mut first_seen: HashMap<u64, tokio::time::Instant> = HashMap::new();
-
-        run_startup_sweep(
-            &mut acc,
-            &db_tx,
-            &mut last_batch_end,
-            &known_responses,
-            &tip,
-            &provider,
-            &mut first_seen,
-        )
-        .await;
-
-        assert_eq!(last_batch_end, Some(200), "last_batch_end advances to finalized to_block");
-        assert_eq!(
-            tip.load(Ordering::Relaxed),
-            200,
-            "orchestrator_tip advances to finalized to_block"
-        );
-        assert!(!acc.has_dispatched(), "row removed after finalize");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn startup_sweep_takes_max_when_multiple_finalize() {
-        let db = temp_db();
-        let (db_tx, _db_rx) = mpsc::unbounded_channel();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db), db_tx.clone());
-
-        let tx_a = B256::repeat_byte(0x01);
-        let tx_b = B256::repeat_byte(0x02);
-        register_dispatched(&mut acc, 1, 100, 150, tx_a, 500);
-        register_dispatched(&mut acc, 2, 151, 250, tx_b, 600);
-
-        let mut receipt_statuses = HashMap::new();
-        receipt_statuses.insert(tx_a, Ok(Some((true, 50_000u64))));
-        receipt_statuses.insert(tx_b, Ok(Some((true, 50_000u64))));
-        let provider =
-            StubFinality { finalized: Some(1000), receipt_statuses, tx_gas_limits: HashMap::new() };
-
-        let mut last_batch_end: Option<u64> = None;
-        let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
-        let tip = Arc::new(AtomicU64::new(0));
-        let mut first_seen = HashMap::new();
-
-        run_startup_sweep(
-            &mut acc,
-            &db_tx,
-            &mut last_batch_end,
-            &known_responses,
-            &tip,
-            &provider,
-            &mut first_seen,
-        )
-        .await;
-
-        assert_eq!(
-            last_batch_end,
-            Some(250),
-            "last_batch_end is the max to_block across finalized rows"
-        );
-        assert_eq!(tip.load(Ordering::Relaxed), 250);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn startup_sweep_no_op_when_no_dispatched() {
-        let db = temp_db();
-        let (db_tx, _db_rx) = mpsc::unbounded_channel();
-        let mut acc = BatchAccumulator::with_db(Arc::clone(&db), db_tx.clone());
-
-        let provider = StubFinality {
-            finalized: Some(1000),
-            receipt_statuses: HashMap::new(),
-            tx_gas_limits: HashMap::new(),
-        };
-
-        let mut last_batch_end: Option<u64> = Some(42);
-        let known_responses: KnownResponses = Arc::new(RwLock::new(HashSet::new()));
-        let tip = Arc::new(AtomicU64::new(7));
-        let mut first_seen = HashMap::new();
-
-        run_startup_sweep(
-            &mut acc,
-            &db_tx,
-            &mut last_batch_end,
-            &known_responses,
-            &tip,
-            &provider,
-            &mut first_seen,
-        )
-        .await;
-
-        assert_eq!(last_batch_end, Some(42), "untouched");
-        assert_eq!(tip.load(Ordering::Relaxed), 7, "untouched");
-    }
-
-    fn make_response(block_number: u64) -> crate::types::EthExecutionResponse {
-        crate::types::EthExecutionResponse {
-            block_number,
-            leaf: [0u8; 32],
-            block_hash: B256::ZERO,
-            signature: [0u8; 64],
-        }
-    }
-
-    fn make_signature(byte: u8) -> crate::types::SubmitBatchResponse {
-        crate::types::SubmitBatchResponse {
-            batch_root: vec![0u8; 32],
-            versioned_hashes: vec![],
-            signature: vec![byte],
-        }
-    }
-
-    /// A mid-RBF row (`l1_block == 0`) must be picked as resume even when
-    /// a fresh signed batch is also ready.
-    #[test]
-    fn pick_next_dispatch_target_prefers_inflight_resume() {
-        let mut acc = BatchAccumulator::new();
-
-        // Batch 1: mid-RBF row from a prior lifetime.
-        acc.set_batch(1, 10, 11);
-        acc.insert_response(make_response(10));
-        acc.insert_response(make_response(11));
-        acc.mark_batch_submitted(1);
-        acc.cache_signature(1, make_signature(0xAA));
-        acc.mark_dispatched(1, B256::from([0xAA; 32]), 0, 5, 1_000, 100);
-
-        // Batch 2: signed and ready, but resume must win.
-        acc.set_batch(2, 12, 13);
-        acc.insert_response(make_response(12));
-        acc.insert_response(make_response(13));
-        acc.mark_batch_submitted(2);
-        acc.cache_signature(2, make_signature(0xBB));
-
-        match pick_next_dispatch_target(&acc) {
-            DispatchTarget::ResumeInFlight { batch_index, .. } => assert_eq!(batch_index, 1),
-            other => panic!("expected ResumeInFlight, got {other:?}"),
-        }
-    }
-
-    /// With no mid-RBF row, the picker falls through to the next fresh
-    /// signed batch.
-    #[test]
-    fn pick_next_dispatch_target_falls_through_to_fresh() {
-        let mut acc = BatchAccumulator::new();
-
-        // Batch 1: already preconfirmed (real l1_block) — finalization
-        // worker's territory, not a resume candidate.
-        acc.set_batch(1, 10, 11);
-        acc.insert_response(make_response(10));
-        acc.insert_response(make_response(11));
-        acc.mark_batch_submitted(1);
-        acc.cache_signature(1, make_signature(0xAA));
-        acc.mark_dispatched(1, B256::from([0xAA; 32]), 100, 5, 1_000, 100);
-
-        // Batch 2: ready and signed; should be picked as Fresh.
-        acc.set_batch(2, 12, 13);
-        acc.insert_response(make_response(12));
-        acc.insert_response(make_response(13));
-        acc.mark_batch_submitted(2);
-        acc.cache_signature(2, make_signature(0xBB));
-
-        match pick_next_dispatch_target(&acc) {
-            DispatchTarget::Fresh { batch_index, .. } => assert_eq!(batch_index, 2),
-            other => panic!("expected Fresh, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pick_next_dispatch_target_none_when_idle() {
-        let acc = BatchAccumulator::new();
-        match pick_next_dispatch_target(&acc) {
-            DispatchTarget::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
     }
 }

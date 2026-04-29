@@ -217,7 +217,7 @@ mod tests {
         alloy_rlp::Header { list: true, payload_length: b1_payload }.encode(&mut payload);
         payload.extend_from_slice(&h1_rlp);
         alloy_rlp::Header { list: true, payload_length: 0 }.encode(&mut payload); // empty txs
-        // Block 2
+                                                                                  // Block 2
         alloy_rlp::Header { list: true, payload_length: b2_payload }.encode(&mut payload);
         payload.extend_from_slice(&h2_rlp);
         alloy_rlp::Header { list: true, payload_length: 0 }.encode(&mut payload); // empty txs
@@ -265,8 +265,7 @@ mod tests {
         let mut compressed = Vec::new();
         {
             use std::io::Write;
-            let mut enc =
-                brotli::enc::writer::CompressorWriter::new(&mut compressed, 4096, 6, 22);
+            let mut enc = brotli::enc::writer::CompressorWriter::new(&mut compressed, 4096, 6, 22);
             enc.write_all(&data).unwrap();
         }
         // Canonicalize: version byte + compressed

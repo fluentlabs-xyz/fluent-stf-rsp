@@ -134,6 +134,27 @@ sol! {
         uint24 challengeWindowSnapshot;
         uint24 finalizationDelaySnapshot;
         uint24 numberOfBlocks;
+        bytes32 toBlockHash;
+    }
+
+    /// Mirrors `struct L2BlockHeader` in `IRollupTypes.sol`. Field order
+    /// is consensus-critical — `_computeCommitment` keccaks the four
+    /// `bytes32` fields in struct-declaration order. `depositCount` is
+    /// in the struct but NOT part of the commitment hash.
+    struct L2BlockHeader {
+        bytes32 previousBlockHash;
+        bytes32 blockHash;
+        bytes32 withdrawalRoot;
+        bytes32 depositRoot;
+        uint16 depositCount;
+    }
+
+    /// Mirrors `MerkleTree.MerkleProof` in `MerkleTree.sol`. `nonce` is
+    /// the leaf index; `proof` is a packed sequence of 32-byte sibling
+    /// hashes from leaf to root.
+    struct MerkleProof {
+        uint256 nonce;
+        bytes proof;
     }
 
     // ============ Functions ============
@@ -151,6 +172,40 @@ sol! {
     /// avoiding a deterministic revert loop when dispatch retries a batch
     /// whose state moved past `Submitted` while the orchestrator was down.
     function getBatch(uint256 batchIndex) external view returns (BatchRecord memory);
+
+    /// View of `_blockChallenges[commitment]`. Mirrors the contract's
+    /// `ChallengeRecord` storage layout: challenger, deposit, deadline
+    /// (L1 block number), resolution flag, and the batch status that was
+    /// active when the challenge was opened. Field types are best-effort
+    /// and must match the deployed Rollup contract.
+    function blockChallenges(bytes32 commitment) external view returns (
+        address challenger,
+        uint96  deposit,
+        uint64  deadline,
+        bool    isResolved,
+        uint8   previousStatus
+    );
+
+    /// Resolve a single-block dispute with an SP1 Groth16 proof. The
+    /// contract re-derives the commitment from `blockHeader`, verifies
+    /// `blockProof` against the batch's `batchRoot`, then calls
+    /// `ISP1Verifier.verifyProof(...)`.
+    function resolveBlockChallenge(
+        uint256 batchIndex,
+        L2BlockHeader blockHeader,
+        MerkleProof blockProof,
+        bytes sp1Proof
+    ) external;
+
+    /// Resolve a batch-root dispute by reconstructing the merkle root
+    /// over the full batch and chaining against the previous batch's
+    /// last block.
+    function resolveBatchRootChallenge(
+        uint256 batchIndex,
+        L2BlockHeader lastBlockHeaderInPreviousBatch,
+        L2BlockHeader[] blockHeaders,
+        MerkleProof lastBlockProof
+    ) external;
 }
 
 // =====================================================================
@@ -382,6 +437,31 @@ pub async fn get_batch_on_chain(
     })
 }
 
+/// View-call `blockChallenges(commitment)` and project just the `deadline`
+/// (L1 block number after which the challenge window closes). One RPC
+/// round-trip; used by the orchestrator to persist the deadline at row
+/// creation time so the worker doesn't re-read it on every tick.
+pub async fn get_block_challenge_deadline(
+    l1_provider: &impl Provider,
+    contract_addr: Address,
+    commitment: B256,
+) -> Result<u64> {
+    let call = blockChallengesCall { commitment };
+    let input = Bytes::from(call.abi_encode());
+    let req = TransactionRequest {
+        to: Some(contract_addr.into()),
+        input: input.into(),
+        ..Default::default()
+    };
+    let raw = l1_provider
+        .call(req)
+        .await
+        .map_err(|e| eyre!("eth_call blockChallenges({commitment}) failed: {e}"))?;
+    let decoded = blockChallengesCall::abi_decode_returns(&raw)
+        .map_err(|e| eyre!("decode blockChallenges return: {e}"))?;
+    Ok(decoded.deadline)
+}
+
 /// Scan L1 for the `BatchPreconfirmed(batchIndex=…)` event in the given
 /// block range. Returns the first matching log's transaction hash and block
 /// number, or `None` if no such event exists in the window.
@@ -425,18 +505,24 @@ pub async fn find_batch_preconfirm_event(
 // Write helpers (RBF-aware)
 // =====================================================================
 
-/// Immutable metadata for an in-flight `preconfirmBatch` transaction. Built
-/// once at dispatch start by [`build_preconfirm_tx`] and reused across RBF
-/// bumps — only `max_fee_per_gas` / `max_priority_fee_per_gas` change on each
-/// rebroadcast.
+/// Immutable metadata for an in-flight rollup-write transaction. Built
+/// once at dispatch start by [`build_preconfirm_tx`] /
+/// [`build_resolve_block_challenge_tx`] /
+/// [`build_resolve_batch_root_challenge_tx`] and reused across RBF
+/// bumps — only `max_fee_per_gas` / `max_priority_fee_per_gas` change on
+/// each rebroadcast.
 #[derive(Debug, Clone)]
-pub struct PreconfirmTxTemplate {
+pub struct RollupTxTemplate {
     pub to: Address,
     pub input: Bytes,
     pub nonce: u64,
     pub gas_limit: u64,
     pub chain_id: u64,
+    /// Log correlation id only — never read from the calldata.
     pub batch_index: u64,
+    /// Tag included in broadcast logs (`"preconfirm"`,
+    /// `"resolve_block_challenge"`, `"resolve_batch_root_challenge"`).
+    pub tx_kind: &'static str,
 }
 
 /// `estimate * 1.2` — industry-standard +20% padding over `eth_estimateGas`.
@@ -463,13 +549,95 @@ pub async fn build_preconfirm_tx(
     signature: Vec<u8>,
     signer: Address,
     nonce: u64,
-) -> Result<PreconfirmTxTemplate> {
+) -> Result<RollupTxTemplate> {
     let call = preconfirmBatchCall {
         nitroVerifier: nitro_verifier_addr,
         batchIndex: U256::from(batch_index),
         signature: Bytes::from(signature),
     };
-    let input = Bytes::from(call.abi_encode());
+    build_template(
+        provider,
+        contract_addr,
+        batch_index,
+        "preconfirm",
+        call.abi_encode(),
+        signer,
+        nonce,
+    )
+    .await
+}
+
+/// Build calldata + gas-limit for `resolveBlockChallenge`.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_resolve_block_challenge_tx(
+    provider: &impl Provider,
+    contract_addr: Address,
+    batch_index: u64,
+    block_header: L2BlockHeader,
+    block_proof: MerkleProof,
+    sp1_proof: Vec<u8>,
+    signer: Address,
+    nonce: u64,
+) -> Result<RollupTxTemplate> {
+    let call = resolveBlockChallengeCall {
+        batchIndex: U256::from(batch_index),
+        blockHeader: block_header,
+        blockProof: block_proof,
+        sp1Proof: Bytes::from(sp1_proof),
+    };
+    build_template(
+        provider,
+        contract_addr,
+        batch_index,
+        "resolve_block_challenge",
+        call.abi_encode(),
+        signer,
+        nonce,
+    )
+    .await
+}
+
+/// Build calldata + gas-limit for `resolveBatchRootChallenge`. No SP1
+/// proof; the contract re-derives the merkle root from `block_headers`.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_resolve_batch_root_challenge_tx(
+    provider: &impl Provider,
+    contract_addr: Address,
+    batch_index: u64,
+    last_block_header_in_previous_batch: L2BlockHeader,
+    block_headers: Vec<L2BlockHeader>,
+    last_block_proof: MerkleProof,
+    signer: Address,
+    nonce: u64,
+) -> Result<RollupTxTemplate> {
+    let call = resolveBatchRootChallengeCall {
+        batchIndex: U256::from(batch_index),
+        lastBlockHeaderInPreviousBatch: last_block_header_in_previous_batch,
+        blockHeaders: block_headers,
+        lastBlockProof: last_block_proof,
+    };
+    build_template(
+        provider,
+        contract_addr,
+        batch_index,
+        "resolve_batch_root_challenge",
+        call.abi_encode(),
+        signer,
+        nonce,
+    )
+    .await
+}
+
+async fn build_template(
+    provider: &impl Provider,
+    contract_addr: Address,
+    batch_index: u64,
+    tx_kind: &'static str,
+    encoded_call: Vec<u8>,
+    signer: Address,
+    nonce: u64,
+) -> Result<RollupTxTemplate> {
+    let input = Bytes::from(encoded_call);
 
     let chain_id = provider.get_chain_id().await.map_err(|e| eyre!("get_chain_id failed: {e}"))?;
 
@@ -483,7 +651,15 @@ pub async fn build_preconfirm_tx(
         provider.estimate_gas(est_req).await.map_err(|e| eyre!("estimate_gas failed: {e}"))?;
     let gas_limit = apply_gas_buffer(estimate);
 
-    Ok(PreconfirmTxTemplate { to: contract_addr, input, nonce, gas_limit, chain_id, batch_index })
+    Ok(RollupTxTemplate {
+        to: contract_addr,
+        input,
+        nonce,
+        gas_limit,
+        chain_id,
+        batch_index,
+        tx_kind,
+    })
 }
 
 /// Returns true when the JSON-RPC error string from `send_raw_transaction`
@@ -610,10 +786,10 @@ impl NonceAllocator {
 /// Sign + broadcast one EIP-1559 transaction with explicit nonce + fees.
 /// Returns the tx hash. Does NOT wait for a receipt — the caller is
 /// responsible for polling and, if needed, bumping fees + rebroadcasting.
-pub async fn broadcast_preconfirm(
+pub async fn broadcast_rollup_tx(
     provider: &impl Provider,
     signer: &(dyn TxSigner<Signature> + Send + Sync),
-    template: &PreconfirmTxTemplate,
+    template: &RollupTxTemplate,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
 ) -> Result<B256> {
@@ -643,11 +819,12 @@ pub async fn broadcast_preconfirm(
     let tx_hash = *pending.tx_hash();
     info!(
         %tx_hash,
+        tx_kind = template.tx_kind,
         batch_index = template.batch_index,
         nonce = template.nonce,
         max_fee_per_gas,
         max_priority_fee_per_gas,
-        "broadcast_preconfirm"
+        "broadcast_rollup_tx"
     );
     Ok(tx_hash)
 }

@@ -29,6 +29,7 @@ rsp-rpc-db.workspace = true
 rsp-client-executor = { workspace = true, features = ["wasmtime"] }
 rsp-mpt.workspace = true
 fluent-stf-primitives = { workspace = true, default-features = false }
+batch-merkle.workspace = true
 
 # reth
 reth-evm.workspace = true

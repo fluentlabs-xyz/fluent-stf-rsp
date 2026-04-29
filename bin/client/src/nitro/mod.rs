@@ -11,12 +11,14 @@ use aws_nitro_enclaves_nsm_api::{
     driver,
 };
 
-use k256::ecdsa::{
-    signature::Signer, signature::Verifier, signature::DigestSigner, RecoveryId, Signature,
-    SigningKey, VerifyingKey,
+use k256::{
+    ecdsa::{
+        signature::{DigestSigner, Signer, Verifier},
+        RecoveryId, Signature, SigningKey, VerifyingKey,
+    },
+    elliptic_curve::scalar::IsHigh,
+    SecretKey,
 };
-use k256::elliptic_curve::scalar::IsHigh;
-use k256::SecretKey;
 
 use alloy_primitives::{Address, B256};
 use c_kzg::{Blob, KzgSettings, BYTES_PER_BLOB};
@@ -28,15 +30,21 @@ use rsp_client_executor::{executor::EthClientExecutor, io::EthClientExecutorInpu
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
-use std::collections::BTreeMap;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::thread;
-use std::time::Duration;
-use ::vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
+        Arc, LazyLock, Mutex,
+    },
+    thread,
+    time::Duration,
+};
+use vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
-use crate::blob;
-use crate::nitro::{kms::KmsClient, vsock::VsockChannel};
+use crate::{
+    blob,
+    nitro::{kms::KmsClient, vsock::VsockChannel},
+};
 
 // ---------------------------------------------------------------------------
 // KZG trusted setup (Ethereum ceremony)
@@ -115,69 +123,33 @@ impl BlockStore {
             self.entries.remove(&oldest);
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
-// Merkle root — compatible with Solidity _calculateMerkleRoot (keccak256)
+// Merkle root + leaf compute
 // ---------------------------------------------------------------------------
+// Source of truth lives in `batch_merkle` (shared with the host
+// orchestrator). The wrappers below adapt `[u8; 32]` ↔ `B256`.
 
-/// keccak256(left ‖ right) — equivalent to _efficientHash in the contract.
-fn keccak_pair(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
-    let mut hasher = Keccak256::new();
-    hasher.update(left);
-    hasher.update(right);
-    hasher.finalize().into()
-}
-
-/// Computes the Merkle root exactly as _calculateMerkleRoot in Solidity:
-///   - pairs are hashed left-to-right
-///   - an odd trailing element is hashed with itself
 fn calculate_merkle_root(leaves: &[[u8; 32]]) -> anyhow::Result<[u8; 32]> {
     anyhow::ensure!(!leaves.is_empty(), "no leaves provided");
-
-    if leaves.len() == 1 {
-        return Ok(leaves[0]);
-    }
-
-    let mut layer: Vec<[u8; 32]> = leaves
-        .chunks(2)
-        .map(|pair| match pair {
-            [a, b] => keccak_pair(*a, *b),
-            [a] => keccak_pair(*a, *a),
-            _ => unreachable!("chunks(2) yields slices of length 1 or 2"),
-        })
-        .collect();
-
-    while layer.len() > 1 {
-        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
-        for pair in layer.chunks(2) {
-            match pair {
-                [a, b] => next.push(keccak_pair(*a, *b)),
-                [a] => next.push(keccak_pair(*a, *a)),
-                _ => unreachable!("chunks(2) yields slices of length 1 or 2"),
-            }
-        }
-        layer = next;
-    }
-
-    Ok(layer[0])
+    let leaves_b256: Vec<B256> = leaves.iter().copied().map(B256::from).collect();
+    Ok(batch_merkle::calculate_merkle_root(&leaves_b256).0)
 }
 
-/// Computes a Merkle leaf matching the Solidity contract:
-/// keccak256(abi.encodePacked(parent, block, withdrawal, deposit))
 fn compute_leaf(
     parent_hash: &[u8],
     block_hash: &[u8],
     withdrawal_hash: &[u8],
     deposit_hash: &[u8],
 ) -> [u8; 32] {
-    let mut hasher = Keccak256::new();
-    hasher.update(parent_hash);
-    hasher.update(block_hash);
-    hasher.update(withdrawal_hash);
-    hasher.update(deposit_hash);
-    hasher.finalize().into()
+    batch_merkle::compute_leaf(
+        B256::from_slice(parent_hash),
+        B256::from_slice(block_hash),
+        B256::from_slice(withdrawal_hash),
+        B256::from_slice(deposit_hash),
+    )
+    .0
 }
 
 // ---------------------------------------------------------------------------
@@ -188,11 +160,7 @@ fn compute_leaf(
 /// `block_number` is committed alongside `(leaf, block_hash)` so a response
 /// signed for block N cannot be replayed under a different block number when
 /// SubmitBatch falls back to responses on cache miss.
-fn execution_sign_payload(
-    block_number: u64,
-    leaf: &[u8; 32],
-    block_hash: &B256,
-) -> [u8; 72] {
+fn execution_sign_payload(block_number: u64, leaf: &[u8; 32], block_hash: &B256) -> [u8; 72] {
     let mut payload = [0u8; 72];
     payload[..8].copy_from_slice(&block_number.to_be_bytes());
     payload[8..40].copy_from_slice(leaf);
@@ -212,7 +180,6 @@ fn verify_response(
     Ok(())
 }
 
-
 // ---------------------------------------------------------------------------
 // Blob verification
 // ---------------------------------------------------------------------------
@@ -225,12 +192,8 @@ fn verify_response(
 /// EthExecutionResponses (cache miss). The payload is
 /// `brotli(rlp(Block_1) || ... || rlp(Block_N))` — we walk it in lockstep
 /// with `block_hashes` and assert per-position equality.
-fn verify_blobs(
-    blobs: &[Vec<u8>],
-    block_hashes: &[B256],
-) -> anyhow::Result<Vec<B256>> {
-    let decompressed =
-        blob::decode_blob_payload(blobs).map_err(|e| anyhow::anyhow!("{e}"))?;
+fn verify_blobs(blobs: &[Vec<u8>], block_hashes: &[B256]) -> anyhow::Result<Vec<B256>> {
+    let decompressed = blob::decode_blob_payload(blobs).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut iter = blob::iter_blocks(&decompressed);
     for (i, expected) in block_hashes.iter().enumerate() {
@@ -245,10 +208,7 @@ fn verify_blobs(
             expected,
         );
     }
-    anyhow::ensure!(
-        iter.next().is_none(),
-        "blob has trailing blocks beyond the trusted list",
-    );
+    anyhow::ensure!(iter.next().is_none(), "blob has trailing blocks beyond the trusted list",);
 
     compute_versioned_hashes(blobs)
 }
@@ -308,9 +268,8 @@ fn sign_batch(
 ) -> SubmitBatchResponse {
     let encoded = abi_encode_batch(&batch_root, &versioned_hashes);
     let digest = Sha256::new_with_prefix(&encoded);
-    let (signature, recid): (Signature, RecoveryId) = signing_key
-        .sign_digest_recoverable(digest)
-        .expect("signing cannot fail with a valid key");
+    let (signature, recid): (Signature, RecoveryId) =
+        signing_key.sign_digest_recoverable(digest).expect("signing cannot fail with a valid key");
 
     // Defence-in-depth: k256 0.13.x guarantees low-S from sign_digest_recoverable.
     // If a future upstream version ever regresses, fail loud at signing time rather
@@ -379,9 +338,9 @@ pub(crate) fn handle_submit_batch(
     // is intentionally invisible to this in-flight batch; the submitter will
     // see the fresher value on the next SubmitBatch call.
     let cached: Vec<Option<BlockEntry>> = {
-        let store = block_store
-            .lock()
-            .map_err(|e| SubmitBatchError::Other(anyhow::anyhow!("block_store mutex poisoned: {e}")))?;
+        let store = block_store.lock().map_err(|e| {
+            SubmitBatchError::Other(anyhow::anyhow!("block_store mutex poisoned: {e}"))
+        })?;
         (from..=to).map(|n| store.get(n).copied()).collect()
     };
 
@@ -409,10 +368,8 @@ pub(crate) fn handle_submit_batch(
         return Err(SubmitBatchError::InvalidSignatures(invalid_blocks));
     }
 
-    let batch_root = calculate_merkle_root(&leaves)
-        .map_err(SubmitBatchError::Other)?;
-    let versioned_hashes = verify_blobs(blobs, &block_hashes)
-        .map_err(SubmitBatchError::Other)?;
+    let batch_root = calculate_merkle_root(&leaves).map_err(SubmitBatchError::Other)?;
+    let versioned_hashes = verify_blobs(blobs, &block_hashes).map_err(SubmitBatchError::Other)?;
     Ok(sign_batch(batch_root, versioned_hashes, signing_key))
 }
 
@@ -472,12 +429,8 @@ fn run_block(
     Ok(ExecutionResult { block_number, leaf, block_hash })
 }
 
-fn sign_execution(
-    result: &ExecutionResult,
-    signing_key: &SigningKey,
-) -> EthExecutionResponse {
-    let payload =
-        execution_sign_payload(result.block_number, &result.leaf, &result.block_hash);
+fn sign_execution(result: &ExecutionResult, signing_key: &SigningKey) -> EthExecutionResponse {
+    let payload = execution_sign_payload(result.block_number, &result.leaf, &result.block_hash);
     let signature: Signature = signing_key.sign(&payload);
 
     EthExecutionResponse {
@@ -500,7 +453,6 @@ pub(crate) fn execute_block(
     let result = run_block(input, block_store)?;
     Ok(sign_execution(&result, signing_key))
 }
-
 
 // ---------------------------------------------------------------------------
 // Enclave identity & runtime
@@ -706,7 +658,6 @@ impl Enclave {
                     );
                     send_response(&mut channel, &resp);
                 }
-
             }
         }
     }
@@ -812,6 +763,10 @@ pub fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn keccak_pair(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+        batch_merkle::keccak_pair(B256::from(left), B256::from(right)).0
+    }
+
     #[test]
     fn merkle_root_single_leaf() {
         let leaf = [0xAA; 32];
@@ -895,9 +850,8 @@ mod tests {
         };
 
         let store = Mutex::new(store);
-        let result = handle_submit_batch(
-            10, 11, &[valid_resp, invalid_resp], &[], &signing_key, &store,
-        );
+        let result =
+            handle_submit_batch(10, 11, &[valid_resp, invalid_resp], &[], &signing_key, &store);
 
         match result {
             Err(SubmitBatchError::InvalidSignatures(blocks)) => {
@@ -913,9 +867,7 @@ mod tests {
         let store = Mutex::new(BlockStore::new());
 
         // No responses, no store entries — all blocks should be invalid
-        let result = handle_submit_batch(
-            100, 102, &[], &[], &signing_key, &store,
-        );
+        let result = handle_submit_batch(100, 102, &[], &[], &signing_key, &store);
 
         match result {
             Err(SubmitBatchError::InvalidSignatures(blocks)) => {

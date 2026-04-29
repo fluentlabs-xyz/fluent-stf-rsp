@@ -10,6 +10,7 @@ pub use error::Error as HostError;
 pub use host_executor::{EthHostExecutor, HostExecutor};
 
 mod error;
+pub mod events_hash;
 mod host_executor;
 
 pub fn create_eth_block_execution_strategy_factory(

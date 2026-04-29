@@ -9,6 +9,7 @@ members = [
     "crates/storage/rpc-db",
     "crates/storage/witness-db","crates/nitro-types",
     "crates/blob-builder",
+    "crates/batch-merkle",
     "crates/l1-rollup-client",
     "bin/witness-orchestrator",
 ]
@@ -88,6 +89,7 @@ bytes = "1.10.1"
 
 # --- workspace crates ---
 rsp-blob-builder = { path = "./crates/blob-builder" }
+batch-merkle = { path = "./crates/batch-merkle" }
 l1-rollup-client = { path = "./crates/l1-rollup-client" }
 rsp-rpc-db = { path = "./crates/storage/rpc-db" }
 rsp-witness-db = { path = "./crates/storage/witness-db" }

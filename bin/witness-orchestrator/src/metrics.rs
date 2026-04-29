@@ -54,6 +54,15 @@ pub(crate) const L1_BROADCAST_FAILURES_TOTAL: &str = "orchestrator_l1_broadcast_
 /// in-memory state ahead of DB; recoverable on restart but worth alerting.
 pub(crate) const DB_WRITER_DROPPED_TOTAL: &str = "orchestrator_db_writer_dropped_total";
 
+/// Resolve-tx counters. Labelled by `kind` (`resolve_block_challenge` |
+/// `resolve_batch_root_challenge`). Separate from preconfirm counters
+/// so the two paths can be alerted on independently.
+pub(crate) const L1_RESOLVE_DISPATCHED_TOTAL: &str = "orchestrator_l1_resolve_dispatched_total";
+pub(crate) const L1_RESOLVE_SUBMITTED_TOTAL: &str = "orchestrator_l1_resolve_submitted_total";
+pub(crate) const L1_RESOLVE_REJECTED_TOTAL: &str = "orchestrator_l1_resolve_rejected_total";
+pub(crate) const L1_RESOLVE_PRE_RECEIPT_FAILURE_TOTAL: &str =
+    "orchestrator_l1_resolve_pre_receipt_failure_total";
+
 // Cost — histogram only. A `u64` counter cannot represent sub-ETH amounts
 // (`0.002 as u64 == 0`); cumulative spend is read from the histogram's `_sum`.
 pub(crate) const L1_DISPATCH_COST_ETH: &str = "orchestrator_l1_dispatch_cost_eth";
@@ -159,6 +168,27 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
          (typically during shutdown). In-memory state may be ahead of DB; restart \
          resyncs via normalize_startup_checkpoint."
     );
+    metrics::describe_counter!(
+        L1_RESOLVE_DISPATCHED_TOTAL,
+        "Resolve-tx broadcasts (first attempt per challenge). Labels: \
+         kind=resolve_block_challenge|resolve_batch_root_challenge"
+    );
+    metrics::describe_counter!(
+        L1_RESOLVE_SUBMITTED_TOTAL,
+        "Resolve-tx receipts observed with status=1. Labels: \
+         kind=resolve_block_challenge|resolve_batch_root_challenge"
+    );
+    metrics::describe_counter!(
+        L1_RESOLVE_REJECTED_TOTAL,
+        "Resolve-tx receipts observed with status=0 (on-chain revert). Labels: \
+         kind=resolve_block_challenge|resolve_batch_root_challenge"
+    );
+    metrics::describe_counter!(
+        L1_RESOLVE_PRE_RECEIPT_FAILURE_TOTAL,
+        "Resolve-tx hard-failures before any receipt (initial broadcast error, \
+         stuck-at-cap, nonce advanced). Labels: \
+         kind=resolve_block_challenge|resolve_batch_root_challenge"
+    );
 
     metrics::describe_histogram!(
         L1_DISPATCH_COST_ETH,
@@ -196,6 +226,24 @@ async fn render_metrics(State(handle): State<Arc<PrometheusHandle>>) -> impl Int
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// ─── Resolve-tx counters ─────────────────────────────────────────────────────
+
+pub(crate) fn counter_resolve_dispatched(kind: &'static str) {
+    metrics::counter!(L1_RESOLVE_DISPATCHED_TOTAL, "kind" => kind).increment(1);
+}
+
+pub(crate) fn counter_resolve_submitted(kind: &'static str) {
+    metrics::counter!(L1_RESOLVE_SUBMITTED_TOTAL, "kind" => kind).increment(1);
+}
+
+pub(crate) fn counter_resolve_rejected(kind: &'static str) {
+    metrics::counter!(L1_RESOLVE_REJECTED_TOTAL, "kind" => kind).increment(1);
+}
+
+pub(crate) fn counter_resolve_pre_receipt_failure(kind: &'static str) {
+    metrics::counter!(L1_RESOLVE_PRE_RECEIPT_FAILURE_TOTAL, "kind" => kind).increment(1);
+}
 
 /// Classify a sign-endpoint error by substring. Any error whose display output
 /// contains the literal `"enclave busy"` is classified as `enclave_busy`;

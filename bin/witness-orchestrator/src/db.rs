@@ -1,30 +1,200 @@
 //! SQLite persistence for orchestrator crash recovery.
 //!
-//! Stores `EthExecutionResponse` entries and `PendingBatch` state so the
-//! orchestrator can resume without re-requesting already-computed witnesses after
-//! a crash.
+//! Single source of truth for batch lifecycle state: every batch has one row
+//! in the `batches` table whose `status` field tracks the canonical L1
+//! contract progression (`committed → accepted → sent → preconfirmed →
+//! finalized`). An orthogonal `enclave_signed` flag records the local
+//! milestone of `/sign-batch-root` succeeding.
 //!
-//! Schema:
-//! - `block_responses(block_number PK, response BLOB)` — serialized responses
-//! - `pending_batches(batch_index PK, from_block, to_block, blobs_accepted)`
-//! - `pending_blobs_accepted(batch_index PK)` — buffered pre-registration events
-//! - `meta(key PK, value)` — checkpoint and other scalars
+//! `block_responses` is the durability backstop for the in-memory hot cache
+//! held by `BatchAccumulator.responses` — async-batched writes amortize
+//! fsyncs; on crash we lose the trailing un-flushed window and recover by
+//! re-execution.
 //!
-//! All writes are immediately durable (WAL mode, synchronous=NORMAL).
+//! `meta` carries the two non-derivable scalars: `l1_checkpoint` (listener
+//! resume point) and `start_batch_id` (BatchReverted recovery anchor).
+//!
+//! All writes go through the actor in `run_db_writer`. Async per-row writes
+//! coalesce into one transaction per flush; sync writes run as their own
+//! dedicated transaction with an awaited oneshot ack so the caller observes
+//! durability before proceeding.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use rusqlite::{params, Connection, Result};
+use alloy_primitives::B256;
+use rusqlite::{params, Connection, OptionalExtension, Result};
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::{interval, MissedTickBehavior},
 };
 use tracing::error;
 
-use crate::{
-    accumulator::PendingBatch,
-    types::{EthExecutionResponse, SubmitBatchResponse},
-};
+use crate::types::{EthExecutionResponse, SubmitBatchResponse};
+
+// ============================================================================
+// Status enum
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum BatchStatus {
+    Committed = 0,
+    Accepted = 1,
+    Sent = 2,
+    Preconfirmed = 3,
+    Finalized = 4,
+}
+
+impl BatchStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Accepted => "accepted",
+            Self::Sent => "sent",
+            Self::Preconfirmed => "preconfirmed",
+            Self::Finalized => "finalized",
+        }
+    }
+
+    pub(crate) fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "committed" => Some(Self::Committed),
+            "accepted" => Some(Self::Accepted),
+            "sent" => Some(Self::Sent),
+            "preconfirmed" => Some(Self::Preconfirmed),
+            "finalized" => Some(Self::Finalized),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================================
+// Batch row + patch
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub(crate) struct BatchRow {
+    pub batch_index: u64,
+    pub from_block: u64,
+    pub to_block: u64,
+    pub status: BatchStatus,
+    pub enclave_signed: bool,
+    pub signature: Option<SubmitBatchResponse>,
+    pub tx_hash: Option<B256>,
+    pub nonce: Option<u64>,
+    pub max_fee_per_gas: Option<u128>,
+    pub max_priority_fee_per_gas: Option<u128>,
+    pub l1_block: Option<u64>,
+    pub committed_at: u64,
+    pub last_status_change_at: u64,
+}
+
+/// Sparse update — only fields the caller wants to change.
+/// `None` → leave unchanged. `Some(None)` → set the column to NULL.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BatchPatch {
+    pub status: Option<BatchStatus>,
+    pub enclave_signed: Option<bool>,
+    pub signature: Option<Option<SubmitBatchResponse>>,
+    pub tx_hash: Option<Option<B256>>,
+    pub nonce: Option<Option<u64>>,
+    pub max_fee_per_gas: Option<Option<u128>>,
+    pub max_priority_fee_per_gas: Option<Option<u128>>,
+    pub l1_block: Option<Option<u64>>,
+}
+
+// ============================================================================
+// Challenge enums + row + patch
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ChallengeKind {
+    Block,
+    BatchRoot,
+}
+
+impl ChallengeKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::BatchRoot => "batch_root",
+        }
+    }
+
+    pub(crate) fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "block" => Some(Self::Block),
+            "batch_root" => Some(Self::BatchRoot),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ChallengeStatus {
+    Received = 0,
+    Sp1Proving = 1,
+    Sp1Proved = 2,
+    Dispatched = 3,
+    Resolved = 4,
+}
+
+impl ChallengeStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Sp1Proving => "sp1_proving",
+            Self::Sp1Proved => "sp1_proved",
+            Self::Dispatched => "dispatched",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    pub(crate) fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "received" => Some(Self::Received),
+            "sp1_proving" => Some(Self::Sp1Proving),
+            "sp1_proved" => Some(Self::Sp1Proved),
+            "dispatched" => Some(Self::Dispatched),
+            "resolved" => Some(Self::Resolved),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChallengeRow {
+    pub challenge_id: i64,
+    pub kind: ChallengeKind,
+    pub batch_index: u64,
+    pub commitment: Option<B256>,
+    pub status: ChallengeStatus,
+    pub deadline: u64,
+    pub sp1_request_id: Option<B256>,
+    pub sp1_proof_bytes: Option<Vec<u8>>,
+    pub tx_hash: Option<B256>,
+    pub nonce: Option<u64>,
+    pub max_fee_per_gas: Option<u128>,
+    pub max_priority_fee_per_gas: Option<u128>,
+    pub l1_block: Option<u64>,
+    pub committed_at: u64,
+    pub last_status_change_at: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ChallengePatch {
+    pub status: Option<ChallengeStatus>,
+    pub sp1_request_id: Option<Option<B256>>,
+    pub sp1_proof_bytes: Option<Option<Vec<u8>>>,
+    pub tx_hash: Option<Option<B256>>,
+    pub nonce: Option<Option<u64>>,
+    pub max_fee_per_gas: Option<Option<u128>>,
+    pub max_priority_fee_per_gas: Option<Option<u128>>,
+    pub l1_block: Option<Option<u64>>,
+}
+
+// ============================================================================
+// Db handle
+// ============================================================================
 
 pub(crate) struct Db {
     pub(crate) conn: Connection,
@@ -43,96 +213,77 @@ impl Db {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(
             "
+            CREATE TABLE IF NOT EXISTS batches (
+                batch_index              INTEGER PRIMARY KEY,
+                from_block               INTEGER NOT NULL,
+                to_block                 INTEGER NOT NULL,
+                status                   TEXT    NOT NULL,
+                enclave_signed           INTEGER NOT NULL DEFAULT 0,
+                signature                BLOB,
+                tx_hash                  BLOB,
+                nonce                    INTEGER,
+                max_fee_per_gas          TEXT,
+                max_priority_fee_per_gas TEXT,
+                l1_block                 INTEGER,
+                committed_at             INTEGER NOT NULL,
+                last_status_change_at    INTEGER NOT NULL,
+                CHECK (status IN ('committed','accepted','sent','preconfirmed','finalized'))
+            );
+            CREATE INDEX IF NOT EXISTS batches_status_idx ON batches(status);
+
             CREATE TABLE IF NOT EXISTS block_responses (
                 block_number INTEGER PRIMARY KEY,
-                response     BLOB NOT NULL
+                response     BLOB    NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS pending_batches (
-                batch_index   INTEGER PRIMARY KEY,
-                from_block    INTEGER NOT NULL,
-                to_block      INTEGER NOT NULL,
-                blobs_accepted INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS pending_blobs_accepted (
-                batch_index INTEGER PRIMARY KEY
-            );
-            CREATE TABLE IF NOT EXISTS batch_signatures (
-                batch_index INTEGER PRIMARY KEY,
-                response    BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS dispatched_batches (
-                batch_index INTEGER PRIMARY KEY,
-                from_block  INTEGER NOT NULL,
-                to_block    INTEGER NOT NULL,
-                tx_hash     BLOB NOT NULL,
-                l1_block    INTEGER NOT NULL,
-                nonce       INTEGER,
-                max_fee_per_gas          TEXT,
-                max_priority_fee_per_gas TEXT
-            );
+
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-        ",
+
+            CREATE TABLE IF NOT EXISTS challenges (
+                challenge_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind                      TEXT    NOT NULL,
+                batch_index               INTEGER NOT NULL,
+                commitment                BLOB,
+                status                    TEXT    NOT NULL,
+                deadline                  INTEGER NOT NULL,
+                sp1_request_id            BLOB,
+                sp1_proof_bytes           BLOB,
+                tx_hash                   BLOB,
+                nonce                     INTEGER,
+                max_fee_per_gas           TEXT,
+                max_priority_fee_per_gas  TEXT,
+                l1_block                  INTEGER,
+                committed_at              INTEGER NOT NULL,
+                last_status_change_at     INTEGER NOT NULL,
+                CHECK (kind IN ('block','batch_root')),
+                CHECK (status IN ('received','sp1_proving','sp1_proved','dispatched','resolved')),
+                CHECK (kind = 'batch_root' OR commitment IS NOT NULL)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS challenges_block_uniq
+                ON challenges(kind, batch_index, commitment)
+                WHERE kind = 'block';
+            CREATE UNIQUE INDEX IF NOT EXISTS challenges_batch_root_uniq
+                ON challenges(kind, batch_index)
+                WHERE kind = 'batch_root';
+            CREATE INDEX IF NOT EXISTS challenges_active_idx
+                ON challenges(status, l1_block, committed_at);
+            ",
         )?;
-
-        // Migration: add RBF columns to pre-existing dispatched_batches tables.
-        // SQLite has no IF NOT EXISTS for ADD COLUMN; we check PRAGMA first.
-        let existing_cols: std::collections::HashSet<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(dispatched_batches)")?;
-            let iter = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            iter.filter_map(|r| r.ok()).collect()
-        };
-        for (col, ddl) in [
-            ("nonce", "ALTER TABLE dispatched_batches ADD COLUMN nonce INTEGER"),
-            ("max_fee_per_gas", "ALTER TABLE dispatched_batches ADD COLUMN max_fee_per_gas TEXT"),
-            (
-                "max_priority_fee_per_gas",
-                "ALTER TABLE dispatched_batches ADD COLUMN max_priority_fee_per_gas TEXT",
-            ),
-        ] {
-            if !existing_cols.contains(col) {
-                conn.execute_batch(ddl)?;
-            }
-        }
-
         Ok(Self { conn })
     }
 
-    // ── Checkpoint ──────────────────────────────────────────────────────────
+    // ── Meta scalars ──────────────────────────────────────────────────────────
 
-    pub(crate) fn get_checkpoint(&self) -> u64 {
-        self.conn
-            .query_row("SELECT value FROM meta WHERE key = 'checkpoint'", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn save_checkpoint(&self, block_number: u64) {
-        if let Err(e) = self.conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES('checkpoint', ?1)",
-            params![block_number.to_string()],
-        ) {
-            error!(err = %e, "Failed to persist checkpoint");
-        }
-    }
-
-    // ── L1 checkpoint ────────────────────────────────────────────────────────────
-
-    /// Last L1 block successfully polled by the L1 listener.
-    /// On restart, the listener resumes from `get_l1_checkpoint().map(|b| b +
-    /// 1).unwrap_or(l1_start_block)`. Returns `None` if never set — distinguishes "not
-    /// persisted" from "persisted block 0".
     pub(crate) fn get_l1_checkpoint(&self) -> Option<u64> {
         self.conn
             .query_row("SELECT value FROM meta WHERE key = 'l1_checkpoint'", [], |row| {
                 row.get::<_, String>(0)
             })
+            .optional()
             .ok()
+            .flatten()
             .and_then(|s| s.parse().ok())
     }
 
@@ -145,19 +296,14 @@ impl Db {
         }
     }
 
-    // ── Pending start batch id (BatchReverted recovery) ─────────────────────────
-    //
-    // On `BatchReverted`, the orchestrator wipes its DB and persists the
-    // reverted batch index here. The startup path prefers this over the
-    // `L1_START_BATCH_ID` env var so the next restart resolves the L2
-    // checkpoint from the reverted batch, not the stale env value.
-
     pub(crate) fn get_start_batch_id(&self) -> Option<u64> {
         self.conn
             .query_row("SELECT value FROM meta WHERE key = 'start_batch_id'", [], |row| {
                 row.get::<_, String>(0)
             })
+            .optional()
             .ok()
+            .flatten()
             .and_then(|s| s.parse().ok())
     }
 
@@ -167,13 +313,386 @@ impl Db {
         }
     }
 
-    /// Atomically wipe all orchestrator state and persist the recovery
-    /// anchors for the next startup: `start_batch_id` (reverted batch index)
-    /// and `l1_checkpoint` (L1 block of the `BatchReverted` event).
-    ///
-    /// Wipes every data table — `block_responses`, `pending_batches`,
-    /// `pending_blobs_accepted`, `batch_signatures`, `dispatched_batches`,
-    /// and the entire `meta` table — before writing the two new meta rows.
+    // ── Derived scalars (computed from batches) ───────────────────────────────
+
+    /// `MAX(to_block)` across rows whose status is at least `Sent`.
+    /// Drives the L2 driver checkpoint upper bound on startup.
+    pub(crate) fn highest_dispatched_to_block(&self) -> Option<u64> {
+        self.conn
+            .query_row(
+                "SELECT MAX(to_block) FROM batches \
+                 WHERE status IN ('sent','preconfirmed','finalized')",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|v| v as u64)
+    }
+
+    /// First missing block in any unsent batch — drives startup checkpoint
+    /// adjustment. Returns `(batch_index, gap_block)` for the lowest-index
+    /// batch with any block in `from_block..=to_block` absent from
+    /// `block_responses`. `None` means every unsent batch is fully covered.
+    pub(crate) fn earliest_unsent_with_gap(&self) -> Option<(u64, u64)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT batch_index, from_block, to_block FROM batches \
+                 WHERE status NOT IN ('sent','preconfirmed','finalized') \
+                 ORDER BY batch_index",
+            )
+            .ok()?;
+        let rows: Vec<(u64, u64, u64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        for (batch_index, from_block, to_block) in rows {
+            for b in from_block..=to_block {
+                let exists: bool = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM block_responses WHERE block_number = ?1",
+                        params![b as i64],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .unwrap_or(None)
+                    .unwrap_or(false);
+                if !exists {
+                    return Some((batch_index, b));
+                }
+            }
+        }
+        None
+    }
+
+    // ── Batch table ──────────────────────────────────────────────────────────
+
+    pub(crate) fn upsert_batch(&self, row: &BatchRow) -> Result<()> {
+        let sig_blob = row.signature.as_ref().map(bincode::serialize).transpose().map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                "serialize SubmitBatchResponse: {e}"
+            ))))
+        })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO batches (\
+                batch_index, from_block, to_block, status, enclave_signed, \
+                signature, tx_hash, nonce, max_fee_per_gas, max_priority_fee_per_gas, \
+                l1_block, committed_at, last_status_change_at\
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                row.batch_index as i64,
+                row.from_block as i64,
+                row.to_block as i64,
+                row.status.as_str(),
+                row.enclave_signed as i64,
+                sig_blob,
+                row.tx_hash.as_ref().map(|h| h.0.to_vec()),
+                row.nonce.map(|n| n as i64),
+                row.max_fee_per_gas.map(|n| n.to_string()),
+                row.max_priority_fee_per_gas.map(|n| n.to_string()),
+                row.l1_block.map(|n| n as i64),
+                row.committed_at as i64,
+                row.last_status_change_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn patch_batch(&self, batch_index: u64, patch: &BatchPatch) -> Result<()> {
+        let mut sets: Vec<&'static str> = Vec::new();
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(s) = patch.status {
+            sets.push("status = ?");
+            binds.push(Box::new(s.as_str().to_string()));
+            sets.push("last_status_change_at = ?");
+            binds.push(Box::new(now_ts() as i64));
+        }
+        if let Some(b) = patch.enclave_signed {
+            sets.push("enclave_signed = ?");
+            binds.push(Box::new(b as i64));
+        }
+        if let Some(ref sig_opt) = patch.signature {
+            let sig_blob = sig_opt.as_ref().map(bincode::serialize).transpose().map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                    "serialize signature: {e}"
+                ))))
+            })?;
+            sets.push("signature = ?");
+            binds.push(Box::new(sig_blob));
+        }
+        if let Some(tx) = patch.tx_hash {
+            sets.push("tx_hash = ?");
+            binds.push(Box::new(tx.map(|h| h.0.to_vec())));
+        }
+        if let Some(n) = patch.nonce {
+            sets.push("nonce = ?");
+            binds.push(Box::new(n.map(|v| v as i64)));
+        }
+        if let Some(f) = patch.max_fee_per_gas {
+            sets.push("max_fee_per_gas = ?");
+            binds.push(Box::new(f.map(|v| v.to_string())));
+        }
+        if let Some(f) = patch.max_priority_fee_per_gas {
+            sets.push("max_priority_fee_per_gas = ?");
+            binds.push(Box::new(f.map(|v| v.to_string())));
+        }
+        if let Some(b) = patch.l1_block {
+            sets.push("l1_block = ?");
+            binds.push(Box::new(b.map(|v| v as i64)));
+        }
+        if sets.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!("UPDATE batches SET {} WHERE batch_index = ?", sets.join(", "));
+        binds.push(Box::new(batch_index as i64));
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        self.conn.execute(&sql, &bind_refs[..])?;
+        Ok(())
+    }
+
+    pub(crate) fn load_all_batches(&self) -> Vec<BatchRow> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT batch_index, from_block, to_block, status, enclave_signed, \
+                    signature, tx_hash, nonce, max_fee_per_gas, max_priority_fee_per_gas, \
+                    l1_block, committed_at, last_status_change_at \
+             FROM batches ORDER BY batch_index",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(err = %e, "load_all_batches prepare failed");
+                return vec![];
+            }
+        };
+        stmt.query_map([], row_to_batch_row)
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    // ── block_responses ──────────────────────────────────────────────────────
+
+    pub(crate) fn load_responses(&self) -> Vec<EthExecutionResponse> {
+        let mut stmt =
+            match self.conn.prepare("SELECT response FROM block_responses ORDER BY block_number") {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(err = %e, "load_responses prepare failed");
+                    return vec![];
+                }
+            };
+        let blobs: Vec<Vec<u8>> = stmt
+            .query_map([], |row| row.get(0))
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        blobs.into_iter().filter_map(|b| bincode::deserialize(&b).ok()).collect()
+    }
+
+    // ── Challenges table ─────────────────────────────────────────────────────
+
+    /// `INSERT OR IGNORE` — idempotent on listener replay. Per-kind
+    /// uniqueness is enforced by the partial unique indexes.
+    pub(crate) fn insert_challenge(&self, row: &ChallengeRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO challenges (\
+                kind, batch_index, commitment, status, deadline, \
+                sp1_request_id, sp1_proof_bytes, \
+                tx_hash, nonce, max_fee_per_gas, max_priority_fee_per_gas, \
+                l1_block, committed_at, last_status_change_at\
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                row.kind.as_str(),
+                row.batch_index as i64,
+                row.commitment.as_ref().map(|h| h.0.to_vec()),
+                row.status.as_str(),
+                row.deadline as i64,
+                row.sp1_request_id.as_ref().map(|h| h.0.to_vec()),
+                row.sp1_proof_bytes.as_ref(),
+                row.tx_hash.as_ref().map(|h| h.0.to_vec()),
+                row.nonce.map(|n| n as i64),
+                row.max_fee_per_gas.map(|n| n.to_string()),
+                row.max_priority_fee_per_gas.map(|n| n.to_string()),
+                row.l1_block.map(|n| n as i64),
+                row.committed_at as i64,
+                row.last_status_change_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn patch_challenge(&self, challenge_id: i64, patch: &ChallengePatch) -> Result<()> {
+        let mut sets: Vec<&'static str> = Vec::new();
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(s) = patch.status {
+            sets.push("status = ?");
+            binds.push(Box::new(s.as_str().to_string()));
+            sets.push("last_status_change_at = ?");
+            binds.push(Box::new(now_ts() as i64));
+        }
+        if let Some(ref id) = patch.sp1_request_id {
+            sets.push("sp1_request_id = ?");
+            binds.push(Box::new(id.as_ref().map(|h| h.0.to_vec())));
+        }
+        if let Some(ref bytes) = patch.sp1_proof_bytes {
+            sets.push("sp1_proof_bytes = ?");
+            binds.push(Box::new(bytes.clone()));
+        }
+        if let Some(tx) = patch.tx_hash {
+            sets.push("tx_hash = ?");
+            binds.push(Box::new(tx.map(|h| h.0.to_vec())));
+        }
+        if let Some(n) = patch.nonce {
+            sets.push("nonce = ?");
+            binds.push(Box::new(n.map(|v| v as i64)));
+        }
+        if let Some(f) = patch.max_fee_per_gas {
+            sets.push("max_fee_per_gas = ?");
+            binds.push(Box::new(f.map(|v| v.to_string())));
+        }
+        if let Some(f) = patch.max_priority_fee_per_gas {
+            sets.push("max_priority_fee_per_gas = ?");
+            binds.push(Box::new(f.map(|v| v.to_string())));
+        }
+        if let Some(b) = patch.l1_block {
+            sets.push("l1_block = ?");
+            binds.push(Box::new(b.map(|v| v as i64)));
+        }
+        if sets.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!("UPDATE challenges SET {} WHERE challenge_id = ?", sets.join(", "));
+        binds.push(Box::new(challenge_id));
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        self.conn.execute(&sql, &bind_refs[..])?;
+        Ok(())
+    }
+
+    /// Worker gate: pick the next row to drive forward.
+    pub(crate) fn find_active_challenge(&self) -> Option<ChallengeRow> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
+                        sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
+                        max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
+                        committed_at, last_status_change_at \
+                 FROM challenges \
+                 WHERE status = 'received' \
+                    OR status = 'sp1_proving' \
+                    OR status = 'sp1_proved' \
+                    OR (status = 'dispatched' AND l1_block IS NULL) \
+                 ORDER BY committed_at ASC \
+                 LIMIT 1",
+            )
+            .ok()?;
+        stmt.query_row([], row_to_challenge_row).optional().ok().flatten()
+    }
+
+    pub(crate) fn find_challenge_by_id(&self, challenge_id: i64) -> Option<ChallengeRow> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
+                        sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
+                        max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
+                        committed_at, last_status_change_at \
+                 FROM challenges WHERE challenge_id = ?1",
+            )
+            .ok()?;
+        stmt.query_row(params![challenge_id], row_to_challenge_row).optional().ok().flatten()
+    }
+
+    /// Lookup for `ChallengeResolved` / `BatchRootChallengeResolved` event
+    /// idempotency. For `Block` kind, `commitment` is required and matches
+    /// exactly; for `BatchRoot` kind, `commitment` is ignored.
+    pub(crate) fn find_challenge_by_event(
+        &self,
+        kind: ChallengeKind,
+        batch_index: u64,
+        commitment: Option<B256>,
+    ) -> Option<ChallengeRow> {
+        match kind {
+            ChallengeKind::Block => {
+                let c = commitment?;
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
+                                sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
+                                max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
+                                committed_at, last_status_change_at \
+                         FROM challenges \
+                         WHERE kind = 'block' AND batch_index = ?1 AND commitment = ?2",
+                    )
+                    .ok()?;
+                stmt.query_row(params![batch_index as i64, c.0.to_vec()], row_to_challenge_row)
+                    .optional()
+                    .ok()
+                    .flatten()
+            }
+            ChallengeKind::BatchRoot => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
+                                sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
+                                max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
+                                committed_at, last_status_change_at \
+                         FROM challenges \
+                         WHERE kind = 'batch_root' AND batch_index = ?1",
+                    )
+                    .ok()?;
+                stmt.query_row(params![batch_index as i64], row_to_challenge_row)
+                    .optional()
+                    .ok()
+                    .flatten()
+            }
+        }
+    }
+
+    /// Snapshot of dispatched rows whose receipt the finalization worker
+    /// must reconcile against L1 (for reorg detection).
+    pub(crate) fn dispatched_challenges_with_l1_block(&self) -> Vec<(i64, B256, u64)> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT challenge_id, tx_hash, l1_block FROM challenges \
+             WHERE status = 'dispatched' AND tx_hash IS NOT NULL AND l1_block IS NOT NULL",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(err = %e, "dispatched_challenges_with_l1_block prepare failed");
+                return vec![];
+            }
+        };
+        stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let tx_blob: Vec<u8> = row.get(1)?;
+            let l1_block: i64 = row.get(2)?;
+            let tx_hash = B256::try_from(tx_blob.as_slice()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("tx_hash B256: {e}"))),
+                )
+            })?;
+            Ok((id, tx_hash, l1_block as u64))
+        })
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    // ── BatchReverted recovery ───────────────────────────────────────────────
+
     pub(crate) fn wipe_for_revert(&mut self, start_batch_id: u64, l1_block: u64) {
         let tx = match self.conn.transaction() {
             Ok(tx) => tx,
@@ -184,11 +703,9 @@ impl Db {
         };
         let res = tx
             .execute_batch(
-                "DELETE FROM block_responses;
-                 DELETE FROM pending_batches;
-                 DELETE FROM pending_blobs_accepted;
-                 DELETE FROM batch_signatures;
-                 DELETE FROM dispatched_batches;
+                "DELETE FROM batches; \
+                 DELETE FROM block_responses; \
+                 DELETE FROM challenges; \
                  DELETE FROM meta;",
             )
             .and_then(|()| {
@@ -216,547 +733,190 @@ impl Db {
             }
         }
     }
-
-    // ── Last batch end ────────────────────────────────────────────────────────────
-
-    /// to_block of the last successfully preconfirmed batch.
-    /// Used to recover `next_batch_from_block` on restart when pending_batches is empty.
-    /// Returns None if no batch has ever been preconfirmed.
-    pub(crate) fn get_last_batch_end(&self) -> Option<u64> {
-        self.conn
-            .query_row("SELECT value FROM meta WHERE key = 'last_batch_end'", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .ok()
-            .and_then(|s| s.parse().ok())
-    }
-
-    pub(crate) fn save_last_batch_end(&self, block_number: u64) {
-        if let Err(e) = self.conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_batch_end', ?1)",
-            params![block_number.to_string()],
-        ) {
-            error!(err = %e, "Failed to persist last_batch_end");
-        }
-    }
-
-    // ── Responses ───────────────────────────────────────────────────────────
-
-    /// Delete many responses in a single transaction so bulk purges (e.g. key
-    /// rotation) don't serialize N individual writes.
-    pub(crate) fn delete_responses_batch(&mut self, blocks: &[u64]) {
-        let tx = match self.conn.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                error!(err = %e, "delete_responses_batch: begin transaction failed");
-                return;
-            }
-        };
-        for &block in blocks {
-            if let Err(e) =
-                tx.execute("DELETE FROM block_responses WHERE block_number = ?1", params![block])
-            {
-                error!(err = %e, block_number = block, "delete_responses_batch: row delete failed");
-            }
-        }
-        if let Err(e) = tx.commit() {
-            error!(err = %e, "delete_responses_batch: commit failed");
-        }
-    }
-
-    pub(crate) fn load_responses(&self) -> Vec<EthExecutionResponse> {
-        let mut stmt =
-            match self.conn.prepare("SELECT response FROM block_responses ORDER BY block_number") {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(err = %e, "load_responses prepare failed");
-                    return vec![];
-                }
-            };
-        let blobs: Vec<Vec<u8>> = stmt
-            .query_map([], |row| row.get(0))
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
-        blobs.into_iter().filter_map(|b| bincode::deserialize(&b).ok()).collect()
-    }
-
-    pub(crate) fn get_all_response_block_numbers(&self) -> Vec<u64> {
-        let mut stmt = match self
-            .conn
-            .prepare("SELECT block_number FROM block_responses ORDER BY block_number")
-        {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map([], |row| row.get::<_, i64>(0))
-            .map(|rows| rows.filter_map(|r| r.ok()).map(|n| n as u64).collect())
-            .unwrap_or_default()
-    }
-
-    // ── Batches ─────────────────────────────────────────────────────────────
-
-    #[cfg(test)]
-    pub(crate) fn save_batch(&self, batch: &PendingBatch) {
-        if let Err(e) = self.conn.execute(
-            "INSERT OR REPLACE INTO pending_batches(batch_index, from_block, to_block, blobs_accepted)
-             VALUES(?1, ?2, ?3, ?4)",
-            params![batch.batch_index, batch.from_block, batch.to_block, batch.blobs_accepted as i64],
-        ) {
-            error!(err = %e, batch_index = batch.batch_index, "Failed to persist batch");
-        }
-    }
-
-    pub(crate) fn load_batches(&self) -> Vec<PendingBatch> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT batch_index, from_block, to_block, blobs_accepted FROM pending_batches ORDER BY batch_index",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(err = %e, "Failed to prepare load_batches");
-                return vec![];
-            }
-        };
-        stmt.query_map([], |row| {
-            Ok(PendingBatch {
-                batch_index: row.get::<_, i64>(0)? as u64,
-                from_block: row.get::<_, i64>(1)? as u64,
-                to_block: row.get::<_, i64>(2)? as u64,
-                blobs_accepted: row.get::<_, i64>(3)? != 0,
-            })
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    }
-
-    // ── Batch signatures ─────────────────────────────────────────────────────
-
-    #[cfg(test)]
-    pub(crate) fn save_batch_signature(&self, batch_index: u64, resp: &SubmitBatchResponse) {
-        let blob = match bincode::serialize(resp) {
-            Ok(b) => b,
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to serialize SubmitBatchResponse");
-                return;
-            }
-        };
-        if let Err(e) = self.conn.execute(
-            "INSERT OR REPLACE INTO batch_signatures(batch_index, response) VALUES(?1, ?2)",
-            params![batch_index, blob],
-        ) {
-            error!(err = %e, batch_index, "Failed to persist batch signature");
-        }
-    }
-
-    pub(crate) fn get_batch_signature(&self, batch_index: u64) -> Option<SubmitBatchResponse> {
-        let blob: Vec<u8> = self
-            .conn
-            .query_row(
-                "SELECT response FROM batch_signatures WHERE batch_index = ?1",
-                params![batch_index],
-                |row| row.get(0),
-            )
-            .ok()?;
-        bincode::deserialize(&blob).ok()
-    }
-
-    pub(crate) fn delete_batch_signature(&self, batch_index: u64) {
-        if let Err(e) = self
-            .conn
-            .execute("DELETE FROM batch_signatures WHERE batch_index = ?1", params![batch_index])
-        {
-            error!(err = %e, batch_index, "Failed to delete batch signature");
-        }
-    }
-
-    /// Return every `batch_index` currently present in `batch_signatures`.
-    /// Used at startup to detect orphan signature rows (rows whose matching
-    /// `pending_batches` / `dispatched_batches` row was lost to a mid-commit
-    /// crash).
-    pub(crate) fn load_batch_signature_indexes(&self) -> Vec<u64> {
-        let mut stmt = match self.conn.prepare("SELECT batch_index FROM batch_signatures") {
-            Ok(s) => s,
-            Err(e) => {
-                error!(err = %e, "Failed to prepare batch_signatures index scan");
-                return Vec::new();
-            }
-        };
-        let iter = match stmt.query_map([], |row| row.get::<_, u64>(0)) {
-            Ok(i) => i,
-            Err(e) => {
-                error!(err = %e, "Failed to query batch_signatures rows");
-                return Vec::new();
-            }
-        };
-        iter.collect::<Result<Vec<_>>>().unwrap_or_else(|e| {
-            error!(err = %e, "Failed to read batch_signatures rows");
-            Vec::new()
-        })
-    }
-
-    /// Load every `(batch_index, SubmitBatchResponse)` row from
-    /// `batch_signatures` in a single query. Used at startup to rebuild the
-    /// in-memory signature map.
-    pub(crate) fn load_all_batch_signatures(&self) -> Vec<(u64, SubmitBatchResponse)> {
-        let mut stmt = match self.conn.prepare("SELECT batch_index, response FROM batch_signatures")
-        {
-            Ok(s) => s,
-            Err(e) => {
-                error!(err = %e, "Failed to prepare batch_signatures scan");
-                return Vec::new();
-            }
-        };
-        let iter = match stmt.query_map([], |row| {
-            let idx: u64 = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            Ok((idx, blob))
-        }) {
-            Ok(i) => i,
-            Err(e) => {
-                error!(err = %e, "Failed to query batch_signatures rows");
-                return Vec::new();
-            }
-        };
-        let mut out = Vec::new();
-        for row in iter {
-            match row {
-                Ok((idx, blob)) => match bincode::deserialize::<SubmitBatchResponse>(&blob) {
-                    Ok(resp) => out.push((idx, resp)),
-                    Err(e) => {
-                        error!(err = %e, batch_index = idx, "Failed to deserialize batch signature");
-                    }
-                },
-                Err(e) => {
-                    error!(err = %e, "Failed to read batch_signatures row");
-                }
-            }
-        }
-        out
-    }
-
-    // ── Pending blobs accepted ───────────────────────────────────────────────
-
-    pub(crate) fn load_pending_blobs_accepted(&self) -> Vec<u64> {
-        let mut stmt = match self.conn.prepare("SELECT batch_index FROM pending_blobs_accepted") {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map([], |row| row.get::<_, i64>(0))
-            .map(|rows| rows.filter_map(|r| r.ok()).map(|n| n as u64).collect())
-            .unwrap_or_default()
-    }
-
-    // ── Dispatched batches ──────────────────────────────────────────────────
-
-    /// Atomically move a batch from pending to dispatched, persisting initial
-    /// RBF state (nonce + fees) alongside the transition.
-    /// Single transaction: DELETE from pending + INSERT into dispatched.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn move_to_dispatched(
-        &mut self,
-        batch_index: u64,
-        from_block: u64,
-        to_block: u64,
-        tx_hash: &[u8],
-        l1_block: u64,
-        nonce: u64,
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-    ) {
-        let tx = match self.conn.transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to begin move_to_dispatched tx");
-                return;
-            }
-        };
-        let ok = tx
-            .execute("DELETE FROM pending_batches WHERE batch_index = ?1", params![batch_index])
-            .and_then(|_| {
-                tx.execute(
-                    "INSERT OR REPLACE INTO dispatched_batches(
-                batch_index, from_block, to_block, tx_hash, l1_block,
-                nonce, max_fee_per_gas, max_priority_fee_per_gas
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        batch_index,
-                        from_block,
-                        to_block,
-                        tx_hash,
-                        l1_block,
-                        nonce,
-                        max_fee_per_gas.to_string(),
-                        max_priority_fee_per_gas.to_string(),
-                    ],
-                )
-            });
-        match ok {
-            Ok(_) => {
-                if let Err(e) = tx.commit() {
-                    error!(err = %e, batch_index, "Failed to commit move_to_dispatched");
-                }
-            }
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to move batch to dispatched — rolling back");
-            }
-        }
-    }
-
-    /// Atomically move a batch from pending to dispatched WITHOUT RBF state.
-    /// Used for externally-preconfirmed batches (observed via L1 event) where
-    /// we are not the submitter and therefore have no local nonce or fees.
-    /// Single transaction: DELETE from pending + INSERT into dispatched with
-    /// NULL RBF columns.
-    pub(crate) fn move_to_dispatched_external(
-        &mut self,
-        batch_index: u64,
-        from_block: u64,
-        to_block: u64,
-        tx_hash: &[u8],
-        l1_block: u64,
-    ) {
-        let tx = match self.conn.transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to begin move_to_dispatched_external tx");
-                return;
-            }
-        };
-        let ok = tx.execute(
-            "DELETE FROM pending_batches WHERE batch_index = ?1",
-            params![batch_index],
-        ).and_then(|_| tx.execute(
-            "INSERT OR REPLACE INTO dispatched_batches(batch_index, from_block, to_block, tx_hash, l1_block)
-             VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![batch_index, from_block, to_block, tx_hash, l1_block],
-        ));
-        match ok {
-            Ok(_) => {
-                if let Err(e) = tx.commit() {
-                    error!(err = %e, batch_index, "Failed to commit move_to_dispatched_external");
-                }
-            }
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to move external batch to dispatched — rolling back");
-            }
-        }
-    }
-
-    /// Atomically clean up a finalized dispatched batch.
-    /// Single transaction: DELETE dispatched + DELETE responses + DELETE signature.
-    pub(crate) fn finalize_dispatched_batch(
-        &mut self,
-        batch_index: u64,
-        from_block: u64,
-        to_block: u64,
-    ) {
-        let tx = match self.conn.transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to begin finalize tx");
-                return;
-            }
-        };
-        let ok = tx
-            .execute("DELETE FROM dispatched_batches WHERE batch_index = ?1", params![batch_index])
-            .and_then(|_| {
-                tx.execute(
-                    "DELETE FROM block_responses WHERE block_number BETWEEN ?1 AND ?2",
-                    params![from_block, to_block],
-                )
-            })
-            .and_then(|_| {
-                tx.execute(
-                    "DELETE FROM batch_signatures WHERE batch_index = ?1",
-                    params![batch_index],
-                )
-            });
-        match ok {
-            Ok(_) => {
-                if let Err(e) = tx.commit() {
-                    error!(err = %e, batch_index, "Failed to commit finalize_dispatched_batch");
-                }
-            }
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to finalize dispatched batch — rolling back");
-            }
-        }
-    }
-
-    /// Move a dispatched batch back to pending (reorg recovery).
-    /// Single transaction: DELETE from dispatched + INSERT into pending.
-    pub(crate) fn undispatch_batch(&mut self, batch_index: u64, from_block: u64, to_block: u64) {
-        let tx = match self.conn.transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to begin undispatch tx");
-                return;
-            }
-        };
-        let ok = tx.execute(
-            "DELETE FROM dispatched_batches WHERE batch_index = ?1",
-            params![batch_index],
-        ).and_then(|_| tx.execute(
-            "INSERT OR REPLACE INTO pending_batches(batch_index, from_block, to_block, blobs_accepted)
-             VALUES(?1, ?2, ?3, 1)",
-            params![batch_index, from_block, to_block],
-        ));
-        match ok {
-            Ok(_) => {
-                if let Err(e) = tx.commit() {
-                    error!(err = %e, batch_index, "Failed to commit undispatch_batch");
-                }
-            }
-            Err(e) => {
-                error!(err = %e, batch_index, "Failed to undispatch batch — rolling back");
-            }
-        }
-    }
-
-    /// Returns per-row: (batch_index, from_block, to_block, tx_hash, l1_block,
-    /// nonce, max_fee_per_gas, max_priority_fee_per_gas). The last three are
-    /// `Option` because legacy rows (pre-migration) have NULL in those columns.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn load_dispatched_batches(
-        &self,
-    ) -> Vec<(u64, u64, u64, Vec<u8>, u64, Option<u64>, Option<u128>, Option<u128>)> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT batch_index, from_block, to_block, tx_hash, l1_block,
-                    nonce, max_fee_per_gas, max_priority_fee_per_gas
-             FROM dispatched_batches ORDER BY batch_index",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(err = %e, "Failed to prepare load_dispatched_batches");
-                return vec![];
-            }
-        };
-        stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                row.get::<_, i64>(1)? as u64,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, i64>(4)? as u64,
-                row.get::<_, Option<i64>>(5)?.map(|n| n as u64),
-                row.get::<_, Option<String>>(6)?.and_then(|s| s.parse::<u128>().ok()),
-                row.get::<_, Option<String>>(7)?.and_then(|s| s.parse::<u128>().ok()),
-            ))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// DB writer actor
-// ═══════════════════════════════════════════════════════════════════════════
+fn row_to_batch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BatchRow> {
+    let status_str: String = row.get(3)?;
+    let status = BatchStatus::from_db(&status_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(format!("unknown batch status: {status_str}"))),
+        )
+    })?;
+    let enclave_signed: i64 = row.get(4)?;
+    let signature_blob: Option<Vec<u8>> = row.get(5)?;
+    let signature = signature_blob
+        .map(|b| bincode::deserialize::<SubmitBatchResponse>(&b))
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::other(format!("deserialize signature: {e}"))),
+            )
+        })?;
+    let tx_hash_blob: Option<Vec<u8>> = row.get(6)?;
+    let tx_hash = tx_hash_blob
+        .map(|b| {
+            B256::try_from(b.as_slice()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("tx_hash B256: {e}"))),
+                )
+            })
+        })
+        .transpose()?;
+    let nonce: Option<i64> = row.get(7)?;
+    let max_fee: Option<String> = row.get(8)?;
+    let max_priority: Option<String> = row.get(9)?;
+    let l1_block: Option<i64> = row.get(10)?;
+    let committed_at: i64 = row.get(11)?;
+    let last_status_change_at: i64 = row.get(12)?;
+    Ok(BatchRow {
+        batch_index: row.get::<_, i64>(0)? as u64,
+        from_block: row.get::<_, i64>(1)? as u64,
+        to_block: row.get::<_, i64>(2)? as u64,
+        status,
+        enclave_signed: enclave_signed != 0,
+        signature,
+        tx_hash,
+        nonce: nonce.map(|n| n as u64),
+        max_fee_per_gas: max_fee.and_then(|s| s.parse::<u128>().ok()),
+        max_priority_fee_per_gas: max_priority.and_then(|s| s.parse::<u128>().ok()),
+        l1_block: l1_block.map(|v| v as u64),
+        committed_at: committed_at as u64,
+        last_status_change_at: last_status_change_at as u64,
+    })
+}
+
+fn row_to_challenge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChallengeRow> {
+    let kind_str: String = row.get(1)?;
+    let kind = ChallengeKind::from_db(&kind_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(format!("unknown challenge kind: {kind_str}"))),
+        )
+    })?;
+    let commitment_blob: Option<Vec<u8>> = row.get(3)?;
+    let commitment = commitment_blob
+        .map(|b| {
+            B256::try_from(b.as_slice()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("commitment B256: {e}"))),
+                )
+            })
+        })
+        .transpose()?;
+    let status_str: String = row.get(4)?;
+    let status = ChallengeStatus::from_db(&status_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(format!("unknown challenge status: {status_str}"))),
+        )
+    })?;
+    let deadline: i64 = row.get(5)?;
+    let sp1_request_blob: Option<Vec<u8>> = row.get(6)?;
+    let sp1_request_id = sp1_request_blob
+        .map(|b| {
+            B256::try_from(b.as_slice()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("sp1_request_id B256: {e}"))),
+                )
+            })
+        })
+        .transpose()?;
+    let sp1_proof_bytes: Option<Vec<u8>> = row.get(7)?;
+    let tx_hash_blob: Option<Vec<u8>> = row.get(8)?;
+    let tx_hash = tx_hash_blob
+        .map(|b| {
+            B256::try_from(b.as_slice()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("tx_hash B256: {e}"))),
+                )
+            })
+        })
+        .transpose()?;
+    let nonce: Option<i64> = row.get(9)?;
+    let max_fee: Option<String> = row.get(10)?;
+    let max_priority: Option<String> = row.get(11)?;
+    let l1_block: Option<i64> = row.get(12)?;
+    let committed_at: i64 = row.get(13)?;
+    let last_status_change_at: i64 = row.get(14)?;
+    Ok(ChallengeRow {
+        challenge_id: row.get::<_, i64>(0)?,
+        kind,
+        batch_index: row.get::<_, i64>(2)? as u64,
+        commitment,
+        status,
+        deadline: deadline as u64,
+        sp1_request_id,
+        sp1_proof_bytes,
+        tx_hash,
+        nonce: nonce.map(|n| n as u64),
+        max_fee_per_gas: max_fee.and_then(|s| s.parse::<u128>().ok()),
+        max_priority_fee_per_gas: max_priority.and_then(|s| s.parse::<u128>().ok()),
+        l1_block: l1_block.map(|v| v as u64),
+        committed_at: committed_at as u64,
+        last_status_change_at: last_status_change_at as u64,
+    })
+}
+
+pub(crate) fn now_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ============================================================================
+// DbCommand actor
+// ============================================================================
 //
-// All mutating SQLite operations route through an `mpsc::UnboundedSender<DbCommand>`
-// into a single background task that batches per-row writes into one
-// transaction per flush (size threshold OR timer tick) — collapsing N fsyncs
-// into one. Atomic multi-statement commands drain the per-row buffer first,
-// then run as their own dedicated transaction, preserving both atomicity and
-// FIFO ordering with preceding per-row writes.
-//
-// Readers (`get_*`, `load_*`) stay synchronous on the same `Arc<Mutex<Db>>`
-// the actor owns — startup reads happen before the actor runs; the lone
-// runtime read (`get_batch_signature` in `sign_batch_io`) serializes on the
-// Mutex with the actor.
+// Async per-row writes coalesce into one transaction per flush (size threshold
+// or 100 ms timer). Sync writes flush the per-row buffer first, run as their
+// own dedicated transaction, then signal a oneshot so the caller observes
+// durability. Caller-side helper: `db_send_sync(...).await`.
+
+pub(crate) enum DbCommand {
+    Async(AsyncOp),
+    Sync(SyncOp, oneshot::Sender<()>),
+}
 
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum DbCommand {
-    // Per-row (coalesced into one batched transaction on flush)
+pub(crate) enum AsyncOp {
     SaveResponse(EthExecutionResponse),
-    SaveCheckpoint(u64),
-    SaveL1Checkpoint(u64),
-    SaveLastBatchEnd(u64),
-    SaveBatch(PendingBatch),
-    UpdateBlobsAccepted(u64),
-    SavePendingBlobsAccepted(u64),
-    DeletePendingBlobsAccepted(u64),
-    SaveBatchSignature {
-        batch_index: u64,
-        resp: SubmitBatchResponse,
-    },
-    DeleteBatchSignature(u64),
-    UpdateRbfState {
-        batch_index: u64,
-        tx_hash: Vec<u8>,
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-    },
-    UpdateDispatchedL1Block {
-        batch_index: u64,
-        l1_block: u64,
-    },
-
-    // Atomic multi-statement (dedicated transaction; buffer flushed first)
     DeleteResponsesBatch(Vec<u64>),
-    MoveToDispatched {
-        batch_index: u64,
-        from_block: u64,
-        to_block: u64,
-        tx_hash: Vec<u8>,
-        l1_block: u64,
-        nonce: u64,
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-    },
-    MoveToDispatchedExternal {
-        batch_index: u64,
-        from_block: u64,
-        to_block: u64,
-        tx_hash: Vec<u8>,
-        l1_block: u64,
-    },
-    FinalizeDispatchedBatch {
-        batch_index: u64,
-        from_block: u64,
-        to_block: u64,
-    },
-    UndispatchBatch {
-        batch_index: u64,
-        from_block: u64,
-        to_block: u64,
-    },
-    WipeForRevert {
-        start_batch_id: u64,
-        l1_block: u64,
-    },
+    SaveL1Checkpoint(u64),
 }
 
-impl DbCommand {
-    fn is_atomic(&self) -> bool {
-        matches!(
-            self,
-            DbCommand::DeleteResponsesBatch(_) |
-                DbCommand::MoveToDispatched { .. } |
-                DbCommand::MoveToDispatchedExternal { .. } |
-                DbCommand::FinalizeDispatchedBatch { .. } |
-                DbCommand::UndispatchBatch { .. } |
-                DbCommand::WipeForRevert { .. }
-        )
-    }
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum SyncOp {
+    UpsertBatch(BatchRow),
+    PatchBatch { batch_index: u64, patch: BatchPatch },
+    WipeForRevert { start_batch_id: u64, l1_block: u64 },
+    InsertChallenge(ChallengeRow),
+    PatchChallenge { challenge_id: i64, patch: ChallengePatch },
 }
 
-/// Per-row flush threshold. Sized to cover a whole L2 batch (≤ ~10 k blocks)
-/// in a handful of flushes while keeping buffered memory bounded.
 const DB_BUFFER_FLUSH_SIZE: usize = 1000;
-
-/// Timer-driven flush cadence. Short enough for live ops visibility; long
-/// enough to amortize fsyncs across many per-row commands during bursts.
 const DB_BUFFER_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Drain `rx` until the sender is dropped, applying commands to the DB.
-/// Per-row commands coalesce into one transaction per flush; atomic multi-
-/// statement commands flush any pending buffer first and then run as their
-/// own transaction. On sender close, performs one final flush and exits.
 pub(crate) async fn run_db_writer(
     mut rx: mpsc::UnboundedReceiver<DbCommand>,
     db: Arc<std::sync::Mutex<Db>>,
 ) {
     tracing::info!("DB writer actor started");
-    let mut buffer: Vec<DbCommand> = Vec::with_capacity(DB_BUFFER_FLUSH_SIZE);
+    let mut buffer: Vec<AsyncOp> = Vec::with_capacity(DB_BUFFER_FLUSH_SIZE);
     let mut ticker = interval(DB_BUFFER_FLUSH_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -765,25 +925,26 @@ pub(crate) async fn run_db_writer(
             biased;
             maybe_cmd = rx.recv() => {
                 match maybe_cmd {
-                    Some(cmd) if cmd.is_atomic() => {
-                        flush_per_row_buffer(&db, &mut buffer);
-                        run_atomic_command(&db, cmd);
+                    Some(DbCommand::Sync(op, ack)) => {
+                        flush_async_buffer(&db, &mut buffer);
+                        run_sync_op(&db, op);
+                        let _ = ack.send(());
                     }
-                    Some(cmd) => {
-                        buffer.push(cmd);
+                    Some(DbCommand::Async(op)) => {
+                        buffer.push(op);
                         if buffer.len() >= DB_BUFFER_FLUSH_SIZE {
-                            flush_per_row_buffer(&db, &mut buffer);
+                            flush_async_buffer(&db, &mut buffer);
                         }
                     }
                     None => {
-                        flush_per_row_buffer(&db, &mut buffer);
+                        flush_async_buffer(&db, &mut buffer);
                         break;
                     }
                 }
             }
             _ = ticker.tick() => {
                 if !buffer.is_empty() {
-                    flush_per_row_buffer(&db, &mut buffer);
+                    flush_async_buffer(&db, &mut buffer);
                 }
             }
         }
@@ -791,11 +952,11 @@ pub(crate) async fn run_db_writer(
     tracing::info!("DB writer actor exited");
 }
 
-fn flush_per_row_buffer(db: &Arc<std::sync::Mutex<Db>>, buffer: &mut Vec<DbCommand>) {
+fn flush_async_buffer(db: &Arc<std::sync::Mutex<Db>>, buffer: &mut Vec<AsyncOp>) {
     if buffer.is_empty() {
         return;
     }
-    let drained: Vec<DbCommand> = std::mem::take(buffer);
+    let drained: Vec<AsyncOp> = std::mem::take(buffer);
     let count = drained.len();
     let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
     let tx = match guard.conn.transaction() {
@@ -805,17 +966,17 @@ fn flush_per_row_buffer(db: &Arc<std::sync::Mutex<Db>>, buffer: &mut Vec<DbComma
             return;
         }
     };
-    for cmd in drained {
-        apply_per_row_in_tx(&tx, cmd);
+    for op in drained {
+        apply_async_op(&tx, op);
     }
     if let Err(e) = tx.commit() {
         error!(err = %e, count, "db writer: commit failed — batch lost");
     }
 }
 
-fn apply_per_row_in_tx(tx: &rusqlite::Transaction<'_>, cmd: DbCommand) {
-    match cmd {
-        DbCommand::SaveResponse(resp) => {
+fn apply_async_op(tx: &rusqlite::Transaction<'_>, op: AsyncOp) {
+    match op {
+        AsyncOp::SaveResponse(resp) => {
             let blob = match bincode::serialize(&resp) {
                 Ok(b) => b,
                 Err(e) => {
@@ -825,20 +986,22 @@ fn apply_per_row_in_tx(tx: &rusqlite::Transaction<'_>, cmd: DbCommand) {
             };
             if let Err(e) = tx.execute(
                 "INSERT OR REPLACE INTO block_responses(block_number, response) VALUES(?1, ?2)",
-                params![resp.block_number, blob],
+                params![resp.block_number as i64, blob],
             ) {
                 error!(err = %e, block_number = resp.block_number, "save_response in batch");
             }
         }
-        DbCommand::SaveCheckpoint(cp) => {
-            if let Err(e) = tx.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('checkpoint', ?1)",
-                params![cp.to_string()],
-            ) {
-                error!(err = %e, cp, "save_checkpoint in batch");
+        AsyncOp::DeleteResponsesBatch(blocks) => {
+            for block in blocks {
+                if let Err(e) = tx.execute(
+                    "DELETE FROM block_responses WHERE block_number = ?1",
+                    params![block as i64],
+                ) {
+                    error!(err = %e, block_number = block, "delete_responses_batch row");
+                }
             }
         }
-        DbCommand::SaveL1Checkpoint(cp) => {
+        AsyncOp::SaveL1Checkpoint(cp) => {
             if let Err(e) = tx.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('l1_checkpoint', ?1)",
                 params![cp.to_string()],
@@ -846,135 +1009,46 @@ fn apply_per_row_in_tx(tx: &rusqlite::Transaction<'_>, cmd: DbCommand) {
                 error!(err = %e, cp, "save_l1_checkpoint in batch");
             }
         }
-        DbCommand::SaveLastBatchEnd(b) => {
-            if let Err(e) = tx.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('last_batch_end', ?1)",
-                params![b.to_string()],
-            ) {
-                error!(err = %e, block = b, "save_last_batch_end in batch");
-            }
-        }
-        DbCommand::SaveBatch(batch) => {
-            if let Err(e) = tx.execute(
-                "INSERT OR REPLACE INTO pending_batches(batch_index, from_block, to_block, blobs_accepted) VALUES(?1, ?2, ?3, ?4)",
-                params![batch.batch_index, batch.from_block, batch.to_block, batch.blobs_accepted as i64],
-            ) {
-                error!(err = %e, batch_index = batch.batch_index, "save_batch in batch");
-            }
-        }
-        DbCommand::UpdateBlobsAccepted(batch_index) => {
-            if let Err(e) = tx.execute(
-                "UPDATE pending_batches SET blobs_accepted = 1 WHERE batch_index = ?1",
-                params![batch_index],
-            ) {
-                error!(err = %e, batch_index, "update_blobs_accepted in batch");
-            }
-        }
-        DbCommand::SavePendingBlobsAccepted(batch_index) => {
-            if let Err(e) = tx.execute(
-                "INSERT OR IGNORE INTO pending_blobs_accepted(batch_index) VALUES(?1)",
-                params![batch_index],
-            ) {
-                error!(err = %e, batch_index, "save_pending_blobs_accepted in batch");
-            }
-        }
-        DbCommand::DeletePendingBlobsAccepted(batch_index) => {
-            if let Err(e) = tx.execute(
-                "DELETE FROM pending_blobs_accepted WHERE batch_index = ?1",
-                params![batch_index],
-            ) {
-                error!(err = %e, batch_index, "delete_pending_blobs_accepted in batch");
-            }
-        }
-        DbCommand::SaveBatchSignature { batch_index, resp } => {
-            let blob = match bincode::serialize(&resp) {
-                Ok(b) => b,
-                Err(e) => {
-                    error!(err = %e, batch_index, "save_batch_signature: serialize failed");
-                    return;
-                }
-            };
-            if let Err(e) = tx.execute(
-                "INSERT OR REPLACE INTO batch_signatures(batch_index, response) VALUES(?1, ?2)",
-                params![batch_index, blob],
-            ) {
-                error!(err = %e, batch_index, "save_batch_signature in batch");
-            }
-        }
-        DbCommand::DeleteBatchSignature(batch_index) => {
-            if let Err(e) = tx.execute(
-                "DELETE FROM batch_signatures WHERE batch_index = ?1",
-                params![batch_index],
-            ) {
-                error!(err = %e, batch_index, "delete_batch_signature in batch");
-            }
-        }
-        DbCommand::UpdateRbfState {
-            batch_index,
-            tx_hash,
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-        } => {
-            if let Err(e) = tx.execute(
-                "UPDATE dispatched_batches SET tx_hash = ?2, max_fee_per_gas = ?3, max_priority_fee_per_gas = ?4 WHERE batch_index = ?1",
-                params![batch_index, tx_hash, max_fee_per_gas.to_string(), max_priority_fee_per_gas.to_string()],
-            ) {
-                error!(err = %e, batch_index, "update_rbf_state in batch");
-            }
-        }
-        DbCommand::UpdateDispatchedL1Block { batch_index, l1_block } => {
-            if let Err(e) = tx.execute(
-                "UPDATE dispatched_batches SET l1_block = ?2 WHERE batch_index = ?1",
-                params![batch_index, l1_block],
-            ) {
-                error!(err = %e, batch_index, "update_dispatched_l1_block in batch");
-            }
-        }
-        _ => unreachable!("atomic command reached per-row apply"),
     }
 }
 
-fn run_atomic_command(db: &Arc<std::sync::Mutex<Db>>, cmd: DbCommand) {
+fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
     let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
-    match cmd {
-        DbCommand::DeleteResponsesBatch(blocks) => guard.delete_responses_batch(&blocks),
-        DbCommand::MoveToDispatched {
-            batch_index,
-            from_block,
-            to_block,
-            tx_hash,
-            l1_block,
-            nonce,
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-        } => guard.move_to_dispatched(
-            batch_index,
-            from_block,
-            to_block,
-            &tx_hash,
-            l1_block,
-            nonce,
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-        ),
-        DbCommand::MoveToDispatchedExternal {
-            batch_index,
-            from_block,
-            to_block,
-            tx_hash,
-            l1_block,
-        } => {
-            guard.move_to_dispatched_external(batch_index, from_block, to_block, &tx_hash, l1_block)
+    match op {
+        SyncOp::UpsertBatch(row) => {
+            if let Err(e) = guard.upsert_batch(&row) {
+                error!(err = %e, batch_index = row.batch_index, "upsert_batch failed");
+            }
         }
-        DbCommand::FinalizeDispatchedBatch { batch_index, from_block, to_block } => {
-            guard.finalize_dispatched_batch(batch_index, from_block, to_block)
+        SyncOp::PatchBatch { batch_index, patch } => {
+            if let Err(e) = guard.patch_batch(batch_index, &patch) {
+                error!(err = %e, batch_index, "patch_batch failed");
+            }
         }
-        DbCommand::UndispatchBatch { batch_index, from_block, to_block } => {
-            guard.undispatch_batch(batch_index, from_block, to_block)
+        SyncOp::WipeForRevert { start_batch_id, l1_block } => {
+            guard.wipe_for_revert(start_batch_id, l1_block);
         }
-        DbCommand::WipeForRevert { start_batch_id, l1_block } => {
-            guard.wipe_for_revert(start_batch_id, l1_block)
+        SyncOp::InsertChallenge(row) => {
+            if let Err(e) = guard.insert_challenge(&row) {
+                error!(err = %e, batch_index = row.batch_index, "insert_challenge failed");
+            }
         }
-        _ => unreachable!("non-atomic command reached atomic handler"),
+        SyncOp::PatchChallenge { challenge_id, patch } => {
+            if let Err(e) = guard.patch_challenge(challenge_id, &patch) {
+                error!(err = %e, challenge_id, "patch_challenge failed");
+            }
+        }
     }
+}
+
+/// Send a sync write through the actor and await its ack.
+/// Caller observes durability (one fsync) before returning.
+pub(crate) async fn db_send_sync(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    op: SyncOp,
+) -> eyre::Result<()> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    db_tx.send(DbCommand::Sync(op, ack_tx)).map_err(|_| eyre::eyre!("db writer channel closed"))?;
+    ack_rx.await.map_err(|_| eyre::eyre!("db writer dropped ack"))?;
+    Ok(())
 }

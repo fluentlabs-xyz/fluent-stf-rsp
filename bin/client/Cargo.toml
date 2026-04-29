@@ -52,6 +52,7 @@ tracing = { version = "0.1", features = ["max_level_off", "release_max_level_off
 rsp-client-executor = { path = "../../crates/executor/client", default-features = false }
 fluent-stf-primitives = { path = "../../crates/primitives", default-features = false }
 nitro-types = { path = "../../crates/nitro-types" }
+batch-merkle = { path = "../../crates/batch-merkle" }
 # sp1
 sp1-zkvm = { version = "6.0.2", optional = true }
 

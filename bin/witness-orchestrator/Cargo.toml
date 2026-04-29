@@ -44,6 +44,7 @@ alloy-rpc-client.workspace = true
 
 # workspace crates
 rsp-blob-builder.workspace = true
+batch-merkle.workspace = true
 l1-rollup-client.workspace = true
 rsp-provider.workspace = true
 rsp-host-executor = { workspace = true, default-features = false }
