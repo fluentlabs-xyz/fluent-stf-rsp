@@ -726,7 +726,7 @@ impl<P: Provider + Send + Sync> FinalityRpc for P {
 
 /// Pure-RPC half of the finalization + reorg check: takes a `dispatched`
 /// snapshot and returns receipt observations without touching the DB.
-/// Skips rows whose `l1_block == 0` (in-flight initial broadcast — the
+/// Skips rows whose `l1_block IS NULL` (in-flight initial broadcast — the
 /// dispatcher remains the sole observer until its first broadcast lands).
 async fn check_finalized_batches_query(
     provider: &dyn FinalityRpc,
@@ -1140,8 +1140,9 @@ fn spawn_key_check(shared: Arc<OrchestratorShared>, addr: Address) {
 
 #[cfg_attr(test, derive(Debug))]
 enum DispatchTarget {
-    /// A previous-lifetime broadcast left an `l1_block == 0` row with
-    /// full RBF state — resume its bump loop with the persisted nonce.
+    /// A previous-lifetime broadcast left a row at `status='dispatched'`
+    /// with `l1_block IS NULL` and full RBF state — resume its bump loop
+    /// with the persisted nonce.
     ResumeInFlight {
         batch_index: u64,
         signature: Vec<u8>,
@@ -1237,7 +1238,7 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
 
         'work: {
             // Snapshot current state: pick the next batch eligible to sign
-            // (status=Accepted, !enclave_signed, all responses present) and
+            // (status=Accepted, signature IS NULL, all responses present) and
             // copy out its responses. Drop the locks before the HTTP call.
             let pick: Option<(u64, u64, u64, Vec<EthExecutionResponse>)> = {
                 let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -1271,23 +1272,15 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
             match outcome {
                 SignOutcome::Signed { response } => {
                     info!(batch_index, "Batch signed — available for dispatch");
-                    let patch = BatchPatch {
-                        enclave_signed: Some(true),
-                        signature: Some(Some(response)),
-                        ..Default::default()
-                    };
+                    let patch =
+                        BatchPatch { signature: Some(Some(response)), ..Default::default() };
                     if let Err(e) =
                         db_send_sync(&shared.db_tx, SyncOp::PatchBatch { batch_index, patch }).await
                     {
-                        error!(batch_index, err = %e, "record_enclave_signed failed");
+                        error!(batch_index, err = %e, "record_signature failed");
                         break 'work;
                     }
-                    metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED).set(batch_index as f64);
-                    metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_FROM_BLOCK)
-                        .set(from_block as f64);
-                    metrics::gauge!(crate::metrics::LAST_BATCH_SIGNED_TO_BLOCK)
-                        .set(to_block as f64);
-                    metrics::gauge!(crate::metrics::LAST_BLOCK_SIGNED).set(to_block as f64);
+                    crate::metrics::set_last_batch_signed(batch_index, from_block, to_block);
                     let blocks: Vec<u64> = (from_block..=to_block).collect();
                     {
                         let mut c = shared.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -1601,11 +1594,11 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
             }
         }
         L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block } => {
-            // Branching is by `enclave_signed`: if we signed the batch (we own
-            // it), preserve any RBF state we may have written. Otherwise
-            // (external takeover edge case) clear nonce/fees and adopt the
-            // event's tx_hash. The decision happens atomically inside the
-            // writer actor — see `SyncOp::ObservePreconfirmed`.
+            // Branching is by `signature.is_some()`: if we signed the batch
+            // (we own it), preserve any RBF state we may have written.
+            // Otherwise (external takeover edge case) clear nonce/fees and
+            // adopt the event's tx_hash. The decision happens atomically
+            // inside the writer actor — see `SyncOp::ObservePreconfirmed`.
             if let Err(e) = db_send_sync(
                 &shared.db_tx,
                 SyncOp::ObservePreconfirmed { batch_index, tx_hash, l1_block },

@@ -280,6 +280,14 @@ pub(crate) fn set_last_batch_preconfirmed(batch_index: u64, from_block: u64, to_
     metrics::gauge!(LAST_BATCH_PRECONFIRMED_TO_BLOCK).set(to_block as f64);
 }
 
+/// Set all four `last_batch_signed*` / `last_block_signed` gauges in one call.
+pub(crate) fn set_last_batch_signed(batch_index: u64, from_block: u64, to_block: u64) {
+    metrics::gauge!(LAST_BATCH_SIGNED).set(batch_index as f64);
+    metrics::gauge!(LAST_BATCH_SIGNED_FROM_BLOCK).set(from_block as f64);
+    metrics::gauge!(LAST_BATCH_SIGNED_TO_BLOCK).set(to_block as f64);
+    metrics::gauge!(LAST_BLOCK_SIGNED).set(to_block as f64);
+}
+
 /// Seed progress gauges from rehydrated state. Prometheus skips rendering a
 /// metric that has never been emitted, so low-cadence gauges
 /// (`last_batch_preconfirmed*`, `last_batch_signed*`) would stay absent
@@ -294,10 +302,7 @@ pub(crate) fn seed_gauges_on_startup(
         metrics::gauge!(LAST_BLOCK_WITNESS_BUILT).set(checkpoint as f64);
     }
     if let Some((idx, from, to)) = signed {
-        metrics::gauge!(LAST_BATCH_SIGNED).set(idx as f64);
-        metrics::gauge!(LAST_BATCH_SIGNED_FROM_BLOCK).set(from as f64);
-        metrics::gauge!(LAST_BATCH_SIGNED_TO_BLOCK).set(to as f64);
-        metrics::gauge!(LAST_BLOCK_SIGNED).set(to as f64);
+        set_last_batch_signed(idx, from, to);
     }
     if let Some((idx, from, to)) = preconfirmed {
         set_last_batch_preconfirmed(idx, from, to);
