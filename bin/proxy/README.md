@@ -10,7 +10,7 @@ An HTTP proxy that sits between callers and execution backends, managing the Mul
 | `POST /sign-block-execution` | AWS Nitro Enclave | bincode+zstd | Signed execution result |
 | `POST /sign-batch-root` | AWS Nitro Enclave | JSON | Signed batch Merkle root over caller-provided blobs |
 
-### Challenge endpoints (proxy reconstructs blobs from L2 transactions via `crates/blob-builder`)
+### Challenge endpoints (orchestrator supplies pre-built `ClientInput` + blobs in the request body)
 | Endpoint | Backend | Output |
 |---|---|---|
 | `POST /challenge/sp1/request` | SP1 zkVM (network) | `request_id` for async Groth16 proof |
@@ -52,13 +52,13 @@ For `/sign-batch-root` the orchestrator pre-builds the EIP-4844 blobs locally vi
 
 ### Challenge flow
 
-Challenge endpoints reconstruct the EIP-4844 blobs for a given `batch_index` directly from L2 transaction data using `rsp_blob_builder::build_blobs_from_l2`. The proxy then builds `ClientInput` from L2 RPC and forwards both to SP1:
+The orchestrator owns the witness payload (via its embedded driver's cold-store / MDBX rebuild) and the canonical batch blobs (via `rsp_blob_builder::build_blobs_from_l2`). It packages both into a single bincode-serialized `ChallengeSp1Request { client_input, blobs }` (optionally zstd-compressed) and POSTs to the proxy. The proxy is a thin SP1 forwarder on this path — no L1 / Beacon access, no host-execute:
 
 ```text
 Orchestrator ──► POST /challenge/sp1/request
-                 { "block_number": 123, "batch_index": 5 }
-            ◄── proxy reconstructs blobs from L2 tx data via blob-builder
-            ◄── proxy builds ClientInput from L2 RPC
+                 Content-Type: application/octet-stream
+                 [Content-Encoding: zstd]
+                 Body: bincode(ChallengeSp1Request { client_input, blobs })
             ◄── proxy submits to SP1 prover network (Groth16)
             ◄── 200 OK  { "request_id": "0x..." }
 ```
@@ -90,12 +90,11 @@ proxy
 
 | Variable | Default | Description |
 |---|---|---|
-| `RPC_URL` | `http://localhost:8545` | L2 RPC endpoint URL used to fetch block data + reconstruct blobs |
+| `RPC_URL` | `http://localhost:8545` | L2 RPC endpoint URL used by `/mock/sp1/request` to build `ClientInput` and reconstruct blobs |
 | `LISTEN_ADDR` | `0.0.0.0:8080` | TCP address to bind |
-| `L1_RPC_URL` | *(unset)* | L1 RPC endpoint for batch metadata (`getBatch`, BatchCommitted scans). Required for challenge endpoints |
+| `L1_RPC_URL` | *(unset)* | L1 RPC endpoint for batch metadata (`BatchCommitted` scans). Required for `/mock/sp1/request` |
 | `L1_ROLLUP_ADDR` | *(unset)* | L1 rollup contract address. Required with `L1_RPC_URL` |
 | `L1_ROLLUP_DEPLOY_BLOCK` | `0` | Lower bound for `BatchCommitted` event scans |
-| `WITNESS_HUB_URL` | *(unset)* | Optional witness-orchestrator cold-storage HTTP endpoint; if set, challenge/mock handlers query it before host-executing |
 | `AWS_SESSION_TOKEN` | *(unset)* | Temporary session token (required when using STS / assumed roles) |
 | `DATA_KEY_STORAGE` | `./data_key.enc` | Path to the KMS-encrypted data key |
 | `ATTESTATION_STORAGE` | `./attestation.bin` | Path to the NSM attestation document |
@@ -178,19 +177,25 @@ Signs a batch root over **caller-provided** EIP-4844 blobs. The witness-orchestr
 
 ### POST /challenge/sp1/request
 
-Submits a block for asynchronous Groth16 proof generation on the Succinct prover network. Reconstructs EIP-4844 blobs for `batch_index` from L2 transaction data via `rsp_blob_builder::build_blobs_from_l2`. Returns a `request_id` for polling.
+Submits a fully-built challenge proof to the Succinct prover network for asynchronous Groth16 proof generation. The orchestrator supplies the `EthClientExecutorInput` (witness) and the canonical EIP-4844 blobs in the request body — the proxy does not touch L1 or any L2 RPC on this path.
 
-Requires `SP1_ELF_PATH` and L1 context.
+Requires `SP1_ELF_PATH`.
 
-**Request**
-```json
-{
-  "block_number": 1234567,
-  "batch_index": 5
+**Headers**
+```http
+Content-Type: application/octet-stream
+[Content-Encoding: zstd]
+```
+
+**Body** — bincode-serialized `nitro_types::ChallengeSp1Request`:
+```rust
+struct ChallengeSp1Request {
+    client_input: Box<EthClientExecutorInput>,
+    blobs: Vec<Vec<u8>>,
 }
 ```
 
-`block_hash` may be sent instead of `block_number`; one of the two is required.
+Optionally zstd-compressed when `Content-Encoding: zstd` is present.
 
 **Response** `200 OK`
 ```json
@@ -242,7 +247,9 @@ The L1 `Rollup.resolveBlockChallenge` reconstructs these public values from the 
 
 ### POST /mock/sp1/request
 
-Executes the SP1 zkVM program locally on the CPU without submitting to the prover network. Takes the same payload as `/challenge/sp1/request`. Requires `SP1_ELF_PATH` and L1 context.
+Self-contained dev/testing endpoint: executes the SP1 zkVM program locally on the CPU without submitting to the prover network. Unlike `/challenge/sp1/request`, the proxy builds `ClientInput` from L2 RPC and reconstructs blobs from L2 tx data itself — no orchestrator required.
+
+Requires `SP1_ELF_PATH` and L1 context.
 
 The endpoint performs the full pipeline: reconstructs blobs from L2 tx data via `blob-builder`, builds `ClientInput` from L2 RPC, prepares KZG witnesses, and runs the SP1 guest program via CPU executor. Returns synchronously whether execution succeeded or failed.
 

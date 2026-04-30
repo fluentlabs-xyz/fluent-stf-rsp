@@ -28,6 +28,21 @@ pub struct BlobVerificationInput {
     pub proofs: Vec<Vec<u8>>,
 }
 
+/// Wire body for `POST /challenge/sp1/request` (orchestrator → proxy).
+///
+/// The orchestrator already owns the witness payload (via
+/// `Driver::get_or_build_witness`) and the canonical batch blobs (via
+/// `rsp_blob_builder::build_blobs_from_l2`). It packages both into this
+/// struct, bincode-serializes, optionally zstd-compresses, and POSTs as
+/// `application/octet-stream`. The proxy then becomes a thin SP1
+/// forwarder: no L1/Beacon access, no host-execute, no cold-store
+/// lookup on the challenge path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChallengeSp1Request {
+    pub client_input: Box<EthClientExecutorInput>,
+    pub blobs: Vec<Vec<u8>>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SubmitBatchResponse {
     pub batch_root: Vec<u8>,

@@ -22,7 +22,6 @@
 //! | `WITNESS_COLD_FILE` | `<datadir>/cold.redb` | redb file for cold witness store |
 //! | `MAX_COLD_BYTES` | `34359738368` (32 GiB) | Size cap for cold witness store |
 //! | `WITNESS_RETENTION_BLOCKS` | `172800` | Cold store retention window in L2 blocks — blocks older than `tip - retention` are pruned on push. `0` disables retention (archive mode). |
-//! | `WITNESS_HUB_LISTEN_ADDR` | `127.0.0.1:8090` | HTTP listen address of the witness-server that serves cold witnesses to external consumers (proxy). |
 //! | `MDBX_MAX_SIZE` | `549755813888` (512 GiB) | MDBX max size |
 //! | `PROXY_URL` | `http://127.0.0.1:8080` | Remote proxy base URL |
 //! | `DB_PATH` | `./witness_orchestrator.db` | SQLite DB for crash recovery |
@@ -71,7 +70,6 @@ mod metrics;
 mod orchestrator;
 mod rbf;
 mod types;
-mod witness_server;
 
 use std::{
     path::PathBuf,
@@ -106,8 +104,6 @@ const DEFAULT_MAX_COLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const DEFAULT_MDBX_MAX_SIZE: u64 = 512 * 1024 * 1024 * 1024;
 /// Default cold-store retention window: 172 800 L2 blocks (~2 days at 1 s/block).
 const DEFAULT_WITNESS_RETENTION_BLOCKS: u64 = 172_800;
-/// Default listen address for the witness HTTP server.
-const DEFAULT_WITNESS_HUB_LISTEN_ADDR: &str = "127.0.0.1:8090";
 /// Default listen address for the Prometheus `/metrics` HTTP server.
 const DEFAULT_METRICS_LISTEN_ADDR: &str = "0.0.0.0:9090";
 
@@ -140,8 +136,6 @@ async fn main() -> eyre::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_WITNESS_RETENTION_BLOCKS);
-    let witness_hub_listen_addr = std::env::var("WITNESS_HUB_LISTEN_ADDR")
-        .unwrap_or_else(|_| DEFAULT_WITNESS_HUB_LISTEN_ADDR.into());
     let mdbx_max_size: u64 = std::env::var("MDBX_MAX_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -298,7 +292,6 @@ async fn main() -> eyre::Result<()> {
         ?cold_file,
         max_cold_bytes,
         witness_retention_blocks,
-        %witness_hub_listen_addr,
         %proxy_url,
         ?db_path,
         http_timeout_secs,
@@ -526,21 +519,6 @@ async fn main() -> eyre::Result<()> {
         })
         .expect("Driver::new failed"),
     );
-
-    // Witness HTTP server — serves witnesses to the proxy (challenge/mock
-    // endpoints). Cold-store hit is verbatim; cold miss falls through to an
-    // MDBX-backed rebuild inside `Driver::get_or_build_witness`. Opens its
-    // own read path into the cold `redb` file via the Arc it shares with the
-    // driver — no cross-process lock conflict.
-    {
-        let driver = Arc::clone(&driver);
-        let shutdown = shutdown.clone();
-        let addr = witness_hub_listen_addr.clone();
-        tasks.spawn(async move {
-            let r = witness_server::run(addr, driver, shutdown).await;
-            ("witness_server", r)
-        });
-    }
 
     // Catch-up runs as its own task so the orchestrator (L1 listener, signing,
     // dispatch) stays responsive while MDBX fast-forwards to witness_from_block.

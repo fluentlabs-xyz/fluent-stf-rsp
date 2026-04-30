@@ -36,6 +36,7 @@ use l1_rollup_client::{
     build_resolve_batch_root_challenge_tx, build_resolve_block_challenge_tx, L2BlockHeader,
     MerkleProof, RollupTxTemplate,
 };
+use nitro_types::ChallengeSp1Request;
 use rsp_host_executor::events_hash::{
     calculate_deposit_hash, calculate_withdrawal_root, count_deposits,
 };
@@ -221,12 +222,77 @@ async fn handle_block_received(
         Some(n) => n,
         None => return,
     };
+    let (from_block, to_block) = match lookup_batch_range(shared, row.batch_index) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(challenge_id = row.challenge_id, err = %e, "lookup_batch_range failed");
+            return;
+        }
+    };
+
+    // 1. Get bincode-serialized EthClientExecutorInput from the driver. Cold-store hit is verbatim;
+    //    cold miss falls through to an MDBX-backed rebuild.
+    let witness_bytes = match shared.driver.get_or_build_witness(target_block_number).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            warn!(
+                challenge_id = row.challenge_id,
+                target_block_number, "witness not available (block beyond MDBX tip or zero)"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                challenge_id = row.challenge_id,
+                target_block_number,
+                err = %e,
+                "Driver::get_or_build_witness failed"
+            );
+            return;
+        }
+    };
+    let client_input: rsp_client_executor::io::EthClientExecutorInput =
+        match bincode::deserialize(&witness_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    challenge_id = row.challenge_id,
+                    target_block_number,
+                    err = %e,
+                    "deserialize EthClientExecutorInput from witness payload failed"
+                );
+                return;
+            }
+        };
+
+    // 2. Build canonical EIP-4844 blobs from L2 transaction data.
+    let blobs = match rsp_blob_builder::build_blobs_from_l2(
+        &shared.config.l2_provider,
+        from_block,
+        to_block,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                challenge_id = row.challenge_id,
+                from_block,
+                to_block,
+                err = %e,
+                "build_blobs_from_l2 failed"
+            );
+            return;
+        }
+    };
+
+    // 3. Wrap and POST to the proxy.
+    let payload = ChallengeSp1Request { client_input: Box::new(client_input), blobs };
     match post_sp1_request(
         &shared.config.http_client,
         &shared.config.proxy_url,
         &shared.config.api_key,
-        target_block_number,
-        row.batch_index,
+        &payload,
     )
     .await
     {
@@ -241,6 +307,7 @@ async fn handle_block_received(
                 challenge_id = row.challenge_id,
                 batch_index = row.batch_index,
                 target_block_number,
+                num_blobs = payload.blobs.len(),
                 %request_id,
                 "SP1 proof requested via proxy"
             );
@@ -801,11 +868,11 @@ async fn build_l2_block_header(
 // Proxy SP1 round-trip
 // ============================================================================
 
-#[derive(Serialize)]
-struct Sp1RequestBody {
-    block_number: u64,
-    batch_index: u64,
-}
+/// zstd level used to compress the bincode-serialized
+/// [`ChallengeSp1Request`] body. Same level as
+/// `/sign-block-execution` (the only other heavy POST path).
+#[cfg(feature = "zstd-block-payload")]
+const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 #[derive(Serialize)]
 struct Sp1StatusBody {
@@ -844,16 +911,36 @@ async fn post_sp1_request(
     http_client: &reqwest::Client,
     proxy_url: &str,
     api_key: &str,
-    block_number: u64,
-    batch_index: u64,
+    payload: &ChallengeSp1Request,
 ) -> eyre::Result<B256> {
-    let resp = http_client
+    let serialized = bincode::serialize(payload)
+        .map_err(|e| eyre::eyre!("bincode serialize ChallengeSp1Request: {e}"))?;
+
+    #[cfg(feature = "zstd-block-payload")]
+    let (body, content_encoding): (Vec<u8>, Option<&'static str>) = {
+        let uncompressed_len = serialized.len();
+        let compressed = zstd::encode_all(serialized.as_slice(), ZSTD_COMPRESSION_LEVEL)
+            .map_err(|e| eyre::eyre!("zstd encode ChallengeSp1Request: {e}"))?;
+        tracing::debug!(
+            uncompressed_len,
+            compressed_len = compressed.len(),
+            "Compressed ChallengeSp1Request payload"
+        );
+        (compressed, Some("zstd"))
+    };
+    #[cfg(not(feature = "zstd-block-payload"))]
+    let (body, content_encoding): (Vec<u8>, Option<&'static str>) = (serialized, None);
+
+    let mut req = http_client
         .post(format!("{proxy_url}/challenge/sp1/request"))
         .header("x-api-key", api_key)
-        .json(&Sp1RequestBody { block_number, batch_index })
-        .send()
-        .await
-        .map_err(|e| eyre::eyre!("/challenge/sp1/request POST failed: {e}"))?;
+        .header("content-type", "application/octet-stream")
+        .body(body);
+    if let Some(enc) = content_encoding {
+        req = req.header("content-encoding", enc);
+    }
+    let resp =
+        req.send().await.map_err(|e| eyre::eyre!("/challenge/sp1/request POST failed: {e}"))?;
 
     let status = resp.status();
     if !status.is_success() {

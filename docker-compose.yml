@@ -57,7 +57,6 @@ services:
       L1_SUBMITTER_KEY: ${L1_SUBMITTER_KEY:?L1_SUBMITTER_KEY is required in .env}
       SP1_PROVER: ${SP1_PROVER}
       NETWORK_PRIVATE_KEY: ${SP1_PRIVATE_KEY}
-      WITNESS_HUB_URL: ${WITNESS_HUB_URL}
     # TCP-only liveness probe. This verifies only that proxy has bound the
     # socket — it does NOT verify that the enclave handshake succeeded or that
     # the signing pipeline is ready. If proxy is stuck retrying vsock handshake
@@ -126,7 +125,6 @@ services:
       WITNESS_COLD_FILE: ${WITNESS_COLD_FILE}
       MAX_COLD_BYTES: ${MAX_COLD_BYTES}
       WITNESS_RETENTION_BLOCKS: ${WITNESS_RETENTION_BLOCKS}
-      WITNESS_HUB_LISTEN_ADDR: ${WITNESS_HUB_LISTEN_ADDR}
       MDBX_MAX_SIZE: ${MDBX_MAX_SIZE}
       PRUNE_FULL: ${PRUNE_FULL}
       DB_PATH: ${DB_PATH}
