@@ -1,41 +1,51 @@
-//! Persistent challenge resolver: a single worker drives every challenge
-//! row through the DB-backed status machine
-//! (`received → sp1_proving → sp1_proved → dispatched → resolved`).
+//! Persistent challenge resolver: two parallel workers (one per kind)
+//! drive challenge rows through the DB-backed status machine.
 //!
-//! - **Block-level** challenges: delegate SP1 Groth16 proof generation to the proxy
-//!   `/challenge/sp1/{request,status}` API; build a merkle inclusion proof from L2 RPC data; submit
-//!   `resolveBlockChallenge`.
-//! - **Batch-root** challenges: reconstruct the merkle root locally from L2 RPC headers + receipts
-//!   (no SP1); submit `resolveBatchRootChallenge`.
+//! - **Block-level** challenges: `received → sp1_proving → sp1_proved → dispatched → resolved`.
+//!   Delegates SP1 Groth16 proof generation to the proxy `/challenge/sp1/{request,status}` API;
+//!   before broadcasting the result, asserts the proxy's reported `vk_hash` matches the on-chain
+//!   `programVKey()` cached at startup. Builds a merkle inclusion proof from L2 RPC data and
+//!   submits `resolveBlockChallenge`.
+//! - **Batch-root** challenges: `received → dispatched → resolved`. Reconstructs the merkle root
+//!   locally from L2 RPC headers + receipts (no SP1) and submits `resolveBatchRootChallenge`.
 //!
-//! Single-worker: one challenge in flight at a time. State is durable in
-//! the `challenges` SQLite table — restart resumes from the persisted
-//! status without re-issuing SP1 work or re-broadcasting in-flight resolve
-//! txs.
+//! Workers do NOT share state beyond the SQLite handle and the
+//! `NonceAllocator`. A long-running SP1 proof on the Block-worker
+//! cannot starve a queued BatchRoot challenge.
+//!
+//! Each worker orders by deadline ASC so a tight-deadline challenge
+//! takes precedence over a loose-deadline one — which `committed_at`
+//! ordering would not respect after backfill.
+//!
+//! Pre-broadcast safety: every resolve template runs through
+//! `validate_resolve_pre_broadcast` (cheap local merkle/chain assertions
+//! plus an `eth_call` simulation against the contract). On any failure
+//! the row is marked `Failed` and we do NOT broadcast — there is no
+//! recovery by retry from the same inputs.
 
 use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::{Bytes, FixedBytes, B256, U256};
 use alloy_provider::Provider;
-use alloy_rpc_types::TransactionReceipt;
+use alloy_rpc_types::{TransactionReceipt, TransactionRequest};
 use fluent_stf_primitives::{
     BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC, BRIDGE_ROLLBACK_TOPIC, BRIDGE_WITHDRAWAL_TOPIC,
     LEGACY_BRIDGE_WITHDRAWAL_TOPIC,
 };
 use l1_rollup_client::{
-    build_resolve_batch_root_challenge_tx, build_resolve_block_challenge_tx, fetch_batch_range,
-    L2BlockHeader, MerkleProof, RollupTxTemplate,
+    build_resolve_batch_root_challenge_tx, build_resolve_block_challenge_tx, L2BlockHeader,
+    MerkleProof, RollupTxTemplate,
 };
 use rsp_host_executor::events_hash::{
     calculate_deposit_hash, calculate_withdrawal_root, count_deposits,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     db::{db_send_sync, ChallengeKind, ChallengePatch, ChallengeRow, ChallengeStatus, SyncOp},
-    orchestrator::{DispatchBackoff, OrchestratorShared, RevertKind},
+    orchestrator::{DispatchBackoff, OrchestratorShared, RevertKind, STUCK_AT_CAP_TIMEOUT},
     rbf::{run_generic, RbfObserver},
 };
 
@@ -45,15 +55,30 @@ const SP1_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// Active worker tick.
 const WORKER_TICK: Duration = Duration::from_secs(1);
 
+/// Average L1 block time used to translate `(deadline - current_block)` into wall-clock seconds.
+const L1_BLOCK_SECS: u64 = 12;
+
 // ============================================================================
-// Worker entry point
+// Worker entry point — two parallel workers, one per kind
 // ============================================================================
 
 pub(crate) async fn run(shared: Arc<OrchestratorShared>) {
-    info!("challenge_resolver started");
+    info!("challenge_resolver started (block + batch_root workers)");
+    let block = {
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move { run_block_worker(shared).await })
+    };
+    let batch_root = {
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move { run_batch_root_worker(shared).await })
+    };
+    let _ = tokio::join!(block, batch_root);
+    info!("challenge_resolver exiting");
+}
+
+async fn run_block_worker(shared: Arc<OrchestratorShared>) {
     let mut tick = tokio::time::interval(WORKER_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Consume the immediately-ready first tick so the loop body runs on cycle 0.
     tick.tick().await;
     let mut backoff = DispatchBackoff::default();
 
@@ -65,40 +90,29 @@ pub(crate) async fn run(shared: Arc<OrchestratorShared>) {
         'work: {
             let row = {
                 let guard = shared.db.lock().unwrap_or_else(|e| e.into_inner());
-                guard.find_active_challenge()
+                guard.find_active_block_challenge()
             };
             let Some(row) = row else { break 'work };
 
-            // Deadline visibility: log + metric, but the operator decides what
-            // to do — we do not auto-abort (per the no-`aborted` decision).
-            if row.deadline != u64::MAX {
-                if let Ok(current_l1_block) = shared.config.l1_provider.get_block_number().await {
-                    if current_l1_block > row.deadline {
-                        metrics::counter!(
-                            "orchestrator_challenge_deadline_expired_total",
-                            "kind" => row.kind.as_str(),
-                        )
-                        .increment(1);
-                        warn!(
-                            challenge_id = row.challenge_id,
-                            deadline = row.deadline,
-                            current_l1_block,
-                            "challenge deadline expired"
-                        );
-                    }
-                }
+            if check_and_fail_if_deadline_expired(&shared, &row).await {
+                break 'work;
             }
 
             match row.status {
-                ChallengeStatus::Received => handle_received(&shared, &row, &mut backoff).await,
+                ChallengeStatus::Received => {
+                    handle_block_received(&shared, &row, &mut backoff).await
+                }
                 ChallengeStatus::Sp1Proving => handle_sp1_proving(&shared, &row).await,
                 ChallengeStatus::Sp1Proved => handle_sp1_proved(&shared, &row, &mut backoff).await,
                 ChallengeStatus::Dispatched => {
                     handle_dispatched_resume(&shared, &row, &mut backoff).await;
                 }
-                ChallengeStatus::Resolved => {
-                    // Filtered by `find_active_challenge`; defensive log.
-                    warn!(challenge_id = row.challenge_id, "active gate returned resolved row");
+                ChallengeStatus::Resolved | ChallengeStatus::Failed => {
+                    warn!(
+                        challenge_id = row.challenge_id,
+                        status = ?row.status,
+                        "block worker active gate returned terminal row"
+                    );
                 }
             }
         }
@@ -109,79 +123,147 @@ pub(crate) async fn run(shared: Arc<OrchestratorShared>) {
             _ = tick.tick() => {}
         }
     }
-    info!("challenge_resolver exiting");
+    info!("block_worker exiting");
 }
 
-// ============================================================================
-// Status-specific handlers
-// ============================================================================
+async fn run_batch_root_worker(shared: Arc<OrchestratorShared>) {
+    let mut tick = tokio::time::interval(WORKER_TICK);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    tick.tick().await;
+    let mut backoff = DispatchBackoff::default();
 
-async fn handle_received(
-    shared: &OrchestratorShared,
-    row: &ChallengeRow,
-    backoff: &mut DispatchBackoff,
-) {
-    match row.kind {
-        ChallengeKind::Block => {
-            // Block-kind: ask the proxy to produce an SP1 proof; status
-            // moves to `sp1_proving` only after we have a request_id.
-            let target_block_number = match resolve_block_target(shared, row).await {
-                Some(n) => n,
-                None => return,
+    loop {
+        if shared.shutdown.is_cancelled() {
+            break;
+        }
+
+        'work: {
+            let row = {
+                let guard = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+                guard.find_active_batch_root_challenge()
             };
-            match post_sp1_request(
-                &shared.config.http_client,
-                &shared.config.proxy_url,
-                &shared.config.api_key,
-                target_block_number,
-                row.batch_index,
-            )
-            .await
-            {
-                Ok(request_id) => {
-                    let patch = ChallengePatch {
-                        status: Some(ChallengeStatus::Sp1Proving),
-                        sp1_request_id: Some(Some(request_id)),
-                        ..Default::default()
-                    };
-                    persist_patch(shared, row.challenge_id, patch).await;
-                    info!(
-                        challenge_id = row.challenge_id,
-                        batch_index = row.batch_index,
-                        target_block_number,
-                        %request_id,
-                        "SP1 proof requested via proxy"
-                    );
+            let Some(row) = row else { break 'work };
+
+            if check_and_fail_if_deadline_expired(&shared, &row).await {
+                break 'work;
+            }
+
+            match row.status {
+                ChallengeStatus::Received => {
+                    run_resolve_lifecycle(&shared, &row, &mut backoff).await;
                 }
-                Err(e) => {
+                ChallengeStatus::Dispatched => {
+                    handle_dispatched_resume(&shared, &row, &mut backoff).await;
+                }
+                other => {
                     warn!(
                         challenge_id = row.challenge_id,
-                        err = %e,
-                        "post_sp1_request failed"
+                        status = ?other,
+                        "batch_root worker active gate returned unexpected row"
                     );
                 }
             }
         }
-        ChallengeKind::BatchRoot => {
-            // Batch-root: no SP1 round-trip — build calldata + broadcast.
-            run_resolve_lifecycle(shared, row, backoff).await;
+
+        tokio::select! {
+            biased;
+            _ = shared.shutdown.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+    }
+    info!("batch_root_worker exiting");
+}
+
+// ============================================================================
+// Deadline gate
+// ============================================================================
+
+/// Returns `true` if the row was past its resolution deadline and was
+/// transitioned to `Failed`. Operator must call `revertBatches` on L1.
+async fn check_and_fail_if_deadline_expired(
+    shared: &OrchestratorShared,
+    row: &ChallengeRow,
+) -> bool {
+    let Ok(current_l1_block) = shared.config.l1_provider.get_block_number().await else {
+        return false;
+    };
+    if current_l1_block <= row.deadline {
+        return false;
+    }
+    metrics::counter!(
+        "orchestrator_challenge_deadline_expired_total",
+        "kind" => row.kind.as_str(),
+    )
+    .increment(1);
+    error!(
+        challenge_id = row.challenge_id,
+        kind = row.kind.as_str(),
+        deadline = row.deadline,
+        current_l1_block,
+        "challenge deadline expired — marking failed (rollup will go corrupted; \
+         operator must call revertBatches)"
+    );
+    let patch = ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
+    persist_patch(shared, row.challenge_id, patch).await;
+    true
+}
+
+// ============================================================================
+// Block-kind status handlers
+// ============================================================================
+
+async fn handle_block_received(
+    shared: &OrchestratorShared,
+    row: &ChallengeRow,
+    _backoff: &mut DispatchBackoff,
+) {
+    let target_block_number = match resolve_block_target(shared, row).await {
+        Some(n) => n,
+        None => return,
+    };
+    match post_sp1_request(
+        &shared.config.http_client,
+        &shared.config.proxy_url,
+        &shared.config.api_key,
+        target_block_number,
+        row.batch_index,
+    )
+    .await
+    {
+        Ok(request_id) => {
+            let patch = ChallengePatch {
+                status: Some(ChallengeStatus::Sp1Proving),
+                sp1_request_id: Some(Some(request_id)),
+                ..Default::default()
+            };
+            persist_patch(shared, row.challenge_id, patch).await;
+            info!(
+                challenge_id = row.challenge_id,
+                batch_index = row.batch_index,
+                target_block_number,
+                %request_id,
+                "SP1 proof requested via proxy"
+            );
+        }
+        Err(e) => {
+            warn!(
+                challenge_id = row.challenge_id,
+                err = %e,
+                "post_sp1_request failed"
+            );
         }
     }
 }
 
 async fn handle_sp1_proving(shared: &OrchestratorShared, row: &ChallengeRow) {
-    let request_id = match row.sp1_request_id {
-        Some(id) => id,
-        None => {
-            warn!(
-                challenge_id = row.challenge_id,
-                "sp1_proving without sp1_request_id — rolling back to received"
-            );
-            let patch =
-                ChallengePatch { status: Some(ChallengeStatus::Received), ..Default::default() };
-            persist_patch(shared, row.challenge_id, patch).await;
-            return;
-        }
+    // CHECK constraint guarantees Sp1Proving rows always carry sp1_request_id.
+    // This `else` is defensive only — real divergence would mean DB corruption.
+    let Some(request_id) = row.sp1_request_id else {
+        error!(
+            challenge_id = row.challenge_id,
+            "BUG: Sp1Proving row without sp1_request_id (CHECK constraint violated)"
+        );
+        return;
     };
     match poll_sp1_status(
         &shared.config.http_client,
@@ -191,7 +273,21 @@ async fn handle_sp1_proving(shared: &OrchestratorShared, row: &ChallengeRow) {
     )
     .await
     {
-        Ok(Sp1StatusOutcome::Ready(proof_bytes)) => {
+        Ok(Sp1StatusOutcome::Ready { vk_hash, proof_bytes }) => {
+            let on_chain = shared.config.on_chain_program_vkey;
+            if vk_hash != on_chain {
+                error!(
+                    challenge_id = row.challenge_id,
+                    proxy_vk_hash = %vk_hash,
+                    on_chain_vk_hash = %shared.config.on_chain_program_vkey,
+                    "vk_hash mismatch — proxy SP1 ELF diverged from on-chain programVKey; \
+                     marking challenge failed (proxy redeploy required)"
+                );
+                let patch =
+                    ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
+                persist_patch(shared, row.challenge_id, patch).await;
+                return;
+            }
             let patch = ChallengePatch {
                 status: Some(ChallengeStatus::Sp1Proved),
                 sp1_proof_bytes: Some(Some(proof_bytes)),
@@ -242,20 +338,24 @@ async fn handle_dispatched_resume(
     row: &ChallengeRow,
     backoff: &mut DispatchBackoff,
 ) {
-    let resume = match (row.nonce, row.tx_hash, row.max_fee_per_gas, row.max_priority_fee_per_gas) {
-        (Some(n), Some(h), Some(fee), Some(tip)) => ResumeState {
-            nonce: n,
+    // Stored-or-allocate: prefer the persisted nonce when present so a
+    // partial RBF tear (e.g. tx_hash cleared but nonce lingering) does
+    // not leak nonces by allocating a fresh one.
+    let nonce = match row.nonce {
+        Some(n) => n,
+        None => shared.nonce_allocator.allocate(),
+    };
+    let resume = match (row.tx_hash, row.max_fee_per_gas, row.max_priority_fee_per_gas) {
+        (Some(h), Some(fee), Some(tip)) => Some(crate::db::RbfResumeState {
+            nonce,
             tx_hash: h,
             max_fee_per_gas: fee,
             max_priority_fee_per_gas: tip,
-        },
-        _ => {
-            // RBF state torn — restart from scratch (a fresh nonce, fees).
-            run_resolve_lifecycle(shared, row, backoff).await;
-            return;
-        }
+        }),
+        _ => None,
     };
-    let template = match build_resolve_template(shared, row, resume.nonce).await {
+
+    let template = match build_resolve_template(shared, row, nonce).await {
         Ok(t) => t,
         Err(e) => {
             warn!(
@@ -263,45 +363,61 @@ async fn handle_dispatched_resume(
                 err = %e,
                 "build_resolve_template (resume) failed"
             );
+            // Only release if we just allocated a fresh nonce (row.nonce was None).
+            if row.nonce.is_none() {
+                shared.nonce_allocator.release(nonce);
+            }
             return;
         }
     };
+
+    if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &template).await {
+        fail_with_reason(shared, row, reason).await;
+        if row.nonce.is_none() {
+            shared.nonce_allocator.release(nonce);
+        }
+        return;
+    }
+
+    let (fee, tip) = match resume.as_ref() {
+        Some(r) => (r.max_fee_per_gas, r.max_priority_fee_per_gas),
+        None => match estimate_initial_fees(shared, row).await {
+            Some(v) => v,
+            None => {
+                if row.nonce.is_none() {
+                    shared.nonce_allocator.release(nonce);
+                }
+                return;
+            }
+        },
+    };
+
     let observer = ResolveObserver {
         shared,
         challenge_id: row.challenge_id,
         kind: row.kind,
-        nonce: resume.nonce,
+        nonce,
         batch_index: row.batch_index,
     };
+    let budget = compute_wall_clock_budget(&shared.config.l1_provider, row.deadline).await;
     run_generic(
         shared,
         row.batch_index,
         &template,
-        resume.nonce,
-        Some(crate::db::RbfResumeState {
-            nonce: resume.nonce,
-            tx_hash: resume.tx_hash,
-            max_fee_per_gas: resume.max_fee_per_gas,
-            max_priority_fee_per_gas: resume.max_priority_fee_per_gas,
-        }),
-        resume.max_fee_per_gas,
-        resume.max_priority_fee_per_gas,
+        nonce,
+        resume,
+        fee,
+        tip,
+        budget,
         &observer,
         backoff,
     )
     .await;
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ResumeState {
-    nonce: u64,
-    tx_hash: B256,
-    max_fee_per_gas: u128,
-    max_priority_fee_per_gas: u128,
-}
-
-/// Allocate a fresh nonce, build the calldata, estimate fees, and run the
-/// shared RBF lifecycle from a clean start.
+/// Allocate a fresh nonce, build the calldata, run pre-broadcast validation,
+/// estimate fees, then enter the RBF lifecycle. Used by both kinds for the
+/// initial dispatch from `Received` (BatchRoot) or `Sp1Proved` (Block).
 async fn run_resolve_lifecycle(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
@@ -320,6 +436,48 @@ async fn run_resolve_lifecycle(
             return;
         }
     };
+
+    if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &template).await {
+        fail_with_reason(shared, row, reason).await;
+        shared.nonce_allocator.release(nonce);
+        return;
+    }
+
+    let (fee, tip) = match estimate_initial_fees(shared, row).await {
+        Some(v) => v,
+        None => {
+            shared.nonce_allocator.release(nonce);
+            return;
+        }
+    };
+
+    let observer = ResolveObserver {
+        shared,
+        challenge_id: row.challenge_id,
+        kind: row.kind,
+        nonce,
+        batch_index: row.batch_index,
+    };
+    let budget = compute_wall_clock_budget(&shared.config.l1_provider, row.deadline).await;
+    run_generic(
+        shared,
+        row.batch_index,
+        &template,
+        nonce,
+        None,
+        fee,
+        tip,
+        budget,
+        &observer,
+        backoff,
+    )
+    .await;
+}
+
+async fn estimate_initial_fees(
+    shared: &OrchestratorShared,
+    row: &ChallengeRow,
+) -> Option<(u128, u128)> {
     let cap = shared.config.rbf_max_fee_per_gas_wei;
     let est = match shared.config.l1_provider.estimate_eip1559_fees().await {
         Ok(e) => e,
@@ -329,8 +487,7 @@ async fn run_resolve_lifecycle(
                 err = %e,
                 "estimate_eip1559_fees failed"
             );
-            shared.nonce_allocator.release(nonce);
-            return;
+            return None;
         }
     };
     let mut fee = est.max_fee_per_gas;
@@ -347,16 +504,74 @@ async fn run_resolve_lifecycle(
             "resolve initial fee at/above cap"
         );
     }
-    let observer = ResolveObserver {
-        shared,
-        challenge_id: row.challenge_id,
-        kind: row.kind,
-        nonce,
-        batch_index: row.batch_index,
-    };
-    run_generic(shared, row.batch_index, &template, nonce, None, fee, tip, &observer, backoff)
-        .await;
+    Some((fee, tip))
 }
+
+/// Compute the per-resolve wall-clock budget for the RBF stuck-at-cap
+/// timeout: the smaller of the preconfirm-tuned default and
+/// `(deadline - current_block) × ~12s`. Caps at the static default so a
+/// huge deadline doesn't extend the budget unnecessarily.
+async fn compute_wall_clock_budget(l1_provider: &impl Provider, deadline: u64) -> Duration {
+    let current = l1_provider.get_block_number().await.unwrap_or(0);
+    let blocks_left = deadline.saturating_sub(current);
+    let computed = Duration::from_secs(blocks_left.saturating_mul(L1_BLOCK_SECS));
+    std::cmp::min(STUCK_AT_CAP_TIMEOUT, computed)
+}
+
+async fn fail_with_reason(shared: &OrchestratorShared, row: &ChallengeRow, reason: String) {
+    error!(
+        challenge_id = row.challenge_id,
+        kind = row.kind.as_str(),
+        reason = %reason,
+        "pre-broadcast validation failed — marking challenge failed"
+    );
+    metrics::counter!(
+        "orchestrator_challenge_pre_broadcast_failed_total",
+        "kind" => row.kind.as_str(),
+    )
+    .increment(1);
+    let patch = ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
+    persist_patch(shared, row.challenge_id, patch).await;
+}
+
+// ============================================================================
+// Pre-broadcast validation: local cheap checks + eth_call simulation
+// ============================================================================
+
+/// Catch-all defense before broadcasting a resolve tx: simulate the
+/// signed calldata via `eth_call`. If the contract would revert, we
+/// surface the revert reason and abort — there is no recovery from the
+/// same inputs, retry is wasted gas.
+///
+/// Local merkle / chain-linkage assertions are NOT duplicated here
+/// because they are already implicit in `build_resolve_template` (which
+/// produces calldata derived from the same headers/leaves the contract
+/// re-validates). The simulation is the catch-all; it covers any future
+/// contract revert path automatically.
+async fn validate_resolve_pre_broadcast(
+    shared: &OrchestratorShared,
+    row: &ChallengeRow,
+    template: &RollupTxTemplate,
+) -> Result<(), String> {
+    let req = TransactionRequest {
+        from: Some(shared.config.l1_signer_address),
+        to: Some(template.to.into()),
+        input: template.input.clone().into(),
+        ..Default::default()
+    };
+    match shared.config.l1_provider.call(req).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!(
+            "eth_call simulation reverted (challenge_id={}, kind={}): {e}",
+            row.challenge_id,
+            row.kind.as_str()
+        )),
+    }
+}
+
+// ============================================================================
+// Resolve template construction
+// ============================================================================
 
 /// Per-kind dispatcher: builds either a `resolveBlockChallenge` or a
 /// `resolveBatchRootChallenge` template.
@@ -384,14 +599,7 @@ async fn build_block_resolve_template(
         .clone()
         .ok_or_else(|| eyre::eyre!("block challenge row missing sp1_proof_bytes"))?;
 
-    let (from_block, to_block) = fetch_batch_range(
-        &cfg.l1_read_provider,
-        &cfg.l2_provider,
-        cfg.l1_rollup_addr,
-        row.batch_index,
-        cfg.l1_deploy_block,
-    )
-    .await?;
+    let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)?;
 
     let (headers, leaves, target_idx) =
         collect_headers_with_target(&cfg.l2_provider, from_block, to_block, Some(commitment))
@@ -429,22 +637,8 @@ async fn build_batch_root_resolve_template(
         return Err(eyre::eyre!("batch 0 is genesis — cannot resolve batch-root challenge"));
     }
 
-    let (from_block, to_block) = fetch_batch_range(
-        &cfg.l1_read_provider,
-        &cfg.l2_provider,
-        cfg.l1_rollup_addr,
-        row.batch_index,
-        cfg.l1_deploy_block,
-    )
-    .await?;
-    let (prev_from, prev_to) = fetch_batch_range(
-        &cfg.l1_read_provider,
-        &cfg.l2_provider,
-        cfg.l1_rollup_addr,
-        row.batch_index - 1,
-        cfg.l1_deploy_block,
-    )
-    .await?;
+    let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)?;
+    let (prev_from, prev_to) = lookup_batch_range(shared, row.batch_index - 1)?;
 
     let (headers, _leaves, _) =
         collect_headers_with_target(&cfg.l2_provider, from_block, to_block, None)
@@ -474,6 +668,20 @@ async fn build_batch_root_resolve_template(
     .await
 }
 
+/// Local lookup of `(from_block, to_block)` for a batch. The orchestrator
+/// observes every `BatchCommitted` event via the listener, so the row
+/// must be present in the local DB by the time any challenge for it is
+/// processed. A missing row is a fatal invariant violation.
+fn lookup_batch_range(shared: &OrchestratorShared, batch_index: u64) -> eyre::Result<(u64, u64)> {
+    let guard = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+    guard.find_batch(batch_index).map(|b| (b.from_block, b.to_block)).ok_or_else(|| {
+        eyre::eyre!(
+            "batch {batch_index} not found in local DB — invariant violation: \
+                 orchestrator must observe every BatchCommitted before any challenge for it"
+        )
+    })
+}
+
 /// Resolve the L2 block number that backs the disputed commitment by
 /// scanning the batch's blocks. Returns `None` on RPC failure or absent
 /// match (caller logs and waits for the next tick).
@@ -486,21 +694,13 @@ async fn resolve_block_target(shared: &OrchestratorShared, row: &ChallengeRow) -
             return None;
         }
     };
-    let (from_block, to_block) = match fetch_batch_range(
-        &cfg.l1_read_provider,
-        &cfg.l2_provider,
-        cfg.l1_rollup_addr,
-        row.batch_index,
-        cfg.l1_deploy_block,
-    )
-    .await
-    {
+    let (from_block, to_block) = match lookup_batch_range(shared, row.batch_index) {
         Ok(r) => r,
         Err(e) => {
             warn!(
                 challenge_id = row.challenge_id,
                 err = %e,
-                "fetch_batch_range failed"
+                "lookup_batch_range failed"
             );
             return None;
         }
@@ -619,15 +819,17 @@ struct Sp1RequestResponse {
 
 #[derive(Deserialize)]
 struct Sp1ProofResponse {
-    #[allow(dead_code)]
     vk_hash: FixedBytes<32>,
+    /// The contract reconstructs publicValues from the block header +
+    /// blob hashes; we don't forward this field to L1. Kept for symmetry
+    /// with the proxy schema and operator inspection.
     #[allow(dead_code)]
     public_values: Vec<u8>,
     proof_bytes: Vec<u8>,
 }
 
 enum Sp1StatusOutcome {
-    Ready(Vec<u8>),
+    Ready { vk_hash: FixedBytes<32>, proof_bytes: Vec<u8> },
     Pending,
 }
 
@@ -690,7 +892,7 @@ async fn poll_sp1_status(
                 .json()
                 .await
                 .map_err(|e| Sp1StatusError::Other(eyre::eyre!("decode proof body: {e}")))?;
-            Ok(Sp1StatusOutcome::Ready(proof.proof_bytes))
+            Ok(Sp1StatusOutcome::Ready { vk_hash: proof.vk_hash, proof_bytes: proof.proof_bytes })
         }
         202 => Ok(Sp1StatusOutcome::Pending),
         404 => Err(Sp1StatusError::Lost),
@@ -736,7 +938,7 @@ impl RbfObserver for ResolveObserver<'_> {
             ..Default::default()
         };
         persist_patch(self.shared, self.challenge_id, patch).await;
-        crate::metrics::counter_resolve_dispatched(metric_kind_label(self.kind));
+        crate::metrics::counter_resolve_dispatched(self.kind.as_str());
     }
 
     async fn on_rebroadcast(&self, hash: B256, fee: u128, tip: u128) {
@@ -769,19 +971,19 @@ impl RbfObserver for ResolveObserver<'_> {
         );
         let patch = ChallengePatch { l1_block: Some(Some(l1_block)), ..Default::default() };
         persist_patch(self.shared, self.challenge_id, patch).await;
-        crate::metrics::counter_resolve_submitted(metric_kind_label(self.kind));
+        crate::metrics::counter_resolve_submitted(self.kind.as_str());
     }
 
     async fn on_reverted(&self, hash: B256, kind: RevertKind) {
         warn!(
-            tx_kind = self.kind.as_str(),
+            kind = self.kind.as_str(),
             challenge_id = self.challenge_id,
             batch_index = self.batch_index,
             %hash,
             ?kind,
             "resolve REVERTED on L1 — alert + retry"
         );
-        crate::metrics::counter_resolve_rejected(metric_kind_label(self.kind));
+        crate::metrics::counter_resolve_rejected(self.kind.as_str());
         // Clear RBF state so the worker re-broadcasts on its next tick.
         // Status stays `Dispatched` with `l1_block IS NULL`.
         let patch = ChallengePatch {
@@ -802,7 +1004,7 @@ impl RbfObserver for ResolveObserver<'_> {
             reason,
             "resolve pre-receipt failure — alert + retry"
         );
-        crate::metrics::counter_resolve_pre_receipt_failure(metric_kind_label(self.kind));
+        crate::metrics::counter_resolve_pre_receipt_failure(self.kind.as_str());
         let patch = ChallengePatch {
             tx_hash: Some(None),
             nonce: Some(None),
@@ -819,16 +1021,9 @@ impl RbfObserver for ResolveObserver<'_> {
             guard.find_challenge_by_id(self.challenge_id)
         };
         match row {
-            Some(r) => r.status == ChallengeStatus::Resolved,
+            Some(r) => matches!(r.status, ChallengeStatus::Resolved | ChallengeStatus::Failed),
             None => true,
         }
-    }
-}
-
-fn metric_kind_label(kind: ChallengeKind) -> &'static str {
-    match kind {
-        ChallengeKind::Block => "resolve_block_challenge",
-        ChallengeKind::BatchRoot => "resolve_batch_root_challenge",
     }
 }
 
@@ -859,15 +1054,7 @@ mod tests {
     /// End-to-end mirror of `Rollup.resolveBatchRootChallenge`'s
     /// validation against real Fluent testnet data for batch 877. Runs
     /// the four checks the contract performs that depend on real chain
-    /// state:
-    ///
-    /// 1. Local merkle root over `blockHeaders[]` equals on-chain `batchRoot`.
-    /// 2. Sequential chain linkage within the batch (`blockHeaders[i].blockHash ==
-    ///    blockHeaders[i+1].previousBlockHash`).
-    /// 3. Cross-batch chain linkage (`lastBlockHeaderInPreviousBatch.blockHash ==
-    ///    blockHeaders[0].previousBlockHash`).
-    /// 4. Merkle inclusion proof of `lastBlockHeaderInPreviousBatch`'s commitment against the
-    ///    previous batch's `batchRoot` at index `previousBatchNumberOfBlocks - 1`.
+    /// state.
     #[tokio::test]
     #[ignore = "requires INTEGRATION_L2_RPC_URL; hits real L2 RPC for ~2k blocks"]
     async fn real_batch_877_resolve_validation() {

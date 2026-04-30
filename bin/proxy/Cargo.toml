@@ -43,7 +43,7 @@ alloy-signer-local = "1.8.1"
 alloy-network.workspace = true
 revm-primitives.workspace = true
 
-# http (for beacon API)
+# http
 reqwest.workspace = true
 
 # reth

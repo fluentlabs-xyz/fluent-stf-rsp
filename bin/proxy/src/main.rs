@@ -4,12 +4,14 @@
 //!
 //! ## Signing endpoints (Nitro TEE, caller provides `EthClientExecutorInput`)
 //!
-//! - `POST /sign-block-execution`           — execute block, return signed result (bincode)
-//! - `POST /sign-batch-root`                — sign batch Merkle root from in-memory store
+//! - `POST /sign-block-execution`     — execute block, return signed result (bincode)
+//! - `POST /sign-batch-root`          — sign a batch root over caller-provided blobs (no L1/Beacon
+//!   fetch)
 //!
-//! ## Challenge endpoints (proxy builds `ClientInput` from cold hub or RPC)
+//! ## Challenge endpoints (proxy builds `ClientInput` from cold hub or RPC, blobs reconstructed
+//!   from L2 transactions via `crates/blob-builder`)
 //!
-//! - `POST /challenge/sp1/request`    — submit async SP1 zkVM proof request (blobs from beacon)
+//! - `POST /challenge/sp1/request`    — submit async SP1 zkVM proof request
 //! - `POST /challenge/sp1/status`     — poll for SP1 proof result
 //!
 //! ## Mock endpoints (testing, local SP1 execution)
@@ -436,8 +438,9 @@ fn decode_bincode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Hand
 
 /// `POST /sign-batch-root`
 ///
-/// Fetches blobs from L1 + Beacon API using `batch_index`, then sends them
-/// to the enclave for batch root signing.
+/// Caller (witness-orchestrator) passes pre-built EIP-4844 blobs reconstructed
+/// from L2 transaction data; the proxy forwards them to the enclave for
+/// signing. No L1 / Beacon API access on this path.
 async fn sign_batch_root(
     State(state): State<AppState>,
     Json(req): Json<SignBatchRootRequest>,
@@ -483,7 +486,8 @@ async fn sign_batch_root(
 /// `POST /challenge/sp1/request`
 /// Body: `{ block_number?, block_hash?, batch_index }`
 ///
-/// Fetches blobs from L1 + Beacon API using `batch_index`.
+/// Reconstructs EIP-4844 blobs for `batch_index` from L2 transaction data
+/// via `rsp_blob_builder::build_blobs_from_l2`. No Beacon API access.
 async fn challenge_sp1_request(
     State(state): State<AppState>,
     Json(req): Json<ChallengeSp1Request>,
@@ -573,6 +577,48 @@ async fn challenge_sp1_status(Json(req): Json<Sp1StatusRequest>) -> impl IntoRes
         _ => {
             info!(challenge_id = %hex::encode(challenge_id), "Challenge proof still pending");
             StatusCode::ACCEPTED.into_response()
+        }
+    }
+}
+
+/// Resume in-flight SP1 challenge proofs after a proxy restart.
+///
+/// Called from the SP1 init background task as soon as `Sp1State` is
+/// available. Mirrors the attestation `resume_all_pending` pattern: rows
+/// with a stored `sp1_request_id` get a worker that calls
+/// `wait_proof(saved_id, ...)` (no stdin reconstruction needed); rows
+/// without an ID are marked failed so the orchestrator's existing 5xx →
+/// re-issue path generates a fresh request.
+async fn resume_all_pending_challenges(sp1_state: &Sp1State) {
+    let rows = {
+        let Some(db) = crate::db::db() else { return };
+        db.load_pending_challenges()
+    };
+    if rows.is_empty() {
+        info!("No pending challenges to resume");
+        return;
+    }
+    info!(count = rows.len(), "Resuming pending challenges");
+    for row in rows {
+        match row.sp1_request_id {
+            Some(sp1_id) => {
+                let client = sp1_state.client.clone();
+                let pk = sp1_state.pk.clone();
+                tokio::spawn(challenge::resume_challenge_proof(
+                    client,
+                    pk,
+                    row.challenge_id,
+                    sp1_id,
+                ));
+            }
+            None => {
+                if let Some(db) = crate::db::db() {
+                    db.set_challenge_failed(
+                        row.challenge_id,
+                        "proxy restart before SP1 submit — orchestrator must re-issue",
+                    );
+                }
+            }
         }
     }
 }
@@ -683,7 +729,12 @@ async fn main() -> eyre::Result<()> {
                 let pk = client.setup(elf).await.unwrap();
                 let vk = pk.verifying_key();
                 info!(vk_hash = %hex::encode(vk.hash_bytes()), "SP1 prover initialised (background)");
-                let _ = cell_clone.set(Sp1State { client: Arc::new(client), pk: Arc::new(pk) });
+                let state = Sp1State { client: Arc::new(client), pk: Arc::new(pk) };
+                let _ = cell_clone.set(state.clone());
+                // Now that SP1 is ready, resume any in-flight challenge
+                // proofs whose `tokio::spawn` worker did not survive the
+                // process restart.
+                resume_all_pending_challenges(&state).await;
             });
 
             info!("SP1 prover initialization started in background");

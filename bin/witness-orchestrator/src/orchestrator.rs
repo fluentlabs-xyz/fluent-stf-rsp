@@ -103,15 +103,8 @@ pub(crate) struct OrchestratorConfig {
     pub proxy_url: String,
     pub http_client: reqwest::Client,
     pub l1_rollup_addr: Address,
-    /// L1 block where the Rollup contract was deployed. Lower bound for
-    /// `fetch_batch_range` event scans on the challenge-resolve path.
-    pub l1_deploy_block: u64,
     pub nitro_verifier_addr: Address,
     pub l1_provider: L1WriteProvider,
-    /// Separate L1 read provider for `fetch_batch_range` (which expects
-    /// the concrete `RootProvider`, not the wallet-filler stack). Built
-    /// once at startup; same RPC URL as `l1_provider`.
-    pub l1_read_provider: RootProvider,
     pub api_key: String,
     pub l2_provider: alloy_provider::RootProvider,
     /// Held alongside `l1_provider` so the RBF worker can sign with an
@@ -126,6 +119,12 @@ pub(crate) struct OrchestratorConfig {
     /// Hitting this cap is a loud operator-attention event; the worker
     /// continues rebroadcasting at the cap.
     pub rbf_max_fee_per_gas_wei: u128,
+    /// On-chain `Rollup.programVKey()` read once at startup. The
+    /// challenge resolver checks the proxy's per-proof `vk_hash`
+    /// against this before broadcasting `resolveBlockChallenge` so a
+    /// stale proxy ELF is caught locally rather than at on-chain
+    /// verifyProof revert.
+    pub on_chain_program_vkey: B256,
 }
 
 /// All batch state lives in SQLite — `db` is the read path, `db_tx` is the
@@ -1646,17 +1645,26 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
                 shared.config.l1_rollup_addr,
                 batch_index,
                 commitment,
+                &shared.shutdown,
             )
             .await
             {
-                warn!(batch_index, %commitment, err = %e, "observe_block_challenged failed");
+                // Only fires on shutdown — observe_block_challenged retries
+                // L1 RPC failures internally.
+                warn!(batch_index, %commitment, err = %e, "observe_block_challenged aborted (shutdown)");
             }
         }
         L1Event::BatchRootChallenged { batch_index } => {
-            if let Err(e) =
-                crate::challenge_db::observe_batch_root_challenged(&shared.db_tx, batch_index).await
+            if let Err(e) = crate::challenge_db::observe_batch_root_challenged(
+                &shared.db_tx,
+                &shared.config.l1_provider,
+                shared.config.l1_rollup_addr,
+                batch_index,
+                &shared.shutdown,
+            )
+            .await
             {
-                warn!(batch_index, err = %e, "observe_batch_root_challenged failed");
+                warn!(batch_index, err = %e, "observe_batch_root_challenged aborted (shutdown)");
             }
         }
         L1Event::ChallengeResolved { batch_index, commitment } => {

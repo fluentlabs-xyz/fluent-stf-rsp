@@ -205,6 +205,50 @@ impl Db {
             )
             .ok()
     }
+
+    /// Snapshot of every challenge row still in `pending`. Used at proxy
+    /// startup to re-spawn `wait_proof` workers for in-flight SP1
+    /// requests that survived a process restart. Rows that have a
+    /// `sp1_request_id` get a fresh `wait_proof` worker; rows without
+    /// one are marked `failed` so the orchestrator's existing 5xx →
+    /// re-issue path takes over.
+    pub(crate) fn load_pending_challenges(&self) -> Vec<PendingChallenge> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT challenge_id, sp1_request_id FROM challenges WHERE status = 'pending'")
+        {
+            Ok(s) => s,
+            Err(e) => {
+                error!(err = %e, "Failed to prepare load_pending_challenges");
+                return Vec::new();
+            }
+        };
+        let rows = stmt.query_map([], |row| {
+            let cid_blob: Vec<u8> = row.get(0)?;
+            let sp1_blob: Option<Vec<u8>> = row.get(1)?;
+            let challenge_id = B256::try_from(cid_blob.as_slice()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("challenge_id: {e}"))),
+                )
+            })?;
+            let sp1_request_id = sp1_blob.and_then(|b| B256::try_from(b.as_slice()).ok());
+            Ok(PendingChallenge { challenge_id, sp1_request_id })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                error!(err = %e, "Failed to query pending challenges");
+                Vec::new()
+            }
+        }
+    }
+}
+
+pub(crate) struct PendingChallenge {
+    pub challenge_id: B256,
+    pub sp1_request_id: Option<B256>,
 }
 
 pub(crate) struct ChallengeRow {

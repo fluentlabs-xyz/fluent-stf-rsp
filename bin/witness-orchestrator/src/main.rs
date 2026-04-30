@@ -565,14 +565,24 @@ async fn main() -> eyre::Result<()> {
         })
     };
 
+    // Read the on-chain SP1 program verification key once at startup.
+    // The challenge resolver uses it to detect proxy ELF / vkey drift
+    // before broadcasting `resolveBlockChallenge`.
+    let on_chain_program_vkey =
+        l1_rollup_client::get_program_vkey(&l1_read_provider_for_config, l1_rollup_addr)
+            .await
+            .map_err(|e| eyre::eyre!("Failed to read on-chain programVKey at startup: {e}"))?;
+    tracing::info!(
+        on_chain_program_vkey = %on_chain_program_vkey,
+        "Cached on-chain programVKey for challenge resolver vk_hash check"
+    );
+
     let config = OrchestratorConfig {
         proxy_url,
         http_client,
         l1_rollup_addr,
-        l1_deploy_block,
         nitro_verifier_addr,
         l1_provider: l1_write_provider,
-        l1_read_provider: l1_read_provider_for_config,
         api_key,
         l2_provider,
         l1_signer,
@@ -580,6 +590,7 @@ async fn main() -> eyre::Result<()> {
         rbf_bump_interval,
         rbf_bump_percent,
         rbf_max_fee_per_gas_wei,
+        on_chain_program_vkey,
     };
 
     // Spawn the driver's autonomous background loop into the top-level JoinSet.

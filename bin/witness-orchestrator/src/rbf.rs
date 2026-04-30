@@ -11,6 +11,8 @@
 //! - [`handle_submitted`] / [`handle_reverted`] / [`handle_failed_then_undispatch`] — terminal
 //!   outcome handlers, used by both the loop and `preflight`.
 
+use std::time::Duration;
+
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
 use alloy_provider::Provider;
@@ -227,13 +229,29 @@ pub(crate) async fn run(
     };
 
     let observer = PreconfirmObserver::new(shared, batch_index, nonce);
-    run_generic(shared, batch_index, &template, nonce, resume, fee, tip, &observer, backoff).await;
+    run_generic(
+        shared,
+        batch_index,
+        &template,
+        nonce,
+        resume,
+        fee,
+        tip,
+        STUCK_AT_CAP_TIMEOUT,
+        &observer,
+        backoff,
+    )
+    .await;
 }
 
 /// RBF bump-and-poll lifecycle. State mutations are delegated to
 /// `observer`; caller is responsible for pre-flight checks + template
 /// construction, and `nonce` must already be allocated from
-/// `shared.nonce_allocator`.
+/// `shared.nonce_allocator`. `wall_clock_budget` caps the time spent in
+/// the bump loop after the fee cap is first hit — preconfirm callers pass
+/// `STUCK_AT_CAP_TIMEOUT` directly; challenge callers compute it from the
+/// row's deadline so a late-arriving dispute does not blow its window
+/// inside an at-cap retry storm.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_generic(
     shared: &OrchestratorShared,
@@ -243,6 +261,7 @@ pub(crate) async fn run_generic(
     resume: Option<RbfResumeState>,
     initial_fee: u128,
     initial_tip: u128,
+    wall_clock_budget: Duration,
     observer: &dyn RbfObserver,
     backoff: &mut DispatchBackoff,
 ) {
@@ -254,6 +273,7 @@ pub(crate) async fn run_generic(
         resume,
         initial_fee,
         initial_tip,
+        wall_clock_budget,
         observer,
         backoff,
     )
@@ -510,6 +530,7 @@ async fn bump_loop(
     resume: Option<RbfResumeState>,
     initial_fee: u128,
     initial_tip: u128,
+    wall_clock_budget: Duration,
     observer: &dyn RbfObserver,
     backoff: &mut DispatchBackoff,
 ) {
@@ -557,7 +578,7 @@ async fn bump_loop(
 
         if let Some(since) = stuck_at_cap_since {
             let elapsed = since.elapsed();
-            if elapsed >= STUCK_AT_CAP_TIMEOUT {
+            if elapsed >= wall_clock_budget {
                 metrics::counter!(
                     crate::metrics::L1_BROADCAST_FAILURES_TOTAL,
                     "kind" => "stuck_at_cap",
@@ -566,8 +587,8 @@ async fn bump_loop(
                 warn!(
                     batch_index,
                     elapsed_secs = elapsed.as_secs(),
-                    stuck_at_cap_timeout_secs = STUCK_AT_CAP_TIMEOUT.as_secs(),
-                    "RBF: stuck at fee cap past timeout — giving up so dispatcher can retry"
+                    wall_clock_budget_secs = wall_clock_budget.as_secs(),
+                    "RBF: stuck at fee cap past wall-clock budget — giving up so dispatcher can retry"
                 );
                 handle_failed_then_undispatch(observer, backoff, "stuck-at-cap timeout").await;
                 return;

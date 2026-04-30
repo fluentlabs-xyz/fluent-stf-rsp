@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use alloy_primitives::Address;
 use revm_primitives::{hex, B256};
@@ -6,9 +6,14 @@ use sp1_sdk::{
     network::{prover::NetworkProver, Error as Sp1NetworkError},
     HashableKey, ProveRequest, Prover, ProvingKey, SP1ProvingKey, SP1Stdin,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::attestation::{fetch_ha_prover_count, fetch_ha_whitelist, identify_fulfiller};
+
+/// Wall-clock cap on a single `wait_proof` call. Bounded so a permanently-
+/// stuck SP1 request can't hold the spawned task forever — `RequestTimedOut`
+/// flows through the existing retriable branch.
+const WAIT_PROOF_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) async fn run_challenge_proof(
     client: Arc<NetworkProver>,
@@ -73,7 +78,7 @@ pub(crate) async fn run_challenge_proof(
             "Challenge proof submitted"
         );
 
-        match client.wait_proof(id, None, None).await {
+        match client.wait_proof(id, Some(WAIT_PROOF_TIMEOUT), None).await {
             Ok(proof) => {
                 info!(
                     challenge_id = %hex::encode(challenge_id),
@@ -149,6 +154,63 @@ pub(crate) async fn run_challenge_proof(
                     );
                     blacklist.clear();
                 }
+            }
+        }
+    }
+}
+
+/// Resume a previously-submitted SP1 request by polling the network with
+/// the saved `sp1_request_id`. Used at proxy startup for rows whose
+/// in-flight `tokio::spawn` task did not survive the process restart.
+///
+/// Mirrors the resume branch of `attestation::network::prove_and_submit_for_key`:
+/// the SP1 network already holds the proof; we just need to retrieve it.
+/// On retriable error (transient network), retry with the same request_id.
+/// On non-retriable error (permanently lost), mark `failed` so the
+/// orchestrator's existing 5xx → re-issue path generates a fresh request.
+pub(crate) async fn resume_challenge_proof(
+    client: Arc<NetworkProver>,
+    pk: Arc<SP1ProvingKey>,
+    challenge_id: B256,
+    sp1_request_id: B256,
+) {
+    info!(
+        challenge_id = %hex::encode(challenge_id),
+        sp1_request_id = %hex::encode(sp1_request_id),
+        "Resuming challenge proof from saved request_id"
+    );
+    match client.wait_proof(sp1_request_id, Some(WAIT_PROOF_TIMEOUT), None).await {
+        Ok(proof) => {
+            let proof_bytes = match bincode::serialize(&proof.proof) {
+                Ok(b) => b,
+                Err(e) => {
+                    if let Some(db) = crate::db::db() {
+                        db.set_challenge_failed(
+                            challenge_id,
+                            &format!("resume: serialize failed: {e}"),
+                        );
+                    }
+                    return;
+                }
+            };
+            let public_values = proof.public_values.as_slice().to_vec();
+            let vk_hash = pk.verifying_key().hash_bytes();
+            if let Some(db) = crate::db::db() {
+                db.set_challenge_completed(challenge_id, &proof_bytes, &public_values, &vk_hash);
+            }
+            info!(
+                challenge_id = %hex::encode(challenge_id),
+                "Resumed challenge proof completed"
+            );
+        }
+        Err(e) => {
+            warn!(
+                challenge_id = %hex::encode(challenge_id),
+                err = %e,
+                "Resume failed — marking failed; orchestrator will re-issue"
+            );
+            if let Some(db) = crate::db::db() {
+                db.set_challenge_failed(challenge_id, &format!("resume failed: {e}"));
             }
         }
     }

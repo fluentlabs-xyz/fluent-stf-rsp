@@ -149,6 +149,11 @@ pub(crate) enum ChallengeStatus {
     Sp1Proved = 2,
     Dispatched = 3,
     Resolved = 4,
+    /// Terminal — challenge cannot be resolved (deadline expired, vk_hash
+    /// mismatch, pre-broadcast simulation reverted, etc). Operator must
+    /// call `revertBatches` on L1 to recover the rollup. The worker skips
+    /// rows in this status.
+    Failed = 5,
 }
 
 impl ChallengeStatus {
@@ -159,6 +164,7 @@ impl ChallengeStatus {
             Self::Sp1Proved => "sp1_proved",
             Self::Dispatched => "dispatched",
             Self::Resolved => "resolved",
+            Self::Failed => "failed",
         }
     }
 
@@ -169,6 +175,7 @@ impl ChallengeStatus {
             "sp1_proved" => Some(Self::Sp1Proved),
             "dispatched" => Some(Self::Dispatched),
             "resolved" => Some(Self::Resolved),
+            "failed" => Some(Self::Failed),
             _ => None,
         }
     }
@@ -264,8 +271,9 @@ const SCHEMA_DDL: &str = "
         committed_at              INTEGER NOT NULL,
         last_status_change_at     INTEGER NOT NULL,
         CHECK (kind IN ('block','batch_root')),
-        CHECK (status IN ('received','sp1_proving','sp1_proved','dispatched','resolved')),
-        CHECK (kind = 'batch_root' OR commitment IS NOT NULL)
+        CHECK (status IN ('received','sp1_proving','sp1_proved','dispatched','resolved','failed')),
+        CHECK (kind = 'batch_root' OR commitment IS NOT NULL),
+        CHECK (status != 'sp1_proving' OR sp1_request_id IS NOT NULL)
     );
     CREATE UNIQUE INDEX IF NOT EXISTS challenges_block_uniq
         ON challenges(kind, batch_index, commitment)
@@ -274,7 +282,7 @@ const SCHEMA_DDL: &str = "
         ON challenges(kind, batch_index)
         WHERE kind = 'batch_root';
     CREATE INDEX IF NOT EXISTS challenges_active_idx
-        ON challenges(status, l1_block, committed_at);
+        ON challenges(kind, status, deadline);
 ";
 
 impl Db {
@@ -819,8 +827,11 @@ impl Db {
         Ok(())
     }
 
-    /// Worker gate: pick the next row to drive forward.
-    pub(crate) fn find_active_challenge(&self) -> Option<ChallengeRow> {
+    /// Block-worker gate: oldest non-terminal `kind=block` row, ordered by
+    /// resolution deadline ASC (tiebreak: insertion order). Excludes the
+    /// `dispatched`-but-mined window where the active worker has handed
+    /// off ownership to the finalization ticker.
+    pub(crate) fn find_active_block_challenge(&self) -> Option<ChallengeRow> {
         let mut stmt = self
             .conn
             .prepare(
@@ -829,11 +840,35 @@ impl Db {
                         max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
                         committed_at, last_status_change_at \
                  FROM challenges \
-                 WHERE status = 'received' \
-                    OR status = 'sp1_proving' \
-                    OR status = 'sp1_proved' \
-                    OR (status = 'dispatched' AND l1_block IS NULL) \
-                 ORDER BY committed_at ASC \
+                 WHERE kind = 'block' \
+                   AND (status = 'received' \
+                        OR status = 'sp1_proving' \
+                        OR status = 'sp1_proved' \
+                        OR (status = 'dispatched' AND l1_block IS NULL)) \
+                 ORDER BY deadline ASC, committed_at ASC \
+                 LIMIT 1",
+            )
+            .ok()?;
+        stmt.query_row([], row_to_challenge_row).optional().ok().flatten()
+    }
+
+    /// BatchRoot-worker gate: oldest non-terminal `kind=batch_root` row,
+    /// ordered by deadline ASC. BatchRoot rows do not transit `sp1_*`
+    /// statuses (no SP1 round-trip), so the predicate is narrower than
+    /// the block worker's.
+    pub(crate) fn find_active_batch_root_challenge(&self) -> Option<ChallengeRow> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
+                        sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
+                        max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
+                        committed_at, last_status_change_at \
+                 FROM challenges \
+                 WHERE kind = 'batch_root' \
+                   AND (status = 'received' \
+                        OR (status = 'dispatched' AND l1_block IS NULL)) \
+                 ORDER BY deadline ASC, committed_at ASC \
                  LIMIT 1",
             )
             .ok()?;
@@ -1568,6 +1603,163 @@ mod tests {
         db.upsert_batch(&dispatched_row(2, None)).unwrap(); // in-flight, returned
         let (idx, _, _) = db.first_inflight_resume().expect("returns row");
         assert_eq!(idx, 2);
+    }
+
+    fn challenge_row(
+        kind: ChallengeKind,
+        batch_index: u64,
+        commitment: Option<B256>,
+        status: ChallengeStatus,
+        deadline: u64,
+        sp1_request_id: Option<B256>,
+        committed_at: u64,
+    ) -> ChallengeRow {
+        ChallengeRow {
+            challenge_id: 0,
+            kind,
+            batch_index,
+            commitment,
+            status,
+            deadline,
+            sp1_request_id,
+            sp1_proof_bytes: None,
+            tx_hash: None,
+            nonce: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            l1_block: None,
+            committed_at,
+            last_status_change_at: committed_at,
+        }
+    }
+
+    #[test]
+    fn challenge_status_failed_persists_and_decodes() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        // Insert a row in Received, then patch to Failed.
+        let row = challenge_row(
+            ChallengeKind::Block,
+            1,
+            Some(B256::from([1u8; 32])),
+            ChallengeStatus::Received,
+            42,
+            None,
+            0,
+        );
+        db.insert_challenge(&row).unwrap();
+        let cid: i64 = db
+            .conn
+            .query_row("SELECT challenge_id FROM challenges LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let patch = ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
+        db.patch_challenge(cid, &patch).unwrap();
+        let stored = db.find_challenge_by_id(cid).expect("row present");
+        assert_eq!(stored.status, ChallengeStatus::Failed);
+    }
+
+    #[test]
+    fn check_constraint_rejects_sp1_proving_without_request_id() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        // Direct INSERT bypassing insert_challenge — exercises the SQL CHECK.
+        let result = db.conn.execute(
+            "INSERT INTO challenges (kind, batch_index, commitment, status, deadline, \
+                                     committed_at, last_status_change_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["block", 1i64, vec![1u8; 32], "sp1_proving", 42i64, 0i64, 0i64,],
+        );
+        assert!(
+            result.is_err(),
+            "INSERT with status='sp1_proving' AND sp1_request_id=NULL must violate CHECK"
+        );
+    }
+
+    #[test]
+    fn find_active_block_challenge_orders_by_deadline_asc() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        // Two block challenges: A has earlier committed_at but later deadline,
+        // B has later committed_at but earlier deadline. Ordering must
+        // pick B first (deadline ASC overrides committed_at ASC).
+        let a = challenge_row(
+            ChallengeKind::Block,
+            1,
+            Some(B256::from([0xAAu8; 32])),
+            ChallengeStatus::Received,
+            /* deadline */ 200,
+            None,
+            /* committed_at */ 0,
+        );
+        let b = challenge_row(
+            ChallengeKind::Block,
+            2,
+            Some(B256::from([0xBBu8; 32])),
+            ChallengeStatus::Received,
+            /* deadline */ 100,
+            None,
+            /* committed_at */ 5,
+        );
+        db.insert_challenge(&a).unwrap();
+        db.insert_challenge(&b).unwrap();
+        let row = db.find_active_block_challenge().expect("row returned");
+        assert_eq!(row.batch_index, 2, "earlier-deadline row must be picked first");
+    }
+
+    #[test]
+    fn find_active_batch_root_challenge_excludes_block_kind() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        // Block-kind row is OLDER but should be invisible to the batch_root worker.
+        let block_row = challenge_row(
+            ChallengeKind::Block,
+            1,
+            Some(B256::from([0xAAu8; 32])),
+            ChallengeStatus::Received,
+            100,
+            None,
+            0,
+        );
+        let br_row = challenge_row(
+            ChallengeKind::BatchRoot,
+            2,
+            None,
+            ChallengeStatus::Received,
+            200,
+            None,
+            5,
+        );
+        db.insert_challenge(&block_row).unwrap();
+        db.insert_challenge(&br_row).unwrap();
+
+        let row = db.find_active_batch_root_challenge().expect("row returned");
+        assert_eq!(row.batch_index, 2);
+        assert_eq!(row.kind, ChallengeKind::BatchRoot);
+    }
+
+    #[test]
+    fn find_active_block_challenge_excludes_failed_and_resolved() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        let failed_row = challenge_row(
+            ChallengeKind::Block,
+            1,
+            Some(B256::from([0xAAu8; 32])),
+            ChallengeStatus::Failed,
+            100,
+            None,
+            0,
+        );
+        let resolved_row = challenge_row(
+            ChallengeKind::Block,
+            2,
+            Some(B256::from([0xBBu8; 32])),
+            ChallengeStatus::Resolved,
+            150,
+            None,
+            5,
+        );
+        db.insert_challenge(&failed_row).unwrap();
+        db.insert_challenge(&resolved_row).unwrap();
+        assert!(
+            db.find_active_block_challenge().is_none(),
+            "Failed and Resolved rows must be excluded from the active gate"
+        );
     }
 
     #[test]

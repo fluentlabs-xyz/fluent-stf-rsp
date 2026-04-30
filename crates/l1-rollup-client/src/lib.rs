@@ -173,18 +173,26 @@ sol! {
     /// whose state moved past `Submitted` while the orchestrator was down.
     function getBatch(uint256 batchIndex) external view returns (BatchRecord memory);
 
-    /// View of `_blockChallenges[commitment]`. Mirrors the contract's
-    /// `ChallengeRecord` storage layout: challenger, deposit, deadline
-    /// (L1 block number), resolution flag, and the batch status that was
-    /// active when the challenge was opened. Field types are best-effort
-    /// and must match the deployed Rollup contract.
-    function blockChallenges(bytes32 commitment) external view returns (
-        address challenger,
-        uint96  deposit,
-        uint64  deadline,
-        bool    isResolved,
-        uint8   previousStatus
-    );
+    /// View: SP1 program verification key. Used by the orchestrator to
+    /// catch ELF/vk drift between the proxy's local SP1 program and the
+    /// on-chain verifier before broadcasting `resolveBlockChallenge`.
+    function programVKey() external view returns (bytes32);
+
+    // ============ Custom errors (for revert-decoding in pre-broadcast simulation) ============
+
+    error InvalidBatchRoot(bytes32 expected, bytes32 actual);
+    error InvalidBlockSequence(uint256 index, bytes32 expected, bytes32 actual);
+    error WrongPreviousBlockHash(bytes32 expected, bytes32 actual);
+    error InvalidLastBlockHash(bytes32 expected, bytes32 actual);
+    error InvalidBlockProof();
+    error BlockNotChallenged(bytes32 commitment);
+    error BlockAlreadyProven(bytes32 commitment);
+    error BatchRootNotChallenged(uint256 batchIndex);
+    error BatchRootAlreadyProven(uint256 batchIndex);
+    error InvalidBatchStatus(uint256 batchIndex, uint8 status);
+    error RollupCorrupted();
+    error ChallengeResolutionTooLate(uint256 batchIndex, uint256 deadline, uint256 blockNumber);
+    error InvalidBatchIndex(uint256 received, uint256 expected);
 
     /// Resolve a single-block dispute with an SP1 Groth16 proof. The
     /// contract re-derives the commitment from `blockHeader`, verifies
@@ -401,18 +409,20 @@ pub mod batch_status {
 }
 
 /// Minimal subset of `BatchRecord` the orchestrator needs for on-chain
-/// reconciliation: current lifecycle status and the L1 block at which the
-/// batch was first committed (lower bound for a targeted event scan).
+/// reconciliation: current lifecycle status, the L1 block at which the
+/// batch was first committed (lower bound for a targeted event scan),
+/// and the snapshot of `challengeWindow` taken at commitBatch time
+/// (used to compute the per-row challenge deadline locally).
 #[derive(Debug, Clone, Copy)]
 pub struct BatchOnChain {
     pub status: u8,
     pub accepted_at_block: u64,
+    pub challenge_window_snapshot: u64,
 }
 
 /// View-call `getBatch(batchIndex)` and project the fields used by the
-/// orchestrator's startup-reconciliation / pre-flight path. One RPC round
-/// trip; returns `status` as the `batch_status::*` ordinal alongside
-/// `acceptedAtBlock` to bound subsequent event scans.
+/// orchestrator's startup-reconciliation / pre-flight / challenge paths.
+/// One RPC round trip.
 pub async fn get_batch_on_chain(
     l1_provider: &impl Provider,
     contract_addr: Address,
@@ -431,35 +441,33 @@ pub async fn get_batch_on_chain(
         .map_err(|e| eyre!("eth_call getBatch({batch_index}) failed: {e}"))?;
     let decoded = getBatchCall::abi_decode_returns(&raw)
         .map_err(|e| eyre!("decode getBatch({batch_index}) return: {e}"))?;
+    let challenge_window_snapshot: u64 =
+        decoded.challengeWindowSnapshot.try_into().map_err(|_| {
+            eyre!("challengeWindowSnapshot overflow: {}", decoded.challengeWindowSnapshot)
+        })?;
     Ok(BatchOnChain {
         status: decoded.status as u8,
         accepted_at_block: u64::from(decoded.acceptedAtBlock),
+        challenge_window_snapshot,
     })
 }
 
-/// View-call `blockChallenges(commitment)` and project just the `deadline`
-/// (L1 block number after which the challenge window closes). One RPC
-/// round-trip; used by the orchestrator to persist the deadline at row
-/// creation time so the worker doesn't re-read it on every tick.
-pub async fn get_block_challenge_deadline(
-    l1_provider: &impl Provider,
-    contract_addr: Address,
-    commitment: B256,
-) -> Result<u64> {
-    let call = blockChallengesCall { commitment };
+/// View-call `programVKey()`. Reads the SP1 program verification key the
+/// rollup contract uses for `resolveBlockChallenge` proofs. Cached at
+/// orchestrator startup; checked against the proxy's vk_hash before each
+/// resolveBlockChallenge broadcast.
+pub async fn get_program_vkey(l1_provider: &impl Provider, contract_addr: Address) -> Result<B256> {
+    let call = programVKeyCall {};
     let input = Bytes::from(call.abi_encode());
     let req = TransactionRequest {
         to: Some(contract_addr.into()),
         input: input.into(),
         ..Default::default()
     };
-    let raw = l1_provider
-        .call(req)
-        .await
-        .map_err(|e| eyre!("eth_call blockChallenges({commitment}) failed: {e}"))?;
-    let decoded = blockChallengesCall::abi_decode_returns(&raw)
-        .map_err(|e| eyre!("decode blockChallenges return: {e}"))?;
-    Ok(decoded.deadline)
+    let raw = l1_provider.call(req).await.map_err(|e| eyre!("eth_call programVKey failed: {e}"))?;
+    let decoded = programVKeyCall::abi_decode_returns(&raw)
+        .map_err(|e| eyre!("decode programVKey return: {e}"))?;
+    Ok(decoded)
 }
 
 /// Scan L1 for the `BatchPreconfirmed(batchIndex=…)` event in the given
